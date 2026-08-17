@@ -185,10 +185,22 @@ if not torch.cuda.is_available():
     raise RuntimeError("Select a Colab G4 GPU runtime before continuing.")
 
 gpu = torch.cuda.get_device_properties(0)
-gpu_gib = gpu.total_memory / 1024**3
-print(f"GPU: {gpu.name} ({gpu_gib:.1f} GiB), capability={torch.cuda.get_device_capability(0)}")
-if gpu_gib < 90:
-    raise RuntimeError("This suite expects the 96 GB Colab G4 runtime; usable VRAM is below 90 GiB.")
+gpu_total_gib = gpu.total_memory / 1024**3
+# A vendor-labelled 96 GB card can be reported as about 89.4 GiB because
+# PyTorch converts the byte count with a binary divisor. Keep the floor well
+# above the roughly 44.7 GiB reported for a 48 GB card without rejecting G4.
+MIN_G4_TOTAL_GIB = 85.0
+print(
+    f"GPU: {gpu.name} ({gpu_total_gib:.1f} GiB total), "
+    f"capability={torch.cuda.get_device_capability(0)}"
+)
+if gpu_total_gib < MIN_G4_TOTAL_GIB:
+    raise RuntimeError(
+        "This suite expects the nominal 96 GB Colab G4 runtime. "
+        f"PyTorch reports {gpu_total_gib:.1f} GiB total; expected at least "
+        f"{MIN_G4_TOTAL_GIB:.0f} GiB. A value near 45 GiB usually indicates "
+        "the 48 GB GPU variant."
+    )
 
 hf_token = userdata.get("HF_TOKEN") if userdata is not None else os.getenv("HF_TOKEN")
 if not hf_token:
@@ -221,7 +233,7 @@ runtime_manifest = {
     "torch": torch.__version__,
     "cuda": torch.version.cuda,
     "gpu": gpu.name,
-    "gpu_gib": round(gpu_gib, 2),
+    "gpu_total_gib": round(gpu_total_gib, 2),
     "packages": {
         name: package_version(name)
         for name in ["unsloth", "unsloth_zoo", "transformers", "trl", "peft", "datasets"]

@@ -92,6 +92,13 @@ The target is a Google Colab G4 runtime using the
 - BF16/FP16, FP8 and FP4 Tensor Core support; and
 - up to 600 W configurable power.
 
+The 96 GB figure is the vendor's decimal capacity. PyTorch reports total
+memory in binary GiB, so a nominal 96 GB card may appear as roughly 89.4 GiB.
+The notebook preflight therefore requires at least 85 GiB of total memory:
+low enough to accept the intended G4 card, but high enough to reject a nominal
+48 GB card (roughly 44.7 GiB). This is a total-capacity check, not a check of
+currently free memory.
+
 Confirm the installed card before implementation:
 
 ```bash

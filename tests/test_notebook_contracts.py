@@ -226,6 +226,22 @@ def test_core_install_uses_a_resolvable_unsloth_compatibility_set():
     assert "/content/qwen38_pip_install.log" in install
 
 
+def test_g4_preflight_accepts_decimal_96_gb_and_rejects_decimal_48_gb():
+    generator = load_generator()
+    auth = generator.AUTH_AND_RUNTIME
+
+    decimal_96_gb_in_gib = 96_000_000_000 / 1024**3
+    decimal_48_gb_in_gib = 48_000_000_000 / 1024**3
+    assert decimal_96_gb_in_gib < 90
+    assert decimal_96_gb_in_gib >= 85
+    assert decimal_48_gb_in_gib < 85
+
+    assert "MIN_G4_TOTAL_GIB = 85.0" in auth
+    assert "gpu_total_gib < MIN_G4_TOTAL_GIB" in auth
+    assert "gpu_gib < 90" not in auth
+    assert '"gpu_total_gib": round(gpu_total_gib, 2)' in auth
+
+
 def test_generated_cell_ids_are_deterministic():
     generator = load_generator()
     first = generator.build_02_data()

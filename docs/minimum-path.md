@@ -104,7 +104,8 @@ with full SWE-bench or Terminal-Bench runs.
 
 ### Notebook preflight
 
-- Detect the G4 GPU and usable VRAM.
+- Detect the G4 GPU and total VRAM, accounting for decimal GB versus binary
+  GiB reporting.
 - Install/pin only the dependencies required for inference and the adapter.
 - Authenticate durable storage without exposing the token to task sandboxes.
 - Load the BF16 model and record peak VRAM.
