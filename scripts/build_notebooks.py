@@ -491,7 +491,7 @@ def build_00_preflight():
                 r"""
                 FastLanguageModel.for_inference(model)
                 inputs = tokenizer(
-                    rendered_probe,
+                    text=rendered_probe,
                     return_tensors="pt",
                     add_special_tokens=False,
                 ).to("cuda")
@@ -773,7 +773,11 @@ def build_01_baseline():
                 r"""
                 def generate_turn(messages: list[dict]) -> tuple[str, int, int]:
                     rendered = render_chat(messages, add_generation_prompt=True)
-                    inputs = tokenizer(rendered, return_tensors="pt", add_special_tokens=False).to("cuda")
+                    inputs = tokenizer(
+                        text=rendered,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    ).to("cuda")
                     with torch.inference_mode():
                         outputs = model.generate(
                             **inputs,
@@ -1097,7 +1101,7 @@ def build_02_data():
                 def render_row(row: dict) -> dict:
                     messages = [_without_arrow_nulls(message) for message in row["messages"]]
                     text = render_chat(messages, add_generation_prompt=False)
-                    token_count = len(tokenizer(text, add_special_tokens=False)["input_ids"])
+                    token_count = len(tokenizer(text=text, add_special_tokens=False)["input_ids"])
                     return {
                         "messages": messages,
                         "text": text,
@@ -2307,7 +2311,7 @@ def build_06_qat_export():
                     )
                     texts = calibration["text"][:512]
                     token_lengths = [
-                        len(calibration_tokenizer(text, add_special_tokens=False)["input_ids"])
+                        len(calibration_tokenizer(text=text, add_special_tokens=False)["input_ids"])
                         for text in texts
                     ]
                     calibration_path = RUN_ROOT / "calibration_native_tools.txt"

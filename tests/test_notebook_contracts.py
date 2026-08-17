@@ -219,6 +219,9 @@ def test_generated_notebooks_have_restart_and_schema_guards():
     assert "TOOL_SCHEMA_JSON" in all_source
     assert 'assert "<function=read_file>" in rendered_probe' not in all_source
     assert "rendered_tool_schema(rendered_probe) == TOOL_SCHEMA_JSON" in all_source
+    assert "tokenizer(rendered, return_tensors=\"pt\"" not in all_source
+    assert "text=rendered_probe" in all_source
+    assert "tokenizer(text=text, add_special_tokens=False)" in all_source
 
     for notebook in notebooks:
         generator.validate_notebook(notebook, Path("generated.ipynb"))
