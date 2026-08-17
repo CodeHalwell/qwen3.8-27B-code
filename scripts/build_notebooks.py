@@ -614,7 +614,7 @@ def build_01_baseline():
                     re.DOTALL,
                 )
                 PARAM_RE = re.compile(
-                    r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>",
+                    r"<parameter=([^>\n]+)>(?:\r?\n)?(.*?)\s*</parameter>",
                     re.DOTALL,
                 )
 
@@ -628,7 +628,14 @@ def build_01_baseline():
                     reasoning, content = split_reasoning(text)
                     calls = []
                     for function_name, body in TOOL_CALL_RE.findall(content):
-                        arguments = {name.strip(): value.strip() for name, value in PARAM_RE.findall(body)}
+                        arguments = {
+                            name.strip(): (
+                                value.rstrip("\r\n")
+                                if name.strip() == "patch"
+                                else value.strip()
+                            )
+                            for name, value in PARAM_RE.findall(body)
+                        }
                         calls.append({
                             "type": "function",
                             "function": {"name": function_name.strip(), "arguments": arguments},

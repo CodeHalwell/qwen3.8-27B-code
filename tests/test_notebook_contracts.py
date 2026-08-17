@@ -174,6 +174,27 @@ def test_baseline_search_uses_bounded_python_fallback(tmp_path):
     )
 
 
+def test_baseline_parser_preserves_unified_diff_context_whitespace():
+    generator = load_generator()
+    parser_cell = code_cell_containing(generator.build_01_baseline(), "def parse_tool_calls")
+    namespace = {"re": re}
+    exec(parser_cell, namespace)
+
+    raw = (
+        "<tool_call>\n<function=apply_patch>\n"
+        "<parameter=patch>\n"
+        "--- a/src/clamp.py\n+++ b/src/clamp.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def clamp(value, lower, upper):\n"
+        "-    return min(lower, max(upper, value))\n"
+        "+    return max(lower, min(upper, value))\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    patch = namespace["parse_tool_calls"](raw)[1][0]["function"]["arguments"]["patch"]
+    assert "\n def clamp(value, lower, upper):\n" in patch
+    assert patch.startswith("--- a/src/clamp.py\n")
+
+
 def test_reward_fixture_rejects_deleted_visible_tests():
     generator = load_generator()
     environment_cell = code_cell_containing(generator.build_05_grpo(), "class ToyCodingEnv")
