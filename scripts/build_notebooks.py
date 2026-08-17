@@ -813,10 +813,15 @@ def build_01_baseline():
                                         return "\n".join(hits)[:20000]
                         return "\n".join(hits)[:20000] or "[no matches]"
                     if name == "apply_patch":
+                        # The XML parameter parser cannot distinguish a patch's
+                        # final newline from tag whitespace, and git apply calls
+                        # a patch whose last line lacks one "corrupt". Normalise
+                        # to exactly one trailing newline.
+                        patch = arguments["patch"].rstrip("\r\n") + "\n"
                         result = subprocess.run(
                             ["git", "apply", "--whitespace=nowarn", "-"],
                             cwd=root,
-                            input=arguments["patch"],
+                            input=patch,
                             text=True,
                             capture_output=True,
                             timeout=30,

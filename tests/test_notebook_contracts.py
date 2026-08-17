@@ -174,6 +174,55 @@ def test_baseline_search_uses_bounded_python_fallback(tmp_path):
     )
 
 
+def test_baseline_apply_patch_accepts_parsed_model_patches(tmp_path):
+    """The XML parser strips the patch's final newline, and git apply rejects
+    such a patch as corrupt. The executor must normalise it back."""
+    generator = load_generator()
+    baseline = generator.build_01_baseline()
+    namespace = {
+        "dataclass": dataclass,
+        "Path": Path,
+        "shutil": shutil,
+        "subprocess": subprocess,
+        "sys": sys,
+        "json": json,
+        "re": re,
+        "DEMO_MODE": False,
+        "PILOT_MANIFEST": tmp_path / "unused.jsonl",
+        "TASK_ENV": {},
+    }
+    exec(code_cell_containing(baseline, "def parse_tool_calls"), namespace)
+    exec(code_cell_containing(baseline, "class PilotTask"), namespace)
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "clamp.py").write_text(
+        "def clamp(value, lower, upper):\n"
+        "    return min(lower, max(upper, value))\n"
+    )
+    raw = (
+        "<tool_call>\n<function=apply_patch>\n"
+        "<parameter=patch>\n"
+        "--- a/src/clamp.py\n+++ b/src/clamp.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def clamp(value, lower, upper):\n"
+        "-    return min(lower, max(upper, value))\n"
+        "+    return max(lower, min(upper, value))\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    arguments = namespace["parse_tool_calls"](raw)[1][0]["function"]["arguments"]
+    task = namespace["PilotTask"](
+        task_id="patch-test",
+        repo_path=str(tmp_path),
+        request="Fix clamp",
+        visible_test_command=[sys.executable, "-V"],
+        hidden_test_command=[sys.executable, "-V"],
+    )
+
+    assert namespace["execute_tool"](task, "apply_patch", arguments) == "patch applied"
+    assert "max(lower, min(upper, value))" in (source / "clamp.py").read_text()
+
+
 def test_baseline_parser_preserves_unified_diff_context_whitespace():
     generator = load_generator()
     parser_cell = code_cell_containing(generator.build_01_baseline(), "def parse_tool_calls")
