@@ -243,6 +243,9 @@ def test_generated_notebooks_have_restart_and_schema_guards():
     assert "tokenizer(rendered, return_tensors=\"pt\"" not in all_source
     assert "text=rendered_probe" in all_source
     assert "tokenizer(text=text, add_special_tokens=False)" in all_source
+    assert 'globals().pop(_stale_name, None)' in all_source
+    assert "torch.cuda.empty_cache()" in all_source
+    assert "torch._dynamo.reset()" in all_source
 
     for notebook in notebooks:
         generator.validate_notebook(notebook, Path("generated.ipynb"))

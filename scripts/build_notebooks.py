@@ -159,6 +159,7 @@ else:
 
 
 AUTH_AND_RUNTIME = r"""
+import gc
 import json
 import os
 import platform
@@ -201,6 +202,19 @@ if gpu_total_gib < MIN_G4_TOTAL_GIB:
         f"{MIN_G4_TOTAL_GIB:.0f} GiB. A value near 45 GiB usually indicates "
         "the 48 GB GPU variant."
     )
+
+# Make rerunning a notebook safe after another heavyweight notebook or a
+# failed generation. Unsloth/TorchDynamo can retain compiled module references
+# even after a Python variable is overwritten, so clear them before loading a
+# fresh model. This does not free memory held by another live Python object.
+for _stale_name in ("model", "tokenizer", "processor"):
+    globals().pop(_stale_name, None)
+gc.collect()
+torch.cuda.empty_cache()
+try:
+    torch._dynamo.reset()
+except AttributeError:
+    pass
 
 hf_token = userdata.get("HF_TOKEN") if userdata is not None else os.getenv("HF_TOKEN")
 if not hf_token:
