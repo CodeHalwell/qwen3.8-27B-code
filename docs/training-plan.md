@@ -118,6 +118,21 @@ collapsing exploration, reasoning depth or general coding ability.
 Use online RL only for tasks with executable rewards. Begin with 2–4 samples
 per prompt, short output budgets and 2–10-tool-call episodes.
 
+The current core Colab environment intentionally pins TRL 0.22.2 because the
+pinned Unsloth Zoo declares `trl<=0.24.0` and `datasets<4.4.0`. TRL's stateful
+`environment_factory` arrived in 0.29.0 and therefore cannot be installed in
+the same reviewed environment today. Notebook 05 validates environment and
+reward contracts but must not run policy updates until one of these paths is
+proven separately:
+
+1. an Unsloth release with compatible TRL environment support;
+2. a separate rollout process using Harbor, NeMo Gym or TRL/OpenEnv while the
+   compatible Unsloth environment performs updates; or
+3. a custom, unit-tested rollout adapter whose policy/version skew is recorded.
+
+Do not bypass the resolver with `--no-deps` and call the resulting run
+reproducible.
+
 The reward is a named vector before it is a scalar:
 
 | Component | Signal | Direction |

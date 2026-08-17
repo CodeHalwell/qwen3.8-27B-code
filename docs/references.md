@@ -29,6 +29,9 @@ in experiments even when a documentation URL is unversioned. Last checked:
   standby and inference/training memory sharing concepts to compatibility-test.
 - [Hugging Face TRL](https://huggingface.co/docs/trl) — SFT, DPO, GRPO and
   dataset-format APIs. Pin a tested TRL version rather than following `main`.
+- [TRL 0.29 release](https://github.com/huggingface/trl/releases/tag/v0.29.0) —
+  introduction of `environment_factory`; currently newer than the maximum TRL
+  version declared by the pinned Unsloth Zoo package.
 - [NVIDIA NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) — resource-server and
   multi-environment patterns for executable RL.
 

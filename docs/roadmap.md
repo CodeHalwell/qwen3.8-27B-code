@@ -117,6 +117,8 @@ Exit criteria:
 Deliverables:
 
 - Unit-tested reward vector.
+- Resolution of the Unsloth `trl<=0.24.0` versus TRL
+  `environment_factory>=0.29.0` compatibility boundary.
 - Short-horizon GRPO/GSPO smoke run.
 - Alternating rollout/update scheduler for one GPU.
 - Curriculum through medium and long episodes.

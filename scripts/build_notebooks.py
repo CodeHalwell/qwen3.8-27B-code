@@ -55,37 +55,101 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Day-zero Qwen3.8 support is pinned to commits verified when these notebooks
-# were generated. Change all four together after a compatibility smoke test.
+# The Git pins supply current Unsloth/Qwen3.8 support. Transformers, TRL and
+# Datasets deliberately use the mutually compatible versions from the adjacent
+# official Unsloth Qwen3.5 27B notebook. Do not replace these with branch-head
+# SHAs without resolving package metadata together first.
 GIT_REVISIONS = {
     "unsloth": "c87fe20e32aca9ceb2dc5059c2987738f32446e8",
     "unsloth_zoo": "5b239e574f03ab3077c17e49aeef3cacfe7cdd4e",
-    "transformers": "c49429ed1f8b89749de77c0ec930ef19685c9ae5",
-    "trl": "b39c2276567639b93ca5b53658751e0f9c09b92f",
 }
 
-INSTALL_KEY = "-".join(value[:8] for value in GIT_REVISIONS.values())
+import torch
+
+torch_version = torch.__version__.split("+", 1)[0]
+torch_minor = ".".join(torch_version.split(".")[:2])
+torchao_by_torch = {"2.8": "0.16.0", "2.9": "0.16.0", "2.10": "0.16.0", "2.11": "0.18.0"}
+xformers_by_torch = {"2.8": "0.0.32.post2", "2.9": "0.0.33.post1", "2.10": "0.0.34", "2.11": "0.0.34"}
+if torch_minor not in torchao_by_torch:
+    raise RuntimeError(
+        f"No reviewed Colab dependency set for torch {torch.__version__}. "
+        f"Expected one of {sorted(torchao_by_torch)}; update the compatibility matrix first."
+    )
+
+COMPATIBILITY_PINS = {
+    "transformers": "5.3.0",
+    "trl": "0.22.2",
+    "datasets": "4.3.0",
+    "peft": "0.19.0",
+    "torchao": torchao_by_torch[torch_minor],
+    "xformers": xformers_by_torch[torch_minor],
+}
+INSTALLER_REVISION = "colab-v2"
+pin_key = "-".join(value.replace(".", "") for value in COMPATIBILITY_PINS.values())
+git_key = "-".join(value[:8] for value in GIT_REVISIONS.values())
+INSTALL_KEY = f"{INSTALLER_REVISION}-torch{torch_minor}-{git_key}-{pin_key}"
 INSTALL_MARKER = Path(f"/content/.qwen38_env_{INSTALL_KEY}")
+PIP_LOG = Path("/content/qwen38_pip_install.log")
 FORCE_INSTALL = False
 
+def install_phase(name: str, packages: list[str], *, no_deps: bool = False) -> None:
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--upgrade-strategy",
+        "only-if-needed",
+        "--no-cache-dir",
+        "--log",
+        str(PIP_LOG),
+    ]
+    if no_deps:
+        command.append("--no-deps")
+    command.extend(packages)
+    print(f"\n=== install phase: {name} ===")
+    print("\n".join(f"  {package}" for package in packages))
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        log_tail = (
+            "\n".join(PIP_LOG.read_text(errors="replace").splitlines()[-120:])
+            if PIP_LOG.exists()
+            else "[pip did not create its log file]"
+        )
+        print(f"\n--- tail of {PIP_LOG} ---\n{log_tail}")
+        raise RuntimeError(
+            f"Package installation failed during {name!r} with exit code {result.returncode}. "
+            f"The detailed log is at {PIP_LOG}."
+        )
+
 if FORCE_INSTALL or not INSTALL_MARKER.exists():
-    packages = [
-        f"unsloth @ git+https://github.com/unslothai/unsloth.git@{GIT_REVISIONS['unsloth']}",
+    if PIP_LOG.exists():
+        PIP_LOG.unlink()
+    install_phase("packaging tools", ["pip", "setuptools==80.9.0", "wheel>=0.42.0"])
+    install_phase("Qwen3.8 training stack", [
         f"unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@{GIT_REVISIONS['unsloth_zoo']}",
-        f"transformers @ git+https://github.com/huggingface/transformers.git@{GIT_REVISIONS['transformers']}",
-        f"trl @ git+https://github.com/huggingface/trl.git@{GIT_REVISIONS['trl']}",
-        "peft",
-        "datasets",
+        f"unsloth @ git+https://github.com/unslothai/unsloth.git@{GIT_REVISIONS['unsloth']}",
+        f"torch=={torch_version}",
+        f"torchao=={COMPATIBILITY_PINS['torchao']}",
+        f"transformers=={COMPATIBILITY_PINS['transformers']}",
+        f"trl=={COMPATIBILITY_PINS['trl']}",
+        f"datasets=={COMPATIBILITY_PINS['datasets']}",
+        f"peft=={COMPATIBILITY_PINS['peft']}",
         "accelerate",
         "bitsandbytes",
         "trackio",
-        "huggingface_hub",
-        "sentencepiece",
+        "huggingface_hub>=0.34.0,<2.0",
+        "hf_transfer",
+        "sentencepiece>=0.2.0",
         "protobuf",
         "pytest",
-    ]
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", *packages]
+        "jmespath",
+    ])
+    install_phase(
+        "PyTorch-matched xFormers wheel",
+        [f"xformers=={COMPATIBILITY_PINS['xformers']}"],
+        no_deps=True,
     )
     INSTALL_MARKER.write_text(INSTALL_KEY)
     print("Packages installed. Restart the Colab runtime, then rerun this notebook from the top.")
@@ -109,6 +173,8 @@ if "GIT_REVISIONS" not in globals():
         "This runtime was restarted. Rerun the notebook from the first cell; "
         "the install marker will skip the expensive package installation."
     )
+if "COMPATIBILITY_PINS" not in globals():
+    raise RuntimeError("Missing compatibility pins; rerun the notebook from the first cell.")
 
 try:
     from google.colab import userdata
@@ -136,6 +202,18 @@ def package_version(name: str) -> str:
     except PackageNotFoundError:
         return "missing"
 
+observed_pins = {name: package_version(name) for name in COMPATIBILITY_PINS}
+pin_mismatches = {
+    name: {"expected": expected, "observed": observed_pins[name]}
+    for name, expected in COMPATIBILITY_PINS.items()
+    if observed_pins[name] != expected
+}
+if pin_mismatches:
+    raise RuntimeError(
+        "The runtime does not match the reviewed compatibility set. "
+        f"Rerun the install cell with FORCE_INSTALL=True: {pin_mismatches}"
+    )
+
 RUN_ROOT = Path("/content/qwen38_runs")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 runtime_manifest = {
@@ -149,6 +227,7 @@ runtime_manifest = {
         for name in ["unsloth", "unsloth_zoo", "transformers", "trl", "peft", "datasets"]
     },
     "git_revisions": GIT_REVISIONS,
+    "compatibility_pins": COMPATIBILITY_PINS,
 }
 (RUN_ROOT / "runtime_manifest.json").write_text(json.dumps(runtime_manifest, indent=2))
 print(json.dumps(runtime_manifest, indent=2))
@@ -1626,10 +1705,13 @@ def build_05_grpo():
                 """
                 # 05 · Agentic GRPO pilot
 
-                This is a deliberately tiny, stateful coding environment using
-                TRL's current `environment_factory` interface. It proves reward,
-                tool, and rollout plumbing before any Harbor/NeMo Gym integration.
-                The fixture is trusted notebook code, never an untrusted repository.
+                This is a deliberately tiny, stateful coding environment. The
+                core Colab stack can validate its tools, hidden reward and
+                reward-hacking fixtures, but intentionally does not install
+                TRL's newer `environment_factory` API: that TRL release conflicts
+                with the current Unsloth dependency bounds. Trainer construction
+                remains gated until a compatible Unsloth/TRL pair or a separate
+                NeMo Gym/Harbor rollout backend is validated.
                 """
             ),
             markdown("## Install and authenticate"),
@@ -1661,10 +1743,17 @@ def build_05_grpo():
                 RUN_TRAINING = False
                 PUSH_ADAPTER = False
 
-                if Version(transformers_version) < Version("5.2.0"):
-                    raise RuntimeError("TRL multi-turn agent training requires Transformers >= 5.2.")
-                if "environment_factory" not in inspect.signature(GRPOTrainer.__init__).parameters:
-                    raise RuntimeError("Pinned TRL no longer exposes environment_factory; stop and update this notebook.")
+                AGENTIC_TRL_AVAILABLE = (
+                    Version(transformers_version) >= Version("5.2.0")
+                    and "environment_factory" in inspect.signature(GRPOTrainer.__init__).parameters
+                )
+                AGENTIC_RL_BLOCKER = (
+                    "The reviewed core stack pins TRL 0.22.2 for Unsloth compatibility; "
+                    "TRL environment_factory starts at 0.29.0, outside the pinned "
+                    "Unsloth Zoo trl<=0.24.0 constraint."
+                )
+                if RUN_TRAINING and not AGENTIC_TRL_AVAILABLE:
+                    raise RuntimeError(AGENTIC_RL_BLOCKER)
                 if RUN_TRAINING and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin an accepted adapter revision before RL.")
                 if ROLLOUT_POLICY_PRECISION not in {"bf16", "bnb4"}:
@@ -1880,59 +1969,67 @@ def build_05_grpo():
                     "rollout_update_precision": ROLLOUT_POLICY_PRECISION,
                     "quantized_policy_approximation": use_quantized_policy,
                     "allow_quantized_rollout_policy": ALLOW_QUANTIZED_ROLLOUT_POLICY,
+                    "agentic_trl_available": AGENTIC_TRL_AVAILABLE,
+                    "agentic_rl_blocker": None if AGENTIC_TRL_AVAILABLE else AGENTIC_RL_BLOCKER,
                 }
                 grpo_root = RUN_ROOT / "grpo"
                 grpo_root.mkdir(parents=True, exist_ok=True)
                 (grpo_root / "policy_manifest.json").write_text(json.dumps(policy_manifest, indent=2))
                 print(json.dumps(policy_manifest, indent=2))
 
-                model, tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=ACCEPTED_ADAPTER_ID,
-                    revision=None if ACCEPTED_REVISION.startswith("REPLACE_") else ACCEPTED_REVISION,
-                    max_seq_length=MAX_SEQ_LENGTH,
-                    dtype=None if use_quantized_policy else torch.bfloat16,
-                    load_in_4bit=use_quantized_policy,
-                    token=hf_token,
-                )
-                if not any(parameter.requires_grad for parameter in model.parameters()):
-                    raise RuntimeError("Accepted adapter has no trainable parameters; inspect PEFT loading before RL.")
+                trainer = None
+                if AGENTIC_TRL_AVAILABLE:
+                    model, tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=ACCEPTED_ADAPTER_ID,
+                        revision=None if ACCEPTED_REVISION.startswith("REPLACE_") else ACCEPTED_REVISION,
+                        max_seq_length=MAX_SEQ_LENGTH,
+                        dtype=None if use_quantized_policy else torch.bfloat16,
+                        load_in_4bit=use_quantized_policy,
+                        token=hf_token,
+                    )
+                    if not any(parameter.requires_grad for parameter in model.parameters()):
+                        raise RuntimeError("Accepted adapter has no trainable parameters; inspect PEFT loading before RL.")
 
-                grpo_args = GRPOConfig(
-                    output_dir=str(grpo_root),
-                    per_device_train_batch_size=1,
-                    gradient_accumulation_steps=2,
-                    num_generations=2,
-                    max_completion_length=1_024,
-                    learning_rate=5e-6,
-                    max_steps=MAX_STEPS,
-                    bf16=True,
-                    optim="adamw_8bit",
-                    logging_steps=1,
-                    save_strategy="steps",
-                    save_steps=1,
-                    save_total_limit=2,
-                    mask_truncated_completions=True,
-                    scale_rewards="batch",
-                    loss_type="dr_grpo",
-                    report_to="trackio",
-                    run_name="qwen38-code-agent-grpo-smoke",
-                    push_to_hub=PUSH_ADAPTER,
-                    hub_model_id=OUTPUT_ADAPTER_ID,
-                    seed=3407,
-                )
-                trainer = GRPOTrainer(
-                    model=model,
-                    args=grpo_args,
-                    processing_class=tokenizer,
-                    environment_factory=ToyCodingEnv,
-                )
-                print("GRPO environment and trainer constructed.")
+                    grpo_args = GRPOConfig(
+                        output_dir=str(grpo_root),
+                        per_device_train_batch_size=1,
+                        gradient_accumulation_steps=2,
+                        num_generations=2,
+                        max_completion_length=1_024,
+                        learning_rate=5e-6,
+                        max_steps=MAX_STEPS,
+                        bf16=True,
+                        optim="adamw_8bit",
+                        logging_steps=1,
+                        save_strategy="steps",
+                        save_steps=1,
+                        save_total_limit=2,
+                        mask_truncated_completions=True,
+                        scale_rewards="batch",
+                        loss_type="dr_grpo",
+                        report_to="trackio",
+                        run_name="qwen38-code-agent-grpo-smoke",
+                        push_to_hub=PUSH_ADAPTER,
+                        hub_model_id=OUTPUT_ADAPTER_ID,
+                        seed=3407,
+                    )
+                    trainer = GRPOTrainer(
+                        model=model,
+                        args=grpo_args,
+                        processing_class=tokenizer,
+                        environment_factory=ToyCodingEnv,
+                    )
+                    print("GRPO environment and trainer constructed.")
+                else:
+                    print(f"Trainer construction skipped: {AGENTIC_RL_BLOCKER}")
                 """
             ),
             markdown("## Run only after the toy rollouts work manually"),
             code(
                 r"""
                 if RUN_TRAINING:
+                    if trainer is None:
+                        raise RuntimeError(AGENTIC_RL_BLOCKER)
                     result = trainer.train()
                     trainer.save_model(str(RUN_ROOT / "grpo" / "final_adapter"))
                     if PUSH_ADAPTER:
@@ -1948,10 +2045,11 @@ def build_05_grpo():
                 ## Scale-up boundary
 
                 Do not turn this fixture into the production harness. After the
-                two-step smoke succeeds, swap the environment factory for an
-                adapter around Harbor/Terminal-Bench or NeMo Gym, retaining the
-                same six tools, hidden-test boundary, failure taxonomy, and
-                reward unit tests. Run two independent seeds before accepting RL.
+                reward fixtures pass, resolve the recorded Unsloth/TRL blocker
+                or use a separate adapter around Harbor/Terminal-Bench or NeMo
+                Gym. Retain the same six tools, hidden-test boundary, failure
+                taxonomy and reward tests. Run two independent seeds before
+                accepting RL.
                 """
             ),
         ],

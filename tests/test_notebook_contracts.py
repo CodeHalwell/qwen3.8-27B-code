@@ -209,6 +209,23 @@ def test_generated_notebooks_have_restart_and_schema_guards():
         generator.validate_notebook(notebook, Path("generated.ipynb"))
 
 
+def test_core_install_uses_a_resolvable_unsloth_compatibility_set():
+    generator = load_generator()
+    install = generator.INSTALL_CORE
+
+    for package, expected in {
+        "transformers": "5.3.0",
+        "trl": "0.22.2",
+        "datasets": "4.3.0",
+        "peft": "0.19.0",
+    }.items():
+        assert f'"{package}": "{expected}"' in install
+    assert "c49429ed1f8b89749de77c0ec930ef19685c9ae5" not in install
+    assert "b39c2276567639b93ca5b53658751e0f9c09b92f" not in install
+    assert "--quiet" not in install
+    assert "/content/qwen38_pip_install.log" in install
+
+
 def test_generated_cell_ids_are_deterministic():
     generator = load_generator()
     first = generator.build_02_data()
