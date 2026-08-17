@@ -353,6 +353,23 @@ def canonical_tool_schema(tools: list[dict]) -> str:
 
 TOOL_SCHEMA_JSON = canonical_tool_schema(TOOLS)
 
+def rendered_tool_schema(rendered_prompt: str) -> str:
+    """Extract and canonicalise JSON tool declarations from a Qwen prompt."""
+    start_tag = "<tools>"
+    end_tag = "</tools>"
+    if start_tag not in rendered_prompt or end_tag not in rendered_prompt:
+        raise ValueError("Rendered prompt does not contain a <tools> block.")
+    payload = rendered_prompt.split(start_tag, 1)[1].split(end_tag, 1)[0]
+    try:
+        rendered_tools = [
+            json.loads(line)
+            for line in payload.splitlines()
+            if line.strip()
+        ]
+    except json.JSONDecodeError as exc:
+        raise ValueError("Rendered <tools> block is not newline-delimited JSON.") from exc
+    return canonical_tool_schema(rendered_tools)
+
 def canonical_to_qwen(messages: list[dict]) -> list[dict]:
     """Fold an initial developer message into system for the HF tokenizer.
 
@@ -457,9 +474,15 @@ def build_00_preflight():
                     {"role": "user", "content": "Read src/cache.py before proposing a fix."},
                 ]
                 rendered_probe = render_chat(template_probe, add_generation_prompt=True)
-                assert "<function=read_file>" in rendered_probe
-                assert "Work only in the provided repository" in rendered_probe
-                assert rendered_probe.endswith("<think>\n")
+                assert rendered_tool_schema(rendered_probe) == TOOL_SCHEMA_JSON, (
+                    "The tokenizer changed the deployment tool declarations."
+                )
+                assert "Work only in the provided repository" in rendered_probe, (
+                    "The developer-to-system adapter lost the repository policy."
+                )
+                assert rendered_probe.endswith("<think>\n"), (
+                    "The generation prompt no longer opens Qwen's thinking channel."
+                )
                 print(rendered_probe[:4000])
                 """
             ),

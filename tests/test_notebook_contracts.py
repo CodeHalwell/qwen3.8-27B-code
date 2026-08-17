@@ -66,6 +66,19 @@ def test_arrow_round_trip_preserves_semantic_tool_schema():
     assert namespace["canonical_tool_schema"](changed) != namespace["TOOL_SCHEMA_JSON"]
 
 
+def test_rendered_tool_block_preserves_semantic_tool_schema():
+    generator = load_generator()
+    namespace = {"json": json}
+    exec(generator.TOOLS_CELL, namespace)
+
+    rendered = (
+        "<|im_start|>system\n<tools>\n"
+        + "\n".join(json.dumps(tool) for tool in namespace["TOOLS"])
+        + "\n</tools><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    )
+    assert namespace["rendered_tool_schema"](rendered) == namespace["TOOL_SCHEMA_JSON"]
+
+
 def test_repository_family_split_always_has_two_nonempty_partitions():
     generator = load_generator()
     split_cell = code_cell_containing(generator.build_02_data(), "validation_family_count")
@@ -204,6 +217,8 @@ def test_generated_notebooks_have_restart_and_schema_guards():
     assert "then continue from the runtime/authentication cell" not in all_source
     assert "This runtime was restarted. Rerun the notebook from the first cell" in all_source
     assert "TOOL_SCHEMA_JSON" in all_source
+    assert 'assert "<function=read_file>" in rendered_probe' not in all_source
+    assert "rendered_tool_schema(rendered_probe) == TOOL_SCHEMA_JSON" in all_source
 
     for notebook in notebooks:
         generator.validate_notebook(notebook, Path("generated.ipynb"))
