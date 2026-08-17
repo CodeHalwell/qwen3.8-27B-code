@@ -251,6 +251,38 @@ def test_generated_notebooks_have_restart_and_schema_guards():
         generator.validate_notebook(notebook, Path("generated.ipynb"))
 
 
+def test_every_model_load_is_guarded_against_silent_offload():
+    """A load without enough free VRAM makes accelerate offload modules to
+    CPU, which then OOMs mid-episode when a spilled tensor is copied back."""
+    generator = load_generator()
+    notebooks = {
+        "00": generator.build_00_preflight(),
+        "01": generator.build_01_baseline(),
+        "02": generator.build_02_data(),
+        "03": generator.build_03_sft(),
+        "04": generator.build_04_dpo(),
+        "05": generator.build_05_grpo(),
+        "06": generator.build_06_qat_export(),
+    }
+
+    load_cells = 0
+    for name, notebook in notebooks.items():
+        for index, cell in enumerate(notebook.cells):
+            if cell.cell_type != "code" or "FastLanguageModel.from_pretrained" not in cell.source:
+                continue
+            load_cells += 1
+            assert "require_free_vram(" in cell.source, f"notebook {name} cell {index}"
+            assert "assert_model_fully_resident(" in cell.source, f"notebook {name} cell {index}"
+    assert load_cells == 7
+
+    auth = generator.AUTH_AND_RUNTIME
+    assert "def release_stale_gpu_state" in auth
+    assert "def require_free_vram" in auth
+    assert "def assert_model_fully_resident" in auth
+    assert '"last_traceback"' in auth
+    assert "\nrelease_stale_gpu_state()" in auth
+
+
 def test_core_install_uses_a_resolvable_unsloth_compatibility_set():
     generator = load_generator()
     install = generator.INSTALL_CORE

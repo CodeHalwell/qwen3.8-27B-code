@@ -163,6 +163,7 @@ import gc
 import json
 import os
 import platform
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -203,18 +204,63 @@ if gpu_total_gib < MIN_G4_TOTAL_GIB:
         "the 48 GB GPU variant."
     )
 
-# Make rerunning a notebook safe after another heavyweight notebook or a
-# failed generation. Unsloth/TorchDynamo can retain compiled module references
-# even after a Python variable is overwritten, so clear them before loading a
-# fresh model. This does not free memory held by another live Python object.
-for _stale_name in ("model", "tokenizer", "processor"):
-    globals().pop(_stale_name, None)
-gc.collect()
-torch.cuda.empty_cache()
-try:
-    torch._dynamo.reset()
-except AttributeError:
-    pass
+# IPython stores the last exception on sys.last_traceback, whose frames keep
+# every local alive, including a ~52 GiB model from a failed cell. gc.collect()
+# cannot free what those frames still reference.
+def release_stale_gpu_state() -> float:
+    for _stale_name in ("model", "tokenizer", "processor", "trainer"):
+        globals().pop(_stale_name, None)
+    for _exc_attr in ("last_traceback", "last_value", "last_type", "last_exc"):
+        if hasattr(sys, _exc_attr):
+            delattr(sys, _exc_attr)
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        torch._dynamo.reset()
+    except AttributeError:
+        pass
+    return torch.cuda.mem_get_info()[0] / 1024**3
+
+# Fail before a model load that accelerate would silently offload.
+def require_free_vram(minimum_gib: float) -> float:
+    free_gib = release_stale_gpu_state()
+    if free_gib < minimum_gib:
+        raise RuntimeError(
+            f"Only {free_gib:.1f} GiB VRAM is free but this load needs about "
+            f"{minimum_gib:.0f} GiB. A previous model in this kernel is still "
+            "holding memory. Restart the runtime and rerun from the top."
+        )
+    return free_gib
+
+# Reject a load that accelerate quietly spilled to CPU or disk. A partially
+# offloaded model copies weights back per forward pass (the 2.4 GiB embedding
+# alone) and is guaranteed to OOM or crawl mid-episode.
+def assert_model_fully_resident(model, minimum_free_gib: float = 4.0) -> None:
+    non_cuda = sorted({
+        parameter.device.type
+        for parameter in model.parameters()
+        if parameter.device.type != "cuda"
+    })
+    offload_hooks = [
+        name for name, module in model.named_modules()
+        if getattr(getattr(module, "_hf_hook", None), "offload", False)
+    ]
+    if non_cuda or offload_hooks:
+        raise RuntimeError(
+            "The checkpoint did not fit on the GPU and accelerate offloaded "
+            f"part of it (devices={non_cuda}, offload_hooks={len(offload_hooks)}). "
+            "Restart the runtime to release stale VRAM, then rerun from the top."
+        )
+    free_gib = torch.cuda.mem_get_info()[0] / 1024**3
+    if free_gib < minimum_free_gib:
+        raise RuntimeError(
+            f"Only {free_gib:.1f} GiB VRAM is free after the load; the KV "
+            "cache and generation workspaces need headroom. Restart the "
+            "runtime and rerun from the top."
+        )
+    print(f"Model fully resident on GPU; {free_gib:.1f} GiB VRAM free.")
+
+release_stale_gpu_state()
 
 hf_token = userdata.get("HF_TOKEN") if userdata is not None else os.getenv("HF_TOKEN")
 if not hf_token:
@@ -468,8 +514,10 @@ def build_00_preflight():
                 if MODEL_REVISION:
                     load_kwargs["revision"] = MODEL_REVISION
 
+                require_free_vram(60.0)
                 torch.cuda.reset_peak_memory_stats()
                 model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+                assert_model_fully_resident(model)
                 peak_gib = torch.cuda.max_memory_reserved() / 1024**3
                 print(f"Loaded {MODEL_ID}; peak reserved VRAM={peak_gib:.2f} GiB")
 
@@ -610,12 +658,14 @@ def build_01_baseline():
                     if not any(marker in key.upper() for marker in secret_markers)
                 }
 
+                require_free_vram(60.0)
                 model, tokenizer = FastLanguageModel.from_pretrained(
                     model_name=MODEL_ID,
                     max_seq_length=MAX_SEQUENCE_LENGTH,
                     load_in_4bit=False,
                     full_finetuning=False,
                 )
+                assert_model_fully_resident(model)
                 FastLanguageModel.for_inference(model)
                 """
             ),
@@ -1287,6 +1337,7 @@ def build_03_sft():
             markdown("## Load the model and discover supported LoRA targets"),
             code(
                 r"""
+                require_free_vram(60.0)
                 model, tokenizer = FastLanguageModel.from_pretrained(
                     model_name=MODEL_ID,
                     max_seq_length=MAX_SEQ_LENGTH,
@@ -1295,6 +1346,7 @@ def build_03_sft():
                     full_finetuning=False,
                     token=hf_token,
                 )
+                assert_model_fully_resident(model)
 
                 candidate_suffixes = {
                     "q_proj", "k_proj", "v_proj", "o_proj",
@@ -1596,6 +1648,7 @@ def build_04_dpo():
             markdown("## Load the accepted SFT adapter"),
             code(
                 r"""
+                require_free_vram(60.0)
                 model, tokenizer = FastLanguageModel.from_pretrained(
                     model_name=SFT_ADAPTER_ID,
                     revision=None if SFT_ADAPTER_REVISION.startswith("REPLACE_") else SFT_ADAPTER_REVISION,
@@ -1604,6 +1657,7 @@ def build_04_dpo():
                     load_in_4bit=False,
                     token=hf_token,
                 )
+                assert_model_fully_resident(model)
                 tokenizer.padding_side = "left"
                 trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
                 total = sum(parameter.numel() for parameter in model.parameters())
@@ -2039,6 +2093,7 @@ def build_05_grpo():
 
                 trainer = None
                 if AGENTIC_TRL_AVAILABLE:
+                    require_free_vram(24.0 if use_quantized_policy else 60.0)
                     model, tokenizer = FastLanguageModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
                         revision=None if ACCEPTED_REVISION.startswith("REPLACE_") else ACCEPTED_REVISION,
@@ -2047,6 +2102,7 @@ def build_05_grpo():
                         load_in_4bit=use_quantized_policy,
                         token=hf_token,
                     )
+                    assert_model_fully_resident(model)
                     if not any(parameter.requires_grad for parameter in model.parameters()):
                         raise RuntimeError("Accepted adapter has no trainable parameters; inspect PEFT loading before RL.")
 
@@ -2201,6 +2257,7 @@ def build_06_qat_export():
                     except ImportError as exc:
                         raise RuntimeError("Install the matched TorchAO/Fbgemm pair and restart first.") from exc
 
+                    require_free_vram(60.0)
                     qat_model, qat_tokenizer = FastLanguageModel.from_pretrained(
                         model_name=MERGED_MODEL_ID,
                         max_seq_length=MAX_SEQ_LENGTH,
@@ -2208,6 +2265,7 @@ def build_06_qat_export():
                         load_in_4bit=False,
                         token=hf_token,
                     )
+                    assert_model_fully_resident(qat_model)
                     qat_model = FastLanguageModel.get_peft_model(
                         qat_model,
                         r=16,
@@ -2294,6 +2352,7 @@ def build_06_qat_export():
             code(
                 r"""
                 if RUN_STANDARD_GGUF_EXPORT:
+                    require_free_vram(60.0)
                     export_model, export_tokenizer = FastLanguageModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
                         revision=ACCEPTED_REVISION,
@@ -2302,6 +2361,7 @@ def build_06_qat_export():
                         load_in_4bit=False,
                         token=hf_token,
                     )
+                    assert_model_fully_resident(export_model)
                     export_model.push_to_hub_gguf(
                         GGUF_OUTPUT_ID,
                         export_tokenizer,
