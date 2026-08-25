@@ -1292,6 +1292,15 @@ def build_03_sft():
                 run remains gated until the baseline, schema-survival, split, and
                 replay checks pass.
 
+                This stage is agentic-coding-only by policy: the corpus contains
+                no general-capability replay slice, and drift on non-coding chat
+                is an accepted trade rather than a gate. Specialisation comes
+                from concentrated coding gradients and adapter capacity — never
+                from unlearning objectives on general text, which regress the
+                coding gates themselves. Acceptance still requires coding,
+                tool-protocol and harness-safety non-regression against the
+                frozen baseline.
+
                 **Input:** a private dataset from notebook 02.
                 **Output:** a versioned LoRA adapter, not a merged base model.
                 """
@@ -1326,6 +1335,8 @@ def build_03_sft():
 
                 run_manifest = {
                     "stage": "sft",
+                    "objective": "agentic-coding",
+                    "general_retention_share": 0.0,
                     "model_id": MODEL_ID,
                     "dataset_id": DATASET_ID,
                     "dataset_revision": DATASET_REVISION,
@@ -2083,6 +2094,7 @@ def build_05_grpo():
                 r"""
                 use_quantized_policy = ROLLOUT_POLICY_PRECISION == "bnb4"
                 policy_manifest = {
+                    "objective": "agentic-coding",
                     "accepted_adapter_id": ACCEPTED_ADAPTER_ID,
                     "accepted_revision": ACCEPTED_REVISION,
                     "rollout_update_precision": ROLLOUT_POLICY_PRECISION,

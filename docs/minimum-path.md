@@ -157,8 +157,8 @@ teacher, human-guided run or verified model attempts. If that corpus cannot be
 produced, reduce the smoke run rather than filling the quota with translated
 traces.
 
-The original 45% agentic token mixture is a later target, not a prerequisite or
-a promise that 45% of public traces will survive conversion.
+The 50% agentic token mixture is a later target, not a prerequisite or a
+promise that half of public traces will survive conversion.
 
 ## Evaluation budget produced by Experiment 1
 
