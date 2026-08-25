@@ -61,14 +61,16 @@ dominate unexpectedly.
 
 | Category | Initial token share | Purpose |
 | --- | ---: | --- |
-| Successful repository-agent trajectories | 45% | Core inspect/edit/test loop |
-| Verified code generation and reasoning | 20% | Algorithmic and implementation retention |
+| Successful repository-agent trajectories | 50% | Core inspect/edit/test loop |
+| Verified code generation and reasoning | 20% | Algorithmic and implementation depth |
 | Debugging, test repair and refactoring | 20% | Diagnosis and minimal patches |
-| Tool protocol, failures and recovery | 10% | Robust JSON and replanning |
-| General capability and safety retention | 5% | Limit catastrophic specialisation |
+| Tool protocol, failures and recovery | 10% | Robust tool calls and replanning |
+
+There is deliberately no general-capability replay slice; see the
+[specialisation policy](#specialisation-policy) below.
 
 Treat this as a later starting hypothesis, not a data-acquisition quota. The
-45% agentic component must contain target-schema trajectories generated or
+50% agentic component must contain target-schema trajectories generated or
 replayed through this project's adapter. If insufficient native data exists,
 run a smaller experiment or postpone main SFT rather than filling the share
 with syntactically translated third-party traces. Adjust the mixture using
@@ -82,6 +84,40 @@ Balance other important dimensions:
 - short versus long repository context;
 - successful first attempts versus recovery after realistic failures; and
 - `low`, `medium` and `xhigh` reasoning effort.
+
+## Specialisation policy
+
+The corpus is 100% software-engineering data. Every training token in every
+stage — SFT demonstrations, preference pairs and RL episodes — should push the
+policy toward the inspect/edit/test loop through the native six-tool schema.
+There is no general-chat, world-knowledge or open-domain slice, and none should
+be added as "insurance": drift on non-coding chat is an accepted cost of
+specialisation, not a defect, and it is neither replayed against nor gated on.
+
+Two boundaries keep the intent honest:
+
+- **Specialisation is concentrated signal, not deleted knowledge.** Parameters
+  are not a budget that general knowledge occupies and coding can reclaim.
+  Targeted unlearning objectives — gradient ascent, corrupted labels or random
+  targets on general text — damage the shared representations that coding,
+  instruction following and tool use sit on, and reliably regress the coding
+  gates this project exists to pass. Do not use them. The levers that convert
+  capacity into coding skill are more verified coding tokens, adapter rank
+  (see the training plan's escalation note), and longer training within the
+  stop conditions.
+- **The adapter is where the specialisation lives.** LoRA keeps the base
+  weights frozen, so the coding specialisation scales with adapter capacity,
+  merges into the release checkpoint, and stays reversible during
+  development. The general ability that coding itself depends on — reading
+  documentation, requirements and error text in natural language — survives
+  through the frozen base and through coding data that exercises it. That is
+  the only general knowledge this project needs to keep.
+
+Safety behaviour inside the agent harness — refusing destructive commands,
+staying in the sandbox, not fabricating verification — is not general-chat
+retention and is not covered by this trade. It is trained by the tool
+protocol/failure category, enforced by the environment, scored by the RL
+safety penalty, and checked at every acceptance gate.
 
 ## Public seed sources
 
@@ -132,9 +168,21 @@ replay success rate. Regardless of the audit, 100% of the main SFT mixture's
 data can supply tasks from which those trajectories are regenerated.
 
 For the first 4K SFT smoke run, target 100–300 successful native trajectories.
-They may be teacher-generated, human-guided or model-generated, but they must
-execute in the target harness and pass verification. This is deliberately much
-smaller than a production corpus.
+They may be teacher-generated, human-guided, model-generated or scripted, but
+they must execute in the target harness and pass verification. This is
+deliberately much smaller than a production corpus.
+
+The repository ships that smoke corpus: `scripts/generate_sft_corpus.py`
+drives the real six-tool harness over pytest-verified fixture repositories
+and emits `data/native_sft/trajectories.jsonl` (scripted gold trajectories —
+every observation recorded from a real execution, five trajectory shapes
+including failure recovery and test authoring, reasoning-effort mix per this
+document). `scripts/generate_preference_pairs.py` produces the matching
+execution-derived preference pairs. Both artifacts carry quality reports with
+real-tokenizer length statistics and are validated by the test suite against
+notebook 02's exact row validation. They satisfy the smoke gate only; the
+main SFT mixture still requires regenerated trajectories from real
+repositories.
 
 ## Demonstration filtering
 

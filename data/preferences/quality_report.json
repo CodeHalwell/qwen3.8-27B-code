@@ -1,0 +1,45 @@
+{
+  "generator_version": "scripted-gold-v1",
+  "rows": 60,
+  "corpus_sha256": "d30f454b6a510ff7775681c0661ff9fa93592b114d34d680a8dd5400f01e483f",
+  "families": {
+    "bounds": 5,
+    "config": 5,
+    "csv_fields": 5,
+    "dedupe": 5,
+    "intervals": 5,
+    "lru_cache": 5,
+    "retry": 5,
+    "ring_buffer": 5,
+    "rpn_calc": 5,
+    "slugify": 5,
+    "stats": 5,
+    "version_cmp": 5
+  },
+  "contrast_types": {
+    "inspect_first": 12,
+    "patch_outcome": 24,
+    "test_integrity": 12,
+    "verification_claim": 12
+  },
+  "chosen_tool_call_pairs": 60,
+  "prompts_with_executed_observations": 48,
+  "execution": "prompts are real executed prefixes (verbatim harness observations); patch contrasts ran both candidate patches through the unit suite and rewards mirror observed outcomes",
+  "limits": [
+    "chosen continuations are single next-turn tool calls; no multi-turn preference rollouts yet",
+    "inspect_first pairs are grounded by an executable read but ranked by the scope policy",
+    "prompts share fixture families with the SFT corpus (parameter-disjoint variants)",
+    "pytest observations in prompts embed wall-clock timings, so regeneration is structurally but not byte identical"
+  ],
+  "rendered": {
+    "rows": 60,
+    "tokenizer": "unsloth/Qwen3.8-27B",
+    "completion_tokens": {
+      "p50": 104,
+      "p90": 163,
+      "p99": 175,
+      "max": 175,
+      "total": 10369
+    }
+  }
+}

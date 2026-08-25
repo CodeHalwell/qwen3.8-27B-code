@@ -153,12 +153,19 @@ Public agent datasets may contribute in three ways:
 Do not rename third-party tools or fabricate target-tool observations. The
 agentic portion of SFT must be generated or replayed through the target adapter.
 For the 4K smoke SFT, collect 100–300 successful native trajectories through a
-teacher, human-guided run or verified model attempts. If that corpus cannot be
-produced, reduce the smoke run rather than filling the quota with translated
-traces.
+teacher, human-guided run, verified model attempts or scripted gold
+trajectories. If that corpus cannot be produced, reduce the smoke run rather
+than filling the quota with translated traces.
 
-The original 45% agentic token mixture is a later target, not a prerequisite or
-a promise that 45% of public traces will survive conversion.
+The repository already carries the scripted option:
+`data/native_sft/trajectories.jsonl` holds 204 execution-verified
+native-schema trajectories from `scripts/generate_sft_corpus.py`, sized and
+validated for exactly this smoke gate. Point notebook 02's
+`SOURCE_LOCAL_JSONL` at it instead of postponing the smoke run on data
+collection.
+
+The 50% agentic token mixture is a later target, not a prerequisite or a
+promise that half of public traces will survive conversion.
 
 ## Evaluation budget produced by Experiment 1
 

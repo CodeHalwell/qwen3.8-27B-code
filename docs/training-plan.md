@@ -9,6 +9,15 @@ that passed the previous evaluation gate, and each has a frozen control run.
 baseline -> SFT smoke -> main SFT -> preference optimisation -> agentic RL
 ```
 
+Every stage optimises a single objective: agentic coding through the native
+six-tool schema. The corpus carries no general-capability replay slice (see
+the [specialisation policy](data-strategy.md#specialisation-policy)); drift on
+non-coding chat is an accepted trade, while coding, tool-protocol and
+harness-safety regressions remain hard stop conditions. Concentrated coding
+gradients are the mechanism for that trade — do not add unlearning objectives
+to force it further, because deleting general knowledge does not free capacity
+and measurably damages the coding behaviour these stages are gated on.
+
 Do not begin online RL until rewards are unit-tested and SFT already produces
 valid tool calls. RL is a poor way to repair a broken template or malformed
 dataset.
@@ -74,7 +83,7 @@ Starting configuration:
 | --- | --- | --- |
 | Base model | `unsloth/Qwen3.8-27B` | Pin Hub revision |
 | Precision | BF16 LoRA | Fall back to 4-bit QLoRA after measured OOM only |
-| LoRA rank / alpha | 16 / 32 | Compare rank 8 or 32 only after baseline run |
+| LoRA rank / alpha | 16 / 32 | Escalate to 32 / 64 as the specialisation lever once the 16 / 32 baseline passes its gate; change one axis per run |
 | LoRA dropout | 0 | Unsloth-optimised default |
 | Target | Language all-linear after module discovery | Explicitly exclude vision |
 | Sequence length | 8,192 | 4,096 smoke; profile 16,384 separately |
@@ -234,5 +243,9 @@ Stop or roll back when any of the following persists across evaluation noise:
 - the model learns repeated calls, test suppression or another reward exploit;
 - training becomes numerically unstable; or
 - dataset/reward contamination is discovered.
+
+Drift on non-coding chat is not on this list by design: the specialisation
+policy accepts it. Stop only on the coding, tool-protocol, safety and
+stability signals above.
 
 The best checkpoint may precede the final training step.

@@ -1,0 +1,62 @@
+{
+  "generator_version": "scripted-gold-v1",
+  "rows": 204,
+  "corpus_sha256": "73c943ded0af5614df0f3fc5f9f7f5baeba97e13edabf799c42907b017eb9fcc",
+  "families": {
+    "bounds": 17,
+    "config": 17,
+    "csv_fields": 17,
+    "dedupe": 17,
+    "intervals": 17,
+    "lru_cache": 17,
+    "retry": 17,
+    "ring_buffer": 17,
+    "rpn_calc": 17,
+    "slugify": 17,
+    "stats": 17,
+    "version_cmp": 17
+  },
+  "shapes": {
+    "inspect_answer": 10,
+    "recovery": 30,
+    "search_first": 31,
+    "standard": 115,
+    "test_author": 18
+  },
+  "reasoning_effort": {
+    "low": 61,
+    "medium": 102,
+    "xhigh": 41
+  },
+  "tool_calls": {
+    "total": 747,
+    "mean_per_row": 3.662,
+    "max_per_row": 6
+  },
+  "approx_whitespace_tokens": {
+    "note": "whitespace proxy; run scripts/validate_dataset_rendering.py for real token counts",
+    "p50": 234,
+    "p90": 415,
+    "p99": 483,
+    "max": 541
+  },
+  "limits": [
+    "Python-only fixtures with pytest as the sole build system",
+    "single-file gold fixes; multi-file work needs real repositories",
+    "scripted gold trajectories: no model-generated exploration variance",
+    "pytest observations embed wall-clock timings, so regeneration is structurally but not byte identical"
+  ],
+  "execution": "every observation recorded from a real harness run; run_tests invoked pytest in the fixture repository",
+  "rendered": {
+    "rows": 204,
+    "tokenizer": "unsloth/Qwen3.8-27B",
+    "tokens": {
+      "p50": 1066,
+      "p90": 1487,
+      "p99": 1753,
+      "max": 1774,
+      "total": 235555
+    },
+    "max_length_checked": 4096
+  }
+}

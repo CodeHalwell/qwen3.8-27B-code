@@ -5,6 +5,12 @@ for a Google Colab **G4** runtime (RTX PRO 6000 Blackwell Server Edition,
 96 GB). They use trainable safetensors from `unsloth/Qwen3.8-27B`; the GGUF
 repository is an inference and quantisation baseline, not a training source.
 
+The whole suite optimises one objective: agentic coding through the native
+six-tool schema. Every training stage — SFT, DPO and the GRPO pilot — consumes
+only execution-verified software-engineering data; there is no general-chat
+replay slice, and drift on non-coding chat is an accepted trade rather than a
+gate (see the [specialisation policy](../docs/data-strategy.md#specialisation-policy)).
+
 ## Run order
 
 | Notebook | Purpose | Required gate before continuing |
@@ -13,7 +19,7 @@ repository is an inference and quantisation baseline, not a training source.
 | [01 · Tool-calling baseline](01_tool_calling_baseline.ipynb) | Run the upstream model through the exact six-tool surface and price a small evaluation gate | Manually classify every pilot failure and record episode cost |
 | [02 · Prepare SFT data](02_prepare_sft_data.ipynb) | Validate, render, measure, split and optionally publish native-schema trajectories | 100–300 replayable native trajectories; frozen repository-family split |
 | [03 · SFT LoRA](03_sft_lora.ipynb) | Train a language-only BF16 LoRA with assistant-only loss | Held-out coding and tool metrics beat the frozen baseline |
-| [04 · DPO preferences](04_dpo_preferences.ipynb) | Apply a small verifier-backed preference stage | DPO beats the accepted SFT adapter without retention regressions |
+| [04 · DPO preferences](04_dpo_preferences.ipynb) | Apply a small verifier-backed preference stage | DPO beats the accepted SFT adapter without coding, tool-protocol or preserved-thinking regressions |
 | [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment and reward tests; trainer integration is compatibility-gated | Reward fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
 | [06 · QAT and export](06_qat_and_export.ipynb) | Create separate QAT/TorchAO and standard GGUF experiments; prepare Dynamic calibration data | Quantised artifacts pass the frozen long-horizon gate against one BF16 reference |
 
@@ -36,6 +42,30 @@ the adjacent official Qwen3.5 27B example.
 Every expensive or externally persistent operation is off by default behind a
 `RUN_*`, `PUSH_*`, `SAVE_*` or `BUILD_*` flag. The included fixture rows prove
 plumbing only; they are explicitly not training data for a capability run.
+
+## Bootstrap corpus
+
+The repository ships a CPU-generated, execution-verified bootstrap corpus:
+`data/native_sft/trajectories.jsonl` (204 native six-tool trajectories) and
+`data/preferences/pairs.jsonl` (60 execution-derived preference pairs), each
+with a quality report that includes real-tokenizer length statistics. In
+Colab, upload the JSONL (or clone this repository) and set
+`SOURCE_LOCAL_JSONL` in notebook 02 or `PREFERENCE_LOCAL_JSONL` in notebook
+04 to its path; notebook 02 remains the publisher that validates, splits and
+pushes the private Hub dataset notebooks 03 and 06 consume. Regenerate or
+extend the corpus locally with:
+
+```bash
+uv run --group dev python scripts/generate_sft_corpus.py
+uv run --group dev python scripts/generate_preference_pairs.py
+uv run --group dev --with "transformers==5.3.0" --with jinja2 \
+    python scripts/validate_dataset_rendering.py
+```
+
+These are scripted gold trajectories over pytest-verified fixture
+repositories — real executions, native schema, honest observations — sized
+for the smoke-SFT gate, not a substitute for the production corpus from real
+repositories described in the data strategy.
 
 ## Design choices inherited from the Unsloth examples
 
