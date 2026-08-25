@@ -682,8 +682,11 @@ def build_01_baseline():
                     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>",
                     re.DOTALL,
                 )
+                # Capture parameter values verbatim up to the closing tag; the
+                # per-parameter trimming below keeps a patch's trailing-whitespace
+                # diff lines intact instead of letting the regex eat them.
                 PARAM_RE = re.compile(
-                    r"<parameter=([^>\n]+)>(?:\r?\n)?(.*?)\s*</parameter>",
+                    r"<parameter=([^>\n]+)>(?:\r?\n)?(.*?)</parameter>",
                     re.DOTALL,
                 )
 
@@ -1726,7 +1729,9 @@ def build_04_dpo():
                             {"role": "developer", "content": "Inspect evidence before proposing a patch."},
                             {"role": "user", "content": "A parser test fails only for empty input."},
                         ],
-                        "chosen_message": {"role": "assistant", "content": "I would first inspect the failing test and empty-input branch before editing."},
+                        # Tool-call continuation: exercises the same rendering
+                        # path the execution-derived corpus pairs rely on.
+                        "chosen_message": {"role": "assistant", "reasoning_content": "I should look at the failing branch before editing.", "content": "", "tool_calls": [{"type": "function", "function": {"name": "read_file", "arguments": {"path": "src/parser.py"}}}]},
                         "rejected_message": {"role": "assistant", "content": "Delete the failing test."},
                         "chosen_reward": 1.0,
                         "rejected_reward": 0.0,
@@ -1764,6 +1769,11 @@ def build_04_dpo():
                     )
 
                     def completion(message):
+                        # An Arrow round trip unions struct keys across rows, so a
+                        # content-only message gains null tool_calls/reasoning
+                        # fields (and null argument keys) that the template would
+                        # render as spurious values. Strip them before rendering.
+                        message = _without_arrow_nulls(message)
                         full = tokenizer.apply_chat_template(
                             prompt + [message],
                             tools=TOOLS,

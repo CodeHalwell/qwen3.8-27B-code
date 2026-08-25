@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import sys
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
 from qwen3_8_27b_code import fixtures, harness, parsing, preferences, schema, trajectories
 
@@ -72,6 +72,11 @@ def test_package_parser_matches_notebook_parser_cell():
     namespace = {"re": re}
     exec(parser_cell, namespace)
 
+    trailing_space_probe = (
+        "<tool_call>\n<function=apply_patch>\n<parameter=patch>\n"
+        "--- a/src/x.py\n+++ b/src/x.py\n@@ -1,1 +1,1 @@\n-old\n+new \n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
     probes = [
         "<think>plan</think>\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/cache.py\n</parameter>\n</function>\n</tool_call>",
         (
@@ -79,10 +84,16 @@ def test_package_parser_matches_notebook_parser_cell():
             "--- a/src/x.py\n+++ b/src/x.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
             "</parameter>\n</function>\n</tool_call>"
         ),
+        trailing_space_probe,
         "plain final answer with no calls",
     ]
     for probe in probes:
         assert namespace["parse_tool_calls"](probe) == parsing.parse_tool_calls(probe)
+
+    # A diff line that intentionally ends in whitespace must survive parsing
+    # (parity alone would also pass if both copies were wrong).
+    patch = parsing.parse_tool_calls(trailing_space_probe)[1][0]["function"]["arguments"]["patch"]
+    assert patch.endswith("+new "), repr(patch[-8:])
 
 
 def test_package_harness_matches_notebook_executor(tmp_path):
@@ -174,14 +185,39 @@ def test_committed_preference_pairs_satisfy_notebook_04_contract():
     for pair in pairs:
         assert pair["infra_status"] == "ok"
         assert pair["chosen_reward"] > pair["rejected_reward"]
-        assert {message["role"] for message in pair["prompt_messages"]} <= {"developer", "system", "user"}
+        assert {message["role"] for message in pair["prompt_messages"]} <= {"developer", "system", "user", "assistant", "tool"}
         assert pair["chosen_message"]["role"] == "assistant"
         assert pair["rejected_message"]["role"] == "assistant"
-        assert pair["chosen_message"]["content"] != pair["rejected_message"]["content"]
+        assert pair["chosen_message"] != pair["rejected_message"]
         assert pair["evidence"]["basis"]
-    executed = [pair for pair in pairs if pair["contrast_type"] == "patch_outcome"]
-    assert all(pair["evidence"]["chosen_run"] == "exit=0" for pair in executed)
-    assert all(pair["evidence"]["rejected_run"] != "exit=0" for pair in executed)
+        # The behaviour DPO rewards must be visible to the trainer: the chosen
+        # continuation acts (a tool call), never claims untraced completed work.
+        assert pair["chosen_message"].get("tool_calls"), pair["id"]
+
+    by_contrast = {}
+    for pair in pairs:
+        by_contrast.setdefault(pair["contrast_type"], []).append(pair)
+
+    for pair in by_contrast["patch_outcome"]:
+        assert pair["evidence"]["chosen_run"] == "exit=0"
+        assert pair["evidence"]["rejected_run"] != "exit=0"
+        assert pair["rejected_message"]["tool_calls"][0]["function"]["name"] == "apply_patch"
+        assert any(message["role"] == "tool" for message in pair["prompt_messages"])
+    for pair in by_contrast["verification_claim"]:
+        assert pair["evidence"]["chosen_run"] == "exit=0"
+        assert pair["chosen_message"]["tool_calls"][0]["function"]["name"] == "run_tests"
+        # State: patch applied in-transcript, tests not yet run.
+        assert any(message.get("content") == "patch applied" for message in pair["prompt_messages"])
+    for pair in by_contrast["test_integrity"]:
+        assert pair["evidence"]["failing_run"] != "exit=0"
+        assert pair["evidence"]["chosen_run"] == "exit=0"
+        # The failing run the rejected message wants to hide is in the transcript.
+        assert any(
+            message["role"] == "tool" and message["content"].startswith("exit=") and not message["content"].startswith("exit=0")
+            for message in pair["prompt_messages"]
+        )
+    for pair in by_contrast["inspect_first"]:
+        assert pair["chosen_message"]["tool_calls"][0]["function"]["name"] == "read_file"
 
 
 def test_synthesis_still_produces_valid_rows_end_to_end():
@@ -202,6 +238,44 @@ def test_preference_generation_grounds_patch_contrasts():
     pair = preferences._build_pair(task, "patch_outcome", "pref/stats-test")
     assert pair["evidence"]["chosen_run"] == "exit=0"
     assert pair["evidence"]["rejected_run"].startswith("exit=") and pair["evidence"]["rejected_run"] != "exit=0"
+    chosen_patch = pair["chosen_message"]["tool_calls"][0]["function"]["arguments"]["patch"]
+    assert chosen_patch == trajectories.unified_patch(task.module_path, task.buggy_module, task.fixed_module)
+    # The prompt prefix carries the real read observation the decision is based on.
+    assert pair["prompt_messages"][-1]["role"] == "tool"
+    assert pair["prompt_messages"][-1]["content"].startswith("def ") or "class " in pair["prompt_messages"][-1]["content"]
+
+
+def _assert_no_none_leaves(value, path="message"):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert item is not None, f"null leaked into rendered {path}.{key}"
+            _assert_no_none_leaves(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _assert_no_none_leaves(item, f"{path}[{index}]")
+
+
+class _NullRejectingTokenizer:
+    """Fails the render if Arrow-injected nulls reach the chat template."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        _assert_no_none_leaves(messages)
+        return "<render>"
+
+
+def test_notebook_04_render_cell_strips_arrow_nulls_from_completions():
+    """A tool-call chosen next to a content-only rejected unions their struct
+    keys through Arrow; the render cell must strip the injected nulls before
+    the template sees them."""
+    generator = load_generator()
+    notebook_04 = generator.build_04_dpo()
+    namespace = {"json": json, "Dataset": Dataset, "DEMO_MODE": True}
+    exec(generator.TOOLS_CELL, namespace)
+    namespace["tokenizer"] = _NullRejectingTokenizer()
+    exec(code_cell_containing(notebook_04, "demo_preferences = Dataset.from_list"), namespace)
+    preferences_dataset = namespace["preferences"]
+    assert len(preferences_dataset) == 2
+    assert set(preferences_dataset.column_names) == {"prompt", "chosen", "rejected"}
 
 
 def test_corpus_sha_matches_report():

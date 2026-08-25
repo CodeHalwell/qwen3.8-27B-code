@@ -12,8 +12,10 @@ TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>",
     re.DOTALL,
 )
+# Capture parameter values verbatim up to the closing tag; trimming happens
+# per-parameter in code so a patch's trailing-whitespace diff lines survive.
 PARAM_RE = re.compile(
-    r"<parameter=([^>\n]+)>(?:\r?\n)?(.*?)\s*</parameter>",
+    r"<parameter=([^>\n]+)>(?:\r?\n)?(.*?)</parameter>",
     re.DOTALL,
 )
 
