@@ -168,9 +168,21 @@ replay success rate. Regardless of the audit, 100% of the main SFT mixture's
 data can supply tasks from which those trajectories are regenerated.
 
 For the first 4K SFT smoke run, target 100–300 successful native trajectories.
-They may be teacher-generated, human-guided or model-generated, but they must
-execute in the target harness and pass verification. This is deliberately much
-smaller than a production corpus.
+They may be teacher-generated, human-guided, model-generated or scripted, but
+they must execute in the target harness and pass verification. This is
+deliberately much smaller than a production corpus.
+
+The repository ships that smoke corpus: `scripts/generate_sft_corpus.py`
+drives the real six-tool harness over pytest-verified fixture repositories
+and emits `data/native_sft/trajectories.jsonl` (scripted gold trajectories —
+every observation recorded from a real execution, five trajectory shapes
+including failure recovery and test authoring, reasoning-effort mix per this
+document). `scripts/generate_preference_pairs.py` produces the matching
+execution-derived preference pairs. Both artifacts carry quality reports with
+real-tokenizer length statistics and are validated by the test suite against
+notebook 02's exact row validation. They satisfy the smoke gate only; the
+main SFT mixture still requires regenerated trajectories from real
+repositories.
 
 ## Demonstration filtering
 

@@ -1,0 +1,140 @@
+"""Deployment tool schema and chat-normalisation helpers.
+
+This module is the importable twin of the generated notebooks' TOOLS cell.
+The notebooks stay self-contained for Colab, so the definitions exist twice;
+``tests/test_bootstrap_corpus.py`` asserts the canonical fingerprints match so
+the copies cannot drift apart silently.
+"""
+
+from __future__ import annotations
+
+import json
+
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v1"
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files below a repository-relative directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 repository file with bounded output.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "Search repository text using a regular expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified diff to files inside the repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": "Run an allow-listed repository test profile.",
+            "parameters": {
+                "type": "object",
+                "properties": {"profile": {"type": "string", "enum": ["unit"]}},
+                "required": ["profile"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": "Run a restricted allow-listed command. It is disabled in the pilot.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def without_arrow_nulls(value):
+    """Remove null struct fields inserted by a Datasets/Arrow round trip."""
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            normalized = without_arrow_nulls(item)
+            if normalized is not None:
+                cleaned[key] = normalized
+        return cleaned
+    if isinstance(value, list):
+        return [without_arrow_nulls(item) for item in value]
+    return value
+
+
+def canonical_tool_schema(tools: list[dict]) -> str:
+    """Return a stable semantic fingerprint while retaining tool order."""
+    return json.dumps(
+        without_arrow_nulls(tools),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+TOOL_SCHEMA_JSON = canonical_tool_schema(TOOLS)
+
+
+def canonical_to_qwen(messages: list[dict]) -> list[dict]:
+    """Fold an initial developer message into system for the HF tokenizer."""
+    converted = []
+    pending_system = []
+    for stored_message in messages:
+        message = without_arrow_nulls(stored_message)
+        role = message["role"]
+        if role in {"system", "developer"} and not converted:
+            pending_system.append(str(message.get("content", "")))
+            continue
+        if pending_system:
+            converted.append({"role": "system", "content": "\n\n".join(pending_system)})
+            pending_system = []
+        converted.append(message)
+    if pending_system:
+        converted.append({"role": "system", "content": "\n\n".join(pending_system)})
+    return converted

@@ -1,0 +1,42 @@
+{
+  "generator_version": "scripted-gold-v1",
+  "rows": 60,
+  "corpus_sha256": "50c373c0560c2e915d890c0180fdb7383229159e66c59b35522354e1a907c34e",
+  "families": {
+    "bounds": 5,
+    "config": 5,
+    "csv_fields": 5,
+    "dedupe": 5,
+    "intervals": 5,
+    "lru_cache": 5,
+    "retry": 5,
+    "ring_buffer": 5,
+    "rpn_calc": 5,
+    "slugify": 5,
+    "stats": 5,
+    "version_cmp": 5
+  },
+  "contrast_types": {
+    "inspect_first": 12,
+    "patch_outcome": 24,
+    "test_integrity": 12,
+    "verification_claim": 12
+  },
+  "execution": "patch-based contrasts ran both candidate patches through the unit suite; rewards mirror observed outcomes",
+  "limits": [
+    "single-turn assistant continuations; no multi-turn trajectory preferences yet",
+    "inspect_first pairs are policy-based rather than execution-derived",
+    "prompts share fixture families with the SFT corpus (parameter-disjoint variants)"
+  ],
+  "rendered": {
+    "rows": 60,
+    "tokenizer": "unsloth/Qwen3.8-27B",
+    "completion_tokens": {
+      "p50": 27,
+      "p90": 43,
+      "p99": 49,
+      "max": 50,
+      "total": 3445
+    }
+  }
+}

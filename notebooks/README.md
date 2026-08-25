@@ -43,6 +43,30 @@ Every expensive or externally persistent operation is off by default behind a
 `RUN_*`, `PUSH_*`, `SAVE_*` or `BUILD_*` flag. The included fixture rows prove
 plumbing only; they are explicitly not training data for a capability run.
 
+## Bootstrap corpus
+
+The repository ships a CPU-generated, execution-verified bootstrap corpus:
+`data/native_sft/trajectories.jsonl` (204 native six-tool trajectories) and
+`data/preferences/pairs.jsonl` (60 execution-derived preference pairs), each
+with a quality report that includes real-tokenizer length statistics. In
+Colab, upload the JSONL (or clone this repository) and set
+`SOURCE_LOCAL_JSONL` in notebook 02 or `PREFERENCE_LOCAL_JSONL` in notebook
+04 to its path; notebook 02 remains the publisher that validates, splits and
+pushes the private Hub dataset notebooks 03 and 06 consume. Regenerate or
+extend the corpus locally with:
+
+```bash
+uv run --group dev python scripts/generate_sft_corpus.py
+uv run --group dev python scripts/generate_preference_pairs.py
+uv run --group dev --with "transformers==5.3.0" --with jinja2 \
+    python scripts/validate_dataset_rendering.py
+```
+
+These are scripted gold trajectories over pytest-verified fixture
+repositories — real executions, native schema, honest observations — sized
+for the smoke-SFT gate, not a substitute for the production corpus from real
+repositories described in the data strategy.
+
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.

@@ -29,3 +29,13 @@ Regenerate and validate the notebooks locally with:
 uv run --group dev python scripts/build_notebooks.py
 uv run --group dev pytest -q
 ```
+
+The execution-verified bootstrap training data in `data/` (native-schema SFT
+trajectories and preference pairs, with quality reports) regenerates with:
+
+```bash
+uv run --group dev python scripts/generate_sft_corpus.py
+uv run --group dev python scripts/generate_preference_pairs.py
+uv run --group dev --with "transformers==5.3.0" --with jinja2 \
+    python scripts/validate_dataset_rendering.py
+```
