@@ -38,10 +38,18 @@ SHAPE_CYCLE = [
     "inspect_answer", "standard", "recovery", "search_first", "test_author",
 ]
 
-# 10-slot cycle: 50% medium, 30% low, 20% xhigh per docs/data-strategy.md.
+# 10-slot cycle: 60% medium, 40% low.
+#
+# `xhigh` is deliberately absent. The template injects "think carefully through
+# the task, validate key assumptions, consider plausible alternatives" into the
+# system prompt for xhigh, and the scripted gold reasoning here is one sentence
+# per turn. Labelling those turns xhigh would train the model to answer that
+# instruction with a single line, collapsing exactly the deep-reasoning
+# behaviour this project depends on. Reintroduce xhigh only with reasoning
+# actually generated at that effort (see docs/data-strategy.md).
 EFFORT_CYCLE = [
-    "medium", "low", "medium", "xhigh", "medium",
-    "low", "medium", "medium", "low", "xhigh",
+    "medium", "low", "medium", "medium", "low",
+    "medium", "low", "medium", "medium", "low",
 ]
 
 
@@ -247,6 +255,8 @@ def quality_report(rows: list[dict], corpus_path: Path) -> dict:
             "Python-only fixtures with pytest as the sole build system",
             "single-file gold fixes; multi-file work needs real repositories",
             "scripted gold trajectories: no model-generated exploration variance",
+            "reasoning is one scripted sentence per turn and does not vary with effort, "
+            "so only low and medium are labelled; xhigh needs generated reasoning",
             "pytest observations embed wall-clock timings, so regeneration is structurally but not byte identical",
         ],
         "execution": "every observation recorded from a real harness run; run_tests invoked pytest in the fixture repository",

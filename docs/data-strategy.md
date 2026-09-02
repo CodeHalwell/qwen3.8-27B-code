@@ -176,8 +176,15 @@ The repository ships that smoke corpus: `scripts/generate_sft_corpus.py`
 drives the real six-tool harness over pytest-verified fixture repositories
 and emits `data/native_sft/trajectories.jsonl` (scripted gold trajectories —
 every observation recorded from a real execution, five trajectory shapes
-including failure recovery and test authoring, reasoning-effort mix per this
-document). `scripts/generate_preference_pairs.py` produces the matching
+including failure recovery and test authoring).
+
+Those rows are labelled `low` and `medium` only. The template injects "think
+carefully through the task, validate key assumptions, consider plausible
+alternatives" for `xhigh`, and the scripted reasoning is one sentence per
+turn; labelling it `xhigh` would supervise the model to answer that
+instruction with a single line. The reasoning-effort balance below is a target
+for generated trajectories, where the reasoning actually varies with the
+requested effort — never something to reach by relabelling fixed text. `scripts/generate_preference_pairs.py` produces the matching
 execution-derived preference pairs. Both artifacts carry quality reports with
 real-tokenizer length statistics and are validated by the test suite against
 notebook 02's exact row validation. They satisfy the smoke gate only; the
@@ -204,6 +211,16 @@ outcomes. Failed attempts are candidates for preference data.
 
 A preference record must compare continuations from the same state. Whole
 trajectories with unrelated prompts are not valid pairs.
+
+Match the *form* of chosen and rejected continuations as closely as the
+behaviour allows. If every chosen turn is a tool call carrying reasoning while
+every rejected turn is prose, the preference stage learns "tool calls beat
+prose" rather than anything about software engineering — and that lesson
+contradicts the SFT corpus, where a prose answer correctly ends an
+inspect-and-answer episode. Where a contrast genuinely cannot be symmetric,
+because the behaviour being penalised *is* the premature prose answer, record
+that asymmetry in the dataset quality report and keep the reasoning channel
+present on both sides.
 
 Prioritise execution-derived pairs such as:
 

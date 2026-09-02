@@ -67,11 +67,24 @@ repositories — real executions, native schema, honest observations — sized
 for the smoke-SFT gate, not a substitute for the production corpus from real
 repositories described in the data strategy.
 
+Two properties of that corpus are deliberate and worth knowing before you
+train on it. Rows are labelled `low` and `medium` only, because the scripted
+reasoning is one sentence per turn and labelling it `xhigh` would teach the
+model to answer the xhigh instruction with a single line. And three of the four
+preference contrasts put an executed tool call on *both* sides, so the pairs
+cannot be won by preferring tool calls over prose; the fourth
+(`verification_claim`) is asymmetric by nature and says so in its quality
+report.
+
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.
-- LoRA starts at rank 16 with attention and MLP projections, Unsloth gradient
-  checkpointing, BF16 compute and an 8-bit optimizer.
+- LoRA starts at rank 16 over the discovered language linear modules — the
+  full-attention projections, the Gated DeltaNet `in_proj_*`/`out_proj` that
+  three of every four layers use, and the MLP projections — with Unsloth
+  gradient checkpointing, BF16 compute and an 8-bit optimizer. Discovery fails
+  the run if the module set is not the reviewed one, and the vision tower, MTP
+  head and `lm_head` are frozen after attach.
 - SFT trains assistant spans only and inspects a collated label batch before
   optimization. Native rows carry both the tool objects and a canonical schema
   fingerprint; Arrow-inserted null struct fields are removed before structural

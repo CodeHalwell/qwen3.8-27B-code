@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 from urllib.parse import unquote
 
 from datasets import Dataset
@@ -295,6 +296,11 @@ def test_generated_notebooks_have_restart_and_schema_guards():
     assert 'globals().pop(_stale_name, None)' in all_source
     assert "torch.cuda.empty_cache()" in all_source
     assert "torch._dynamo.reset()" in all_source
+    # The masking gate must not be pinned to a phrase only the demo row has.
+    assert 'assert "Implemented the bounded clamp" in joined_supervision' not in all_source
+    assert "masking_problems(" in all_source
+    # A bare "in_proj" matches none of Qwen3.8's DeltaNet projections.
+    assert '"gate_proj", "up_proj", "down_proj", "in_proj", "out_proj",' not in all_source
 
     for notebook in notebooks:
         generator.validate_notebook(notebook, Path("generated.ipynb"))
@@ -388,3 +394,236 @@ def test_local_markdown_links_resolve():
             if local_target and not (markdown_file.parent / local_target).resolve().exists():
                 failures.append(f"{markdown_file.relative_to(ROOT)} -> {target}")
     assert not failures, failures
+
+
+class _FakeParameter:
+    def __init__(self, requires_grad: bool = True):
+        self.requires_grad = requires_grad
+
+    def requires_grad_(self, flag: bool):
+        self.requires_grad = flag
+        return self
+
+    def numel(self) -> int:
+        return 1
+
+
+class _FakeLinear:
+    """Stands in for torch.nn.Linear; gains lora_A when an adapter attaches."""
+
+    def __init__(self):
+        self.lora_A: dict = {}
+
+
+class _FakeNonLinear:
+    """A norm or embedding: discovery must never target it."""
+
+
+class _FakeTorch:
+    bfloat16 = "bfloat16"
+
+    class nn:
+        Linear = _FakeLinear
+
+
+def qwen38_linear_module_names() -> list[str]:
+    """The linear modules the published Qwen3.8-27B weight index actually has.
+
+    Three of every four layers are Gated DeltaNet (`linear_attn`), whose
+    projections are named in_proj_qkv/z/a/b and out_proj. config.json places
+    the full-attention layer at every fourth position.
+    """
+    names = []
+    for layer in range(64):
+        prefix = f"model.language_model.layers.{layer}"
+        if layer % 4 == 3:
+            names += [f"{prefix}.self_attn.{projection}_proj" for projection in ("q", "k", "v", "o")]
+        else:
+            names += [
+                f"{prefix}.linear_attn.{projection}"
+                for projection in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj")
+            ]
+        names += [f"{prefix}.mlp.{projection}_proj" for projection in ("gate", "up", "down")]
+    names += [f"mtp.layers.0.self_attn.{projection}_proj" for projection in ("q", "k", "v", "o")]
+    names += [f"mtp.layers.0.mlp.{projection}_proj" for projection in ("gate", "up", "down")]
+    names.append("mtp.fc")
+    for block in range(27):
+        names += [
+            f"model.visual.blocks.{block}.attn.qkv",
+            f"model.visual.blocks.{block}.attn.proj",
+            f"model.visual.blocks.{block}.mlp.linear_fc1",
+            f"model.visual.blocks.{block}.mlp.linear_fc2",
+        ]
+    names += ["model.visual.merger.linear_fc1", "model.visual.merger.linear_fc2", "lm_head"]
+    return names
+
+
+class _FakeQwen38Model:
+    def __init__(self):
+        self._modules = {name: _FakeLinear() for name in qwen38_linear_module_names()}
+        self._modules["model.language_model.norm"] = _FakeNonLinear()
+        self._parameters = {f"{name}.weight": _FakeParameter(False) for name in self._modules}
+
+    def named_modules(self):
+        return list(self._modules.items())
+
+    def named_parameters(self):
+        return list(self._parameters.items())
+
+    def parameters(self):
+        return list(self._parameters.values())
+
+    def print_trainable_parameters(self):
+        return None
+
+    def attach_lora(self, target_modules: set[str]) -> None:
+        # PEFT matches target_modules by name suffix, so the MTP head's own
+        # q_proj/o_proj are adapted too unless something freezes them.
+        for name, module in self._modules.items():
+            if isinstance(module, _FakeLinear) and name.rsplit(".", 1)[-1] in target_modules:
+                module.lora_A = {"default": object()}
+                self._parameters[f"{name}.lora_A.default.weight"] = _FakeParameter(True)
+
+
+class _FakeFastLanguageModel:
+    @staticmethod
+    def from_pretrained(**kwargs):
+        # Notebook 04 sets tokenizer.padding_side, so the stand-in must accept
+        # attribute assignment.
+        return _FakeQwen38Model(), SimpleNamespace()
+
+    @staticmethod
+    def get_peft_model(model, target_modules, **kwargs):
+        model.attach_lora(set(target_modules))
+        return model
+
+
+REVIEWED_SUFFIXES = {
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+    "gate_proj", "up_proj", "down_proj",
+}
+
+
+def run_lora_discovery(cell: str) -> dict:
+    namespace = {
+        "json": json,
+        "torch": _FakeTorch,
+        "FastLanguageModel": _FakeFastLanguageModel,
+        "require_free_vram": lambda *_: 90.0,
+        "assert_model_fully_resident": lambda *_, **__: None,
+        "MODEL_ID": "unsloth/Qwen3.8-27B",
+        "MERGED_SFT_MODEL_ID": "user/merged",
+        "MERGED_SFT_REVISION": "REPLACE_WITH_ACCEPTED_COMMIT",
+        "MAX_SEQ_LENGTH": 4096,
+        "hf_token": "token",
+    }
+    exec(cell, namespace)
+    return namespace
+
+
+def test_lora_adapters_cover_the_gated_deltanet_layers():
+    """Three of four Qwen3.8 layers are linear attention. A suffix list built
+    for a standard transformer misses every one of their projections."""
+    generator = load_generator()
+    namespace = run_lora_discovery(
+        code_cell_containing(generator.build_03_sft(), "REVIEWED_TARGET_SUFFIXES")
+    )
+
+    assert set(namespace["target_modules"]) == REVIEWED_SUFFIXES
+    adapted = namespace["adapted_counts"]
+    for projection in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+        assert adapted[projection] == 48, projection
+    for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        assert adapted[projection] == 16, projection
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        assert adapted[projection] == 64, projection
+    assert sum(adapted.values()) == 496
+
+
+def test_lora_leaves_the_mtp_head_and_vision_tower_frozen():
+    generator = load_generator()
+    namespace = run_lora_discovery(
+        code_cell_containing(generator.build_03_sft(), "REVIEWED_TARGET_SUFFIXES")
+    )
+    parameters = dict(namespace["model"].named_parameters())
+
+    # Suffix matching does reach the MTP head, so the freeze is load-bearing.
+    mtp_adapters = [name for name in parameters if name.startswith("mtp.") and "lora_A" in name]
+    assert mtp_adapters, "expected suffix matching to reach the MTP head"
+    assert not [name for name in mtp_adapters if parameters[name].requires_grad]
+    assert not [
+        name for name, parameter in parameters.items()
+        if parameter.requires_grad and "visual" in name
+    ]
+
+
+def test_sft_and_dpo_attach_adapters_to_the_same_module_set():
+    """A different subnetwork per stage would make the DPO delta uninterpretable."""
+    generator = load_generator()
+    sft = run_lora_discovery(code_cell_containing(generator.build_03_sft(), "REVIEWED_TARGET_SUFFIXES"))
+    dpo = run_lora_discovery(code_cell_containing(generator.build_04_dpo(), "REVIEWED_TARGET_SUFFIXES"))
+
+    assert sft["REVIEWED_TARGET_SUFFIXES"] == dpo["REVIEWED_TARGET_SUFFIXES"] == REVIEWED_SUFFIXES
+    assert sft["adapted_counts"] == dpo["adapted_counts"]
+
+
+def test_sft_resume_picks_the_highest_numbered_checkpoint(tmp_path):
+    """checkpoint-10 sorts before checkpoint-9 as a string."""
+    generator = load_generator()
+    namespace = {"RUN_TRAINING": False}
+    exec(code_cell_containing(generator.build_03_sft(), "def latest_checkpoint"), namespace)
+    latest_checkpoint = namespace["latest_checkpoint"]
+
+    for name in ("checkpoint-2", "checkpoint-9", "checkpoint-10", "checkpoint-final"):
+        (tmp_path / name).mkdir()
+    assert latest_checkpoint(tmp_path).name == "checkpoint-10"
+    assert latest_checkpoint(tmp_path / "absent") is None
+
+
+def test_baseline_treats_truncated_and_overlong_turns_as_terminations():
+    """A turn cut off at the token cap parses as 'no tool calls', so storing it
+    as the final answer scores a truncation as a completed episode."""
+    generator = load_generator()
+    baseline = generator.build_01_baseline()
+    generation_cell = code_cell_containing(baseline, "def generate_turn")
+    episode_cell = code_cell_containing(baseline, "def run_episode")
+
+    assert "EOS_TOKEN_IDS" in generation_cell
+    assert '"fault": "context_budget"' in generation_cell
+    assert '"output_truncated"' in generation_cell
+    assert "prompt_tokens + MAX_NEW_TOKENS_PER_TURN > MAX_SEQUENCE_LENGTH" in generation_cell
+    assert 'if turn["fault"] is not None:' in episode_cell
+    # The old shape silently promoted a truncated prefix to a final answer.
+    assert "raw, prompt_count, completion_count = generate_turn" not in episode_cell
+
+
+def test_notebook_02_accepts_the_documented_non_agentic_lane():
+    generator = load_generator()
+    namespace = {"json": json, "raw_dataset": []}
+    exec(generator.TOOLS_CELL, namespace)
+    exec(code_cell_containing(generator.build_02_data(), "def validate_row"), namespace)
+    validate_row = namespace["validate_row"]
+
+    base = {
+        "tool_schema_version": namespace["TOOL_SCHEMA_VERSION"],
+        "tool_schema_json": namespace["TOOL_SCHEMA_JSON"],
+        "tools": namespace["TOOLS"],
+        "verification": {"all_required_tests_pass": True},
+    }
+    reasoning_row = dict(base, lane="non_agentic", messages=[
+        {"role": "user", "content": "Implement a bounded cache."},
+        {"role": "assistant", "content": "Here is the implementation."},
+    ])
+    assert validate_row(reasoning_row) == []
+
+    # An agentic row still has to call a tool, and a non-agentic row must not.
+    assert validate_row(dict(reasoning_row, lane="agentic"))
+    mislabelled = dict(base, lane="non_agentic", messages=[
+        {"role": "user", "content": "Fix it."},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"type": "function", "function": {"name": "read_file", "arguments": {"path": "src/a.py"}}}
+        ]},
+        {"role": "tool", "name": "read_file", "content": "x = 1"},
+    ])
+    assert validate_row(mislabelled)

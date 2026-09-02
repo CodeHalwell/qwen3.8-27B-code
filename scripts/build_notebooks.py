@@ -308,6 +308,11 @@ print(f"Authenticated as {HF_USERNAME}")
 
 
 TOOLS_CELL = r'''
+# Bumped from v1 when the `shell` description stopped carrying pilot status
+# text. Tool descriptions are model inputs and part of the fingerprint, so a
+# wording change is a schema change.
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
+
 TOOLS = [
     {
         "type": "function",
@@ -378,7 +383,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a restricted allow-listed command. It is disabled in the pilot.",
+            "description": "Run a command from the harness allow-list.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -431,10 +436,12 @@ def rendered_tool_schema(rendered_prompt: str) -> str:
     return canonical_tool_schema(rendered_tools)
 
 def canonical_to_qwen(messages: list[dict]) -> list[dict]:
-    """Fold an initial developer message into system for the HF tokenizer.
+    """Merge the leading policy messages into one system message.
 
-    The adapter performs the same mapping in training and deployment. The
-    official safetensor tokenizer currently accepts system/user/assistant/tool.
+    The Qwen3.8 template accepts `developer` natively and merges a run of
+    leading system/developer messages itself. This fold is therefore not a
+    compatibility shim: it exists so training and deployment both hand the
+    template one deterministically joined policy message.
     """
     converted = []
     pending_system = []
@@ -644,7 +651,9 @@ def build_01_baseline():
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 MAX_SEQUENCE_LENGTH = 16384
-                MAX_NEW_TOKENS_PER_TURN = 1024
+                # Thinking mode spends tokens before the tool call appears, so a
+                # 1k cap truncated ordinary turns and scored them as answers.
+                MAX_NEW_TOKENS_PER_TURN = 2048
                 MAX_TOOL_CALLS = 10
                 EPISODE_TIMEOUT_SECONDS = 480
                 BASELINE_SEEDS = (3407, 9176, 20261)
@@ -652,7 +661,7 @@ def build_01_baseline():
                 PILOT_MANIFEST = Path("/content/pilot_tasks.jsonl")
                 RESULTS_DIR = RUN_ROOT / "baseline"
                 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-                secret_markers = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+                secret_markers = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
                 TASK_ENV = {
                     key: value for key, value in os.environ.items()
                     if not any(marker in key.upper() for marker in secret_markers)
@@ -662,6 +671,31 @@ def build_01_baseline():
                 # seconds), silently testing pre-patch code. Never cache bytecode
                 # inside task repositories.
                 TASK_ENV["PYTHONDONTWRITEBYTECODE"] = "1"
+
+                # Dropping secret-looking variable names is not enough on its own:
+                # the auth cell wrote the Hub token to a file under HOME, so any
+                # test the model runs could read the credential straight off disk.
+                # Give task subprocesses an empty home and no Hub access.
+                TASK_HOME = Path("/content/qwen38_task_home")
+                TASK_HOME.mkdir(parents=True, exist_ok=True)
+                for cache_key in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "HF_HOME", "HUGGINGFACE_HUB_CACHE"):
+                    TASK_ENV[cache_key] = str(TASK_HOME)
+                TASK_ENV["HF_HUB_OFFLINE"] = "1"
+                TASK_ENV["TRANSFORMERS_OFFLINE"] = "1"
+
+                token_probe = subprocess.run(
+                    [sys.executable, "-c", "import os, pathlib; print(any(pathlib.Path(os.path.expanduser('~')).rglob('token')))"],
+                    env=TASK_ENV,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                )
+                if token_probe.stdout.strip() != "False":
+                    raise RuntimeError(
+                        "Task subprocesses can still reach a credential cache: "
+                        f"{token_probe.stdout.strip()} {token_probe.stderr[:500]}"
+                    )
+                print(f"Task subprocesses isolated to {TASK_HOME} with Hub access disabled.")
 
                 require_free_vram(60.0)
                 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -690,11 +724,30 @@ def build_01_baseline():
                     re.DOTALL,
                 )
 
+                # Generation is decoded with special tokens visible so the
+                # tool-call markup survives; the turn terminators must not leak
+                # into a stored final answer.
+                TURN_TERMINATORS = ("<|im_end|>", "<|endoftext|>")
+
+                def strip_turn_terminators(text: str) -> str:
+                    stripped = text.strip()
+                    changed = True
+                    while changed:
+                        changed = False
+                        for terminator in TURN_TERMINATORS:
+                            if stripped.endswith(terminator):
+                                stripped = stripped[: -len(terminator)].rstrip()
+                                changed = True
+                    return stripped
+
                 def split_reasoning(text: str) -> tuple[str, str]:
                     if "</think>" in text:
                         reasoning, content = text.split("</think>", 1)
-                        return reasoning.removeprefix("<think>").strip(), content.strip()
-                    return "", text.strip()
+                        return (
+                            reasoning.removeprefix("<think>").strip(),
+                            strip_turn_terminators(content),
+                        )
+                    return "", strip_turn_terminators(text)
 
                 def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
                     reasoning, content = split_reasoning(text)
@@ -848,20 +901,44 @@ def build_01_baseline():
                         )
                         return f"exit={result.returncode}\n{(result.stdout + result.stderr)[-12000:]}"
                     if name == "shell":
-                        return "shell is disabled in the pilot; use the semantic tools"
+                        return "shell is disabled by the harness allow-list; use the semantic tools"
                     return f"unknown tool: {name}"
                 """
             ),
             markdown("## Run a bounded episode"),
             code(
                 r"""
-                def generate_turn(messages: list[dict]) -> tuple[str, int, int]:
+                generation_eos = model.generation_config.eos_token_id
+                EOS_TOKEN_IDS = {
+                    token_id
+                    for token_id in (
+                        *(generation_eos if isinstance(generation_eos, (list, tuple)) else [generation_eos]),
+                        tokenizer.eos_token_id,
+                    )
+                    if token_id is not None
+                }
+                if not EOS_TOKEN_IDS:
+                    raise RuntimeError("No end-of-turn token id is available; truncation cannot be detected.")
+
+                # Returns the generated text plus how the turn ended, so the
+                # episode loop can tell a finished answer from a cut-off one.
+                def generate_turn(messages: list[dict]) -> dict:
                     rendered = render_chat(messages, add_generation_prompt=True)
                     inputs = tokenizer(
                         text=rendered,
                         return_tensors="pt",
                         add_special_tokens=False,
                     ).to("cuda")
+                    prompt_tokens = int(inputs["input_ids"].numel())
+                    # Ten bounded observations still add up. Stop the episode
+                    # here rather than let the window overflow mid-generation.
+                    if prompt_tokens + MAX_NEW_TOKENS_PER_TURN > MAX_SEQUENCE_LENGTH:
+                        return {
+                            "text": "",
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": 0,
+                            "fault": "context_budget",
+                        }
                     with torch.inference_mode():
                         outputs = model.generate(
                             **inputs,
@@ -873,7 +950,18 @@ def build_01_baseline():
                             use_cache=True,
                         )
                     new_ids = outputs[0, inputs["input_ids"].shape[1]:]
-                    return tokenizer.decode(new_ids, skip_special_tokens=False), inputs["input_ids"].numel(), new_ids.numel()
+                    completion_tokens = int(new_ids.numel())
+                    # A turn cut off at the cap carries no closing </think> or
+                    # </tool_call>, so it parses as "no tool calls". Recording
+                    # that prefix as the final answer would score a truncation
+                    # as a completed episode.
+                    stopped_on_eos = completion_tokens > 0 and int(new_ids[-1]) in EOS_TOKEN_IDS
+                    return {
+                        "text": tokenizer.decode(new_ids, skip_special_tokens=False),
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "fault": None if stopped_on_eos else "output_truncated",
+                    }
 
                 def run_episode(task: PilotTask, seed: int) -> dict:
                     torch.manual_seed(seed)
@@ -891,12 +979,15 @@ def build_01_baseline():
                         if time.monotonic() - start > EPISODE_TIMEOUT_SECONDS:
                             termination = "timeout"
                             break
-                        raw, prompt_count, completion_count = generate_turn(messages)
-                        prompt_tokens += prompt_count
-                        completion_tokens += completion_count
-                        reasoning, calls = parse_tool_calls(raw)
+                        turn = generate_turn(messages)
+                        prompt_tokens += turn["prompt_tokens"]
+                        completion_tokens += turn["completion_tokens"]
+                        if turn["fault"] is not None:
+                            termination = turn["fault"]
+                            break
+                        reasoning, calls = parse_tool_calls(turn["text"])
                         if not calls:
-                            _, final_text = split_reasoning(raw)
+                            _, final_text = split_reasoning(turn["text"])
                             messages.append({"role": "assistant", "reasoning_content": reasoning, "content": final_text})
                             break
                         if tool_count + len(calls) > MAX_TOOL_CALLS:
@@ -977,6 +1068,13 @@ def build_01_baseline():
                     "attempts": len(trajectories),
                     "seeds": list(active_seeds),
                     "successes": sum(row["success"] for row in trajectories),
+                    # Truncated and budget-exhausted episodes are not model
+                    # failures in the same sense as a wrong patch; keep them
+                    # visible so the failure mix drives the data decision.
+                    "terminations": {
+                        reason: sum(1 for row in trajectories if row["termination"] == reason)
+                        for reason in sorted({row["termination"] for row in trajectories})
+                    },
                     "mean_episode_seconds": mean_seconds,
                     "candidate_gate_gpu_hours_at_observed_mean": projected_candidate_hours,
                     "trace_path": str(trace_path),
@@ -1062,7 +1160,7 @@ def build_02_data():
                     {
                         "id": "fixture/native-tool-001",
                         "repo_family": "fixture-clamp",
-                        "tool_schema_version": "qwen38-six-tools-v1",
+                        "tool_schema_version": TOOL_SCHEMA_VERSION,
                         "tool_schema_json": TOOL_SCHEMA_JSON,
                         "tools": TOOLS,
                         "messages": [
@@ -1081,7 +1179,7 @@ def build_02_data():
                     {
                         "id": "fixture/native-tool-002",
                         "repo_family": "fixture-parser",
-                        "tool_schema_version": "qwen38-six-tools-v1",
+                        "tool_schema_version": TOOL_SCHEMA_VERSION,
                         "tool_schema_json": TOOL_SCHEMA_JSON,
                         "tools": TOOLS,
                         "messages": [
@@ -1123,7 +1221,7 @@ def build_02_data():
 
                 def validate_row(row: dict) -> list[str]:
                     errors = []
-                    if row.get("tool_schema_version") != "qwen38-six-tools-v1":
+                    if row.get("tool_schema_version") != TOOL_SCHEMA_VERSION:
                         errors.append("wrong or missing tool_schema_version")
                     if row.get("tool_schema_json") != TOOL_SCHEMA_JSON:
                         errors.append("wrong or missing canonical tool_schema_json")
@@ -1172,8 +1270,17 @@ def build_02_data():
                             errors.append(f"message {index}: unresolved tool responses {pending_tools!r}")
                     if pending_tools:
                         errors.append(f"trajectory ends with unresolved tool calls {pending_tools!r}")
-                    if not saw_tool_call:
-                        errors.append("native agent trajectory has no tool call")
+                    # docs/data-strategy.md defines a non-agentic lane for code
+                    # and reasoning content that carries no tool supervision.
+                    # Rejecting those rows here made the documented mixture
+                    # impossible to build.
+                    lane = row.get("lane") or "agentic"
+                    if lane not in {"agentic", "non_agentic"}:
+                        errors.append(f"unknown lane {lane!r}")
+                    elif lane == "agentic" and not saw_tool_call:
+                        errors.append("agentic trajectory has no tool call")
+                    elif lane == "non_agentic" and saw_tool_call:
+                        errors.append("non-agentic row supervises a tool call; label it agentic")
                     if not row.get("verification", {}).get("all_required_tests_pass", False):
                         errors.append("trajectory is not execution-verified")
                     return errors
@@ -1201,7 +1308,7 @@ def build_02_data():
                         "text": text,
                         "token_count": token_count,
                         "tools": TOOLS,
-                        "tool_schema_version": "qwen38-six-tools-v1",
+                        "tool_schema_version": TOOL_SCHEMA_VERSION,
                         "tool_schema_json": TOOL_SCHEMA_JSON,
                     }
 
@@ -1327,6 +1434,8 @@ def build_03_sft():
             code(INSTALL_CORE),
             markdown("After the first install, restart the runtime and rerun the notebook from the top; the install marker skips the pip work."),
             code(AUTH_AND_RUNTIME),
+            markdown("## Deployment tool surface"),
+            code(TOOLS_CELL),
             markdown("## Run configuration"),
             code(
                 r"""
@@ -1361,7 +1470,7 @@ def build_03_sft():
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
                     "demo_mode": DEMO_MODE,
-                    "tool_schema_version": "qwen38-six-tools-v1",
+                    "tool_schema_version": TOOL_SCHEMA_VERSION,
                     "harness_version": "pilot-local-v1",
                     "run_training": RUN_TRAINING,
                 }
@@ -1382,23 +1491,52 @@ def build_03_sft():
                 )
                 assert_model_fully_resident(model)
 
-                candidate_suffixes = {
+                from collections import Counter
+
+                # Qwen3.8 repeats three Gated DeltaNet layers per full-attention
+                # layer, and the DeltaNet projections are named in_proj_qkv,
+                # in_proj_z, in_proj_a and in_proj_b. None of those matched the
+                # earlier suffix list, so 48 of the 64 layers had no adapter on
+                # their attention path at all. Discover the set, then refuse to
+                # train if it is not the reviewed one.
+                REVIEWED_TARGET_SUFFIXES = {
                     "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj", "in_proj", "out_proj",
+                    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+                    "gate_proj", "up_proj", "down_proj",
                 }
+                # The vision tower is frozen by project policy. The MTP head and
+                # lm_head are excluded because nothing here trains a multi-token
+                # objective and the merged checkpoint should keep its original
+                # output layer.
+                EXCLUDED_MODULE_MARKERS = ("visual", "vision", "image", "mtp.", "lm_head")
+
+                def is_excluded_module(name: str) -> bool:
+                    lowered = name.lower()
+                    return any(marker in lowered for marker in EXCLUDED_MODULE_MARKERS)
+
                 language_linear_names = [
                     name for name, module in model.named_modules()
-                    if isinstance(module, torch.nn.Linear)
-                    and not any(part in name.lower() for part in ("vision", "visual", "image"))
+                    if isinstance(module, torch.nn.Linear) and not is_excluded_module(name)
                 ]
-                target_modules = sorted({
-                    name.rsplit(".", 1)[-1]
-                    for name in language_linear_names
-                    if name.rsplit(".", 1)[-1] in candidate_suffixes
-                })
-                if not target_modules:
-                    raise RuntimeError("No supported language LoRA targets were discovered; stop and inspect the architecture.")
-                print("LoRA targets:", target_modules)
+                discovered_suffixes = {name.rsplit(".", 1)[-1] for name in language_linear_names}
+                expected_module_counts = Counter(name.rsplit(".", 1)[-1] for name in language_linear_names)
+                missing_suffixes = sorted(REVIEWED_TARGET_SUFFIXES - discovered_suffixes)
+                unexpected_suffixes = sorted(discovered_suffixes - REVIEWED_TARGET_SUFFIXES)
+                if missing_suffixes:
+                    raise RuntimeError(
+                        f"Reviewed LoRA targets are absent from the loaded model: {missing_suffixes}. "
+                        "The architecture or the loader changed; re-derive the target list before training."
+                    )
+                if unexpected_suffixes:
+                    raise RuntimeError(
+                        f"The model exposes language linear modules this suite has not reviewed: {unexpected_suffixes}. "
+                        "Decide explicitly whether they belong in the adapter, then update REVIEWED_TARGET_SUFFIXES."
+                    )
+                target_modules = sorted(discovered_suffixes)
+                print(json.dumps({
+                    "lora_targets": target_modules,
+                    "language_linear_modules": dict(sorted(expected_module_counts.items())),
+                }, indent=2))
 
                 model = FastLanguageModel.get_peft_model(
                     model,
@@ -1413,27 +1551,43 @@ def build_03_sft():
                     loftq_config=None,
                 )
 
-                # Qwen3.8 is natively multimodal. This project tunes only language behavior.
+                # PEFT matches target_modules by name suffix, so the MTP head's
+                # own q_proj/o_proj would otherwise receive adapters that no loss
+                # ever trains. Freeze everything outside the language decoder.
                 for name, parameter in model.named_parameters():
-                    if any(part in name.lower() for part in ("vision", "visual", "image")):
+                    if is_excluded_module(name):
                         parameter.requires_grad_(False)
-                trainable_vision = [
+                trainable_outside_decoder = [
                     name for name, parameter in model.named_parameters()
-                    if parameter.requires_grad and any(part in name.lower() for part in ("vision", "visual", "image"))
+                    if parameter.requires_grad and is_excluded_module(name)
                 ]
-                assert not trainable_vision, trainable_vision[:20]
+                assert not trainable_outside_decoder, trainable_outside_decoder[:20]
+
+                # Prove the adapter actually reaches every module discovery found,
+                # rather than trusting that suffix matching did what was intended.
+                adapted_counts = Counter(
+                    name.rsplit(".", 1)[-1]
+                    for name, module in model.named_modules()
+                    if not is_excluded_module(name) and len(getattr(module, "lora_A", {}) or {})
+                )
+                if adapted_counts != expected_module_counts:
+                    raise RuntimeError(
+                        "LoRA coverage does not match module discovery. "
+                        f"expected={dict(sorted(expected_module_counts.items()))} "
+                        f"adapted={dict(sorted(adapted_counts.items()))}"
+                    )
+                print(json.dumps({"adapted_modules": dict(sorted(adapted_counts.items()))}, indent=2))
                 model.print_trainable_parameters()
                 """
             ),
             markdown("## Load native-schema data and render the exact deployment template"),
-            code(TOOLS_CELL),
             code(
                 r"""
                 def demo_rows():
                     return [
                         {
                             "repo_family": "fixture/clamp",
-                            "tool_schema_version": "qwen38-six-tools-v1",
+                            "tool_schema_version": TOOL_SCHEMA_VERSION,
                             "tool_schema_json": TOOL_SCHEMA_JSON,
                             "tools": TOOLS,
                             "messages": [
@@ -1456,7 +1610,7 @@ def build_03_sft():
                         },
                         {
                             "repo_family": "fixture/parser",
-                            "tool_schema_version": "qwen38-six-tools-v1",
+                            "tool_schema_version": TOOL_SCHEMA_VERSION,
                             "tool_schema_json": TOOL_SCHEMA_JSON,
                             "tools": TOOLS,
                             "messages": [
@@ -1487,7 +1641,7 @@ def build_03_sft():
                     eval_raw = loaded["validation"]
 
                 def render_row(row):
-                    if row.get("tool_schema_version") != "qwen38-six-tools-v1":
+                    if row.get("tool_schema_version") != TOOL_SCHEMA_VERSION:
                         raise ValueError("Dataset schema version differs from this notebook.")
                     if row.get("tool_schema_json") != TOOL_SCHEMA_JSON:
                         raise ValueError("Dataset canonical tool fingerprint differs from this notebook.")
@@ -1557,32 +1711,86 @@ def build_03_sft():
                 first_trainable = int((labels[0] != -100).nonzero()[0])
                 assert (labels[0, :first_trainable] == -100).all(), "Prompt/tool context leaked into the first response loss."
 
-                supervised_texts = []
-                for split_dataset in (trainer.train_dataset, trainer.eval_dataset):
-                    for row in split_dataset:
+                # Checking for one phrase from the demo fixture made this gate
+                # pass only in demo mode: with real data it failed before
+                # training could start. Derive the expectation from each row.
+                OBSERVATION_MATCH_FLOOR = 40  # short observations coincide with patch text
+
+                def masking_problems(tokenized_split, source_split) -> list[str]:
+                    if len(tokenized_split) != len(source_split):
+                        return [
+                            f"trainer holds {len(tokenized_split)} rows but the source has "
+                            f"{len(source_split)}; rows cannot be compared positionally"
+                        ]
+                    problems = []
+                    for index, (row, source_row) in enumerate(zip(tokenized_split, source_split)):
                         supervised_ids = [
                             token_id for token_id, label in zip(row["input_ids"], row["labels"])
                             if label != -100
                         ]
-                        supervised_texts.append(tokenizer.decode(supervised_ids, skip_special_tokens=False))
-                joined_supervision = "\n".join(supervised_texts)
-                assert "Implemented the bounded clamp" in joined_supervision, "Expected final assistant answer is masked."
-                assert "def clamp(x, low, high)" not in joined_supervision, "Tool observation leaked into the loss."
+                        if not supervised_ids:
+                            problems.append(f"row {index}: no supervised tokens remain")
+                            continue
+                        supervised = tokenizer.decode(supervised_ids, skip_special_tokens=False)
+                        # A right-truncated row legitimately loses its tail, so
+                        # only assert completeness where nothing was cut.
+                        complete = len(row["input_ids"]) < MAX_SEQ_LENGTH
+                        for message in source_row["messages"]:
+                            content = (message.get("content") or "").strip()
+                            if not content:
+                                continue
+                            if message["role"] == "assistant" and complete and content not in supervised:
+                                problems.append(f"row {index}: assistant content is masked out of the loss")
+                            if (
+                                message["role"] == "tool"
+                                and len(content) >= OBSERVATION_MATCH_FLOOR
+                                and content in supervised
+                            ):
+                                problems.append(f"row {index}: tool observation leaked into the loss")
+                    return problems
+
+                masking_failures = (
+                    masking_problems(trainer.train_dataset, train_dataset)
+                    + masking_problems(trainer.eval_dataset, eval_dataset)
+                )
+                if masking_failures:
+                    raise RuntimeError(f"Assistant-only masking is wrong (first 10): {masking_failures[:10]}")
+
+                first_supervised = tokenizer.decode(
+                    [
+                        token_id for token_id, label in zip(
+                            trainer.train_dataset[0]["input_ids"], trainer.train_dataset[0]["labels"]
+                        )
+                        if label != -100
+                    ],
+                    skip_special_tokens=False,
+                )
                 print({
                     "batch_shape": tuple(labels.shape),
                     "first_trained_token": first_trainable,
-                    "supervision_preview": joined_supervision[:2000],
+                    "checked_rows": len(trainer.train_dataset) + len(trainer.eval_dataset),
+                    "supervision_preview": first_supervised[:2000],
                 })
                 """
             ),
             markdown("## Train, resume, and publish the adapter"),
             code(
                 r"""
+                # checkpoint-10 sorts before checkpoint-9 lexicographically, so a
+                # plain sort silently resumes from a stale step.
+                def latest_checkpoint(directory):
+                    numbered = [
+                        (int(path.name.rsplit("-", 1)[-1]), path)
+                        for path in directory.glob("checkpoint-*")
+                        if path.is_dir() and path.name.rsplit("-", 1)[-1].isdigit()
+                    ]
+                    return max(numbered)[1] if numbered else None
+
                 if RUN_TRAINING:
-                    checkpoints = sorted((RUN_ROOT / "sft").glob("checkpoint-*"))
+                    resume_from = latest_checkpoint(RUN_ROOT / "sft")
                     torch.cuda.reset_peak_memory_stats()
                     start_reserved_gib = torch.cuda.memory_reserved() / 1024**3
-                    result = trainer.train(resume_from_checkpoint=str(checkpoints[-1]) if checkpoints else None)
+                    result = trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)
                     peak_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     run_manifest["peak_reserved_gib"] = round(peak_reserved_gib, 3)
@@ -1656,6 +1864,11 @@ def build_04_dpo():
                 Use DPO only on preferences whose chosen answer is demonstrably
                 better under the same harness and hidden verifier. This stage is
                 intentionally smaller than SFT and cannot repair a broken tool schema.
+
+                **Input:** the *merged* accepted SFT checkpoint from notebook 03,
+                not its adapter. Set `SAVE_MERGED_BF16` there and record the
+                commit before starting here. The model-loading cell explains why
+                the distinction decides what the KL reference is.
                 """
             ),
             markdown("## Install and authenticate"),
@@ -1664,12 +1877,19 @@ def build_04_dpo():
             code(AUTH_AND_RUNTIME),
             code(
                 r"""
+                import hashlib
+
                 from unsloth import FastLanguageModel
                 from datasets import Dataset, load_dataset
                 from trl import DPOConfig, DPOTrainer
 
+                # DPO starts from the *merged* accepted SFT weights, not the SFT
+                # adapter; see the model-loading cell for why the distinction
+                # decides what the KL reference actually is.
+                MERGED_SFT_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
+                MERGED_SFT_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
                 SFT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
-                SFT_ADAPTER_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
+                SFT_ADAPTER_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"  # recorded for lineage only
                 PREFERENCE_DATASET_ID = f"{HF_USERNAME}/qwen38-code-preferences"
                 PREFERENCE_DATASET_REVISION = "main"
                 # Bootstrap pairs generated by scripts/generate_preference_pairs.py.
@@ -1681,8 +1901,10 @@ def build_04_dpo():
                 RUN_TRAINING = False
                 PUSH_ADAPTER = False
 
+                if RUN_TRAINING and MERGED_SFT_REVISION.startswith("REPLACE_"):
+                    raise RuntimeError("Pin the merged accepted SFT commit before DPO.")
                 if RUN_TRAINING and SFT_ADAPTER_REVISION.startswith("REPLACE_"):
-                    raise RuntimeError("Pin the accepted SFT adapter commit before DPO.")
+                    raise RuntimeError("Record the accepted SFT adapter commit for lineage before DPO.")
                 if DEMO_MODE and (PUSH_ADAPTER or MAX_STEPS > 2):
                     raise RuntimeError("Demo preferences are limited to two local smoke steps and cannot be published.")
                 """
@@ -1690,10 +1912,19 @@ def build_04_dpo():
             markdown("## Load the accepted SFT adapter"),
             code(
                 r"""
+                from collections import Counter
+
                 require_free_vram(60.0)
+                # `ref_model=None` does not mean "no reference": TRL uses the
+                # policy with its adapters disabled. Loading the SFT *adapter*
+                # here therefore made the reference the pre-SFT base model, so
+                # the KL term pulled the policy back toward exactly the
+                # behaviour SFT had just trained away. Loading the merged SFT
+                # weights and attaching a fresh adapter makes the reference the
+                # accepted SFT policy, which is what this stage should move from.
                 model, tokenizer = FastLanguageModel.from_pretrained(
-                    model_name=SFT_ADAPTER_ID,
-                    revision=None if SFT_ADAPTER_REVISION.startswith("REPLACE_") else SFT_ADAPTER_REVISION,
+                    model_name=MERGED_SFT_MODEL_ID,
+                    revision=None if MERGED_SFT_REVISION.startswith("REPLACE_") else MERGED_SFT_REVISION,
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,
@@ -1701,11 +1932,68 @@ def build_04_dpo():
                 )
                 assert_model_fully_resident(model)
                 tokenizer.padding_side = "left"
+
+                # Same reviewed target set as notebook 03; a mismatch between the
+                # stages would silently train a different subnetwork.
+                REVIEWED_TARGET_SUFFIXES = {
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                }
+                EXCLUDED_MODULE_MARKERS = ("visual", "vision", "image", "mtp.", "lm_head")
+
+                def is_excluded_module(name: str) -> bool:
+                    lowered = name.lower()
+                    return any(marker in lowered for marker in EXCLUDED_MODULE_MARKERS)
+
+                language_linear_names = [
+                    name for name, module in model.named_modules()
+                    if isinstance(module, torch.nn.Linear) and not is_excluded_module(name)
+                ]
+                discovered_suffixes = {name.rsplit(".", 1)[-1] for name in language_linear_names}
+                if discovered_suffixes != REVIEWED_TARGET_SUFFIXES:
+                    raise RuntimeError(
+                        "Merged checkpoint exposes a different language module set than notebook 03 reviewed: "
+                        f"missing={sorted(REVIEWED_TARGET_SUFFIXES - discovered_suffixes)} "
+                        f"unexpected={sorted(discovered_suffixes - REVIEWED_TARGET_SUFFIXES)}"
+                    )
+                expected_module_counts = Counter(name.rsplit(".", 1)[-1] for name in language_linear_names)
+
+                model = FastLanguageModel.get_peft_model(
+                    model,
+                    r=16,
+                    target_modules=sorted(discovered_suffixes),
+                    lora_alpha=32,
+                    lora_dropout=0,
+                    bias="none",
+                    use_gradient_checkpointing="unsloth",
+                    random_state=3407,
+                )
+                for name, parameter in model.named_parameters():
+                    if is_excluded_module(name):
+                        parameter.requires_grad_(False)
+                adapted_counts = Counter(
+                    name.rsplit(".", 1)[-1]
+                    for name, module in model.named_modules()
+                    if not is_excluded_module(name) and len(getattr(module, "lora_A", {}) or {})
+                )
+                if adapted_counts != expected_module_counts:
+                    raise RuntimeError(
+                        "LoRA coverage does not match module discovery. "
+                        f"expected={dict(sorted(expected_module_counts.items()))} "
+                        f"adapted={dict(sorted(adapted_counts.items()))}"
+                    )
+
                 trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
                 total = sum(parameter.numel() for parameter in model.parameters())
                 if not trainable:
-                    raise RuntimeError("The SFT adapter loaded without trainable parameters; inspect PEFT loading before DPO.")
-                print({"trainable": trainable, "total": total, "fraction": trainable / total})
+                    raise RuntimeError("The fresh DPO adapter has no trainable parameters; inspect PEFT loading before DPO.")
+                print({
+                    "reference": "accepted SFT weights (adapters disabled)",
+                    "trainable": trainable,
+                    "total": total,
+                    "fraction": trainable / total,
+                })
                 """
             ),
             markdown("## Render prompt/chosen/rejected with the native Qwen3.8 template"),
@@ -1714,6 +2002,7 @@ def build_04_dpo():
                 r"""
                 demo_preferences = Dataset.from_list([
                     {
+                        "repo_family": "fixture/bounds",
                         "prompt_messages": [
                             {"role": "developer", "content": "Make the smallest correct change and report verification."},
                             {"role": "user", "content": "The bounds check is inverted; what did you change?"},
@@ -1725,6 +2014,7 @@ def build_04_dpo():
                         "infra_status": "ok",
                     },
                     {
+                        "repo_family": "fixture/parser",
                         "prompt_messages": [
                             {"role": "developer", "content": "Inspect evidence before proposing a patch."},
                             {"role": "user", "content": "A parser test fails only for empty input."},
@@ -1793,8 +2083,38 @@ def build_04_dpo():
                         "rejected": completion(row["rejected_message"]),
                     }
 
+                # A random split puts variants of the same repository family on
+                # both sides, so the evaluation half measures memorisation of the
+                # family rather than transfer. Split on families, as notebook 02
+                # does for SFT.
+                if "repo_family" not in raw.column_names:
+                    raise ValueError("Preference rows must carry repo_family so the split can be family-disjoint.")
+                row_families = list(raw["repo_family"])
+                families = sorted(set(row_families))
+                if len(families) < 2:
+                    raise ValueError(f"At least two repository families are required; found {families}.")
+                evaluation_family_count = min(max(1, round(len(families) * 0.10)), len(families) - 1)
+                ranked_families = sorted(families, key=lambda family: hashlib.sha256(family.encode()).hexdigest())
+                evaluation_families = set(ranked_families[:evaluation_family_count])
+
                 preferences = raw.map(render_preference, remove_columns=raw.column_names)
-                split = preferences.train_test_split(test_size=0.5 if len(preferences) < 20 else 0.1, seed=3407)
+                evaluation_indices = [
+                    index for index, family in enumerate(row_families) if family in evaluation_families
+                ]
+                train_indices = [
+                    index for index, family in enumerate(row_families) if family not in evaluation_families
+                ]
+                split = {
+                    "train": preferences.select(train_indices),
+                    "test": preferences.select(evaluation_indices),
+                }
+                if not len(split["train"]) or not len(split["test"]):
+                    raise RuntimeError(f"Family split produced an empty partition: {sorted(evaluation_families)}")
+                print({
+                    "train_rows": len(split["train"]),
+                    "evaluation_rows": len(split["test"]),
+                    "evaluation_families": sorted(evaluation_families),
+                })
                 print({key: split["train"][0][key][:1000] for key in ["prompt", "chosen", "rejected"]})
                 """
             ),
@@ -1809,7 +2129,11 @@ def build_04_dpo():
                     per_device_train_batch_size=1,
                     per_device_eval_batch_size=1,
                     gradient_accumulation_steps=8,
-                    learning_rate=5e-7,
+                    # 5e-7 is a full-fine-tuning DPO rate. A rank-16 adapter sees
+                    # a small fraction of the parameters and barely moves at that
+                    # rate; 5e-6 is the conservative end of the usual LoRA band.
+                    # Sweep it alongside beta rather than treating it as settled.
+                    learning_rate=5e-6,
                     warmup_ratio=0.05,
                     lr_scheduler_type="cosine",
                     max_steps=MAX_STEPS,
@@ -2318,13 +2642,20 @@ def build_06_qat_export():
                         token=hf_token,
                     )
                     assert_model_fully_resident(qat_model)
+                    # Same reviewed set as notebooks 03 and 04. The Gated
+                    # DeltaNet projections are in_proj_qkv/z/a/b; a bare
+                    # "in_proj" matches none of them, which would leave three of
+                    # every four layers unadapted during the recovery pass.
+                    QAT_TARGET_MODULES = [
+                        "down_proj", "gate_proj",
+                        "in_proj_a", "in_proj_b", "in_proj_qkv", "in_proj_z",
+                        "k_proj", "o_proj", "out_proj", "q_proj", "up_proj", "v_proj",
+                    ]
+                    EXCLUDED_MODULE_MARKERS = ("visual", "vision", "image", "mtp.", "lm_head")
                     qat_model = FastLanguageModel.get_peft_model(
                         qat_model,
                         r=16,
-                        target_modules=[
-                            "q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj", "in_proj", "out_proj",
-                        ],
+                        target_modules=QAT_TARGET_MODULES,
                         lora_alpha=32,
                         lora_dropout=0,
                         bias="none",
@@ -2333,7 +2664,7 @@ def build_06_qat_export():
                         qat_scheme="int4",
                     )
                     for name, parameter in qat_model.named_parameters():
-                        if any(part in name.lower() for part in ("vision", "visual", "image")):
+                        if any(marker in name.lower() for marker in EXCLUDED_MODULE_MARKERS):
                             parameter.requires_grad_(False)
                     fake_quant_modules = [
                         module.__class__.__name__ for module in qat_model.modules()

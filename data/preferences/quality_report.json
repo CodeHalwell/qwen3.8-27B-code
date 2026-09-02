@@ -1,7 +1,7 @@
 {
   "generator_version": "scripted-gold-v1",
   "rows": 60,
-  "corpus_sha256": "d30f454b6a510ff7775681c0661ff9fa93592b114d34d680a8dd5400f01e483f",
+  "corpus_sha256": "c1ffc9ec81ec11ba90bffabdc34ff79d9ca5a3f37ce509da0a21f155c8c34979",
   "families": {
     "bounds": 5,
     "config": 5,
@@ -23,23 +23,26 @@
     "verification_claim": 12
   },
   "chosen_tool_call_pairs": 60,
+  "rejected_tool_call_pairs": 48,
+  "pairs_with_matched_reasoning_channel": 60,
   "prompts_with_executed_observations": 48,
   "execution": "prompts are real executed prefixes (verbatim harness observations); patch contrasts ran both candidate patches through the unit suite and rewards mirror observed outcomes",
   "limits": [
     "chosen continuations are single next-turn tool calls; no multi-turn preference rollouts yet",
-    "inspect_first pairs are grounded by an executable read but ranked by the scope policy",
+    "verification_claim is the one deliberately form-asymmetric contrast: the behaviour it penalises is ending the episode with prose instead of verifying, so the rejected turn cannot be a tool call. Its reasoning channel is matched to the chosen turn so the pair is not separable by the presence of a think block alone",
     "prompts share fixture families with the SFT corpus (parameter-disjoint variants)",
+    "rejected continuations are scripted rather than sampled from the policy under training, so they cover the intended failure modes but not the model's own error distribution",
     "pytest observations in prompts embed wall-clock timings, so regeneration is structurally but not byte identical"
   ],
   "rendered": {
     "rows": 60,
     "tokenizer": "unsloth/Qwen3.8-27B",
     "completion_tokens": {
-      "p50": 104,
-      "p90": 163,
-      "p99": 175,
-      "max": 175,
-      "total": 10369
+      "p50": 123,
+      "p90": 174,
+      "p99": 251,
+      "max": 422,
+      "total": 14169
     }
   }
 }

@@ -58,8 +58,25 @@ behavioural specialisation, not removing the vision tensors. For initial work:
   in saved artifacts.
 
 Do not copy a Qwen3.5 target-module list without checking the loaded Qwen3.8
-module names. Add a preflight that prints eligible language modules, excludes
-the vision prefix, and fails if the intended coverage unexpectedly changes.
+module names. The hybrid layout means a standard transformer suffix list is
+wrong here: only 16 of the 64 layers carry `self_attn.{q,k,v,o}_proj`, while
+the other 48 are Gated DeltaNet layers whose projections are named
+`linear_attn.in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b` and
+`out_proj`. A list matching a bare `in_proj` matches none of them and leaves
+three of every four layers without an adapter on their attention path.
+
+The reviewed target set is therefore:
+
+| Module group | Names | Layers |
+| --- | --- | ---: |
+| Full attention | `q_proj`, `k_proj`, `v_proj`, `o_proj` | 16 |
+| Gated DeltaNet | `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj` | 48 |
+| Feed forward | `gate_proj`, `up_proj`, `down_proj` | 64 |
+
+PEFT matches `target_modules` by name suffix, so the multi-token-prediction
+head's own `q_proj`/`o_proj` are adapted unless they are explicitly frozen.
+Exclude the vision tower, the `mtp.` prefix and `lm_head`, and fail the run if
+discovery returns anything other than the reviewed set.
 
 ## Native conversation behaviour
 

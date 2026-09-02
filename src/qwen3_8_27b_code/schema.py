@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-TOOL_SCHEMA_VERSION = "qwen38-six-tools-v1"
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
 
 TOOLS = [
     {
@@ -82,7 +82,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a restricted allow-listed command. It is disabled in the pilot.",
+            "description": "Run a command from the harness allow-list.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -122,7 +122,14 @@ TOOL_SCHEMA_JSON = canonical_tool_schema(TOOLS)
 
 
 def canonical_to_qwen(messages: list[dict]) -> list[dict]:
-    """Fold an initial developer message into system for the HF tokenizer."""
+    """Merge the leading policy messages into one system message.
+
+    The Qwen3.8 template accepts ``developer`` natively and merges any run of
+    leading system/developer messages itself. This fold is therefore not a
+    compatibility shim; it exists so that training and deployment both send
+    the template a single, deterministically joined policy message instead of
+    relying on the template's own join order.
+    """
     converted = []
     pending_system = []
     for stored_message in messages:
