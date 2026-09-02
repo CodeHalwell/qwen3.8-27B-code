@@ -22,6 +22,14 @@ gate (see the [specialisation policy](../docs/data-strategy.md#specialisation-po
 | [04 · DPO preferences](04_dpo_preferences.ipynb) | Apply a small verifier-backed preference stage | DPO beats the accepted SFT adapter without coding, tool-protocol or preserved-thinking regressions |
 | [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment and reward tests; trainer integration is compatibility-gated | Reward fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
 | [06 · QAT and export](06_qat_and_export.ipynb) | Create separate QAT/TorchAO and standard GGUF experiments; prepare Dynamic calibration data | Quantised artifacts pass the frozen long-horizon gate against one BF16 reference |
+| [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Score a checkpoint on the held-out suite, compare it to the frozen baseline, and collect verified trajectories by rejection sampling | A candidate beats the baseline on the gate before it is accepted |
+
+Notebook 07 is the only one that is not self-contained, and deliberately so.
+The episode loop, the collection filters and the scorecard live in
+`qwen3_8_27b_code` and it imports them: three hand-copied copies would drift,
+and a gate that has drifted from the collector it grades is worse than no gate.
+The one thing notebook 07 defines locally is the GPU-specific policy — messages
+in, one generated turn out.
 
 ## Colab setup
 
@@ -42,6 +50,30 @@ the adjacent official Qwen3.5 27B example.
 Every expensive or externally persistent operation is off by default behind a
 `RUN_*`, `PUSH_*`, `SAVE_*` or `BUILD_*` flag. The included fixture rows prove
 plumbing only; they are explicitly not training data for a capability run.
+
+## Measuring whether any of this worked
+
+Until a candidate is scored against the stock model on tasks it has never
+seen, training loss and a green notebook are the only signals, and neither
+says the model got better at the job. The held-out suite is six families in
+`qwen3_8_27b_code.tasks`, disjoint from the SFT fixtures in bug class, module
+and family name, each with a verifier that runs outside the workspace the model
+can read. Passing by deleting the failing test is detected rather than scored.
+
+Both paths run from the command line with a scripted policy, which is how the
+filters and the scorecard are tested without a GPU:
+
+```bash
+uv run --group dev python scripts/evaluate_agent.py run \
+    --policy gold --label candidate --out reports/candidate.json
+uv run --group dev python scripts/evaluate_agent.py compare \
+    reports/baseline.json reports/candidate.json
+uv run --group dev python scripts/collect_trajectories.py --policy gold --attempts 3
+```
+
+`compare` exits non-zero when the gate fails, so it can sit in front of a
+promotion step. Supply a real policy as `module:attribute` — a callable taking
+`(task, seed)` — or use notebook 07, which builds one from a loaded model.
 
 ## Bootstrap corpus
 
@@ -67,11 +99,24 @@ repositories — real executions, native schema, honest observations — sized
 for the smoke-SFT gate, not a substitute for the production corpus from real
 repositories described in the data strategy.
 
+Two properties of that corpus are deliberate and worth knowing before you
+train on it. Rows are labelled `low` and `medium` only, because the scripted
+reasoning is one sentence per turn and labelling it `xhigh` would teach the
+model to answer the xhigh instruction with a single line. And three of the four
+preference contrasts put an executed tool call on *both* sides, so the pairs
+cannot be won by preferring tool calls over prose; the fourth
+(`verification_claim`) is asymmetric by nature and says so in its quality
+report.
+
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.
-- LoRA starts at rank 16 with attention and MLP projections, Unsloth gradient
-  checkpointing, BF16 compute and an 8-bit optimizer.
+- LoRA starts at rank 16 over the discovered language linear modules — the
+  full-attention projections, the Gated DeltaNet `in_proj_*`/`out_proj` that
+  three of every four layers use, and the MLP projections — with Unsloth
+  gradient checkpointing, BF16 compute and an 8-bit optimizer. Discovery fails
+  the run if the module set is not the reviewed one, and the vision tower, MTP
+  head and `lm_head` are frozen after attach.
 - SFT trains assistant spans only and inspects a collated label batch before
   optimization. Native rows carry both the tool objects and a canonical schema
   fingerprint; Arrow-inserted null struct fields are removed before structural
@@ -93,7 +138,12 @@ not ceremony.
 
 The repository generator validates notebook structure and parses every Python
 cell. The contract tests also execute the Arrow-round-tripped demo path for
-notebooks 02 and 03, the search fallback, split construction, and reward guard:
+notebooks 02 and 03, the search fallback, split construction, and reward guard.
+The agent contracts go further and run the real thing on CPU: every held-out
+task is materialised, its hidden verifiers execute, and the collector and gate
+are driven end to end by scripted policies — including the reward hacks
+(deleting the failing tests, declaring success without verifying, looping,
+malformed calls) each of which must be caught by a named filter:
 
 ```bash
 uv run --group dev python scripts/build_notebooks.py

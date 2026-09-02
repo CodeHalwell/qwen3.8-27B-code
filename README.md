@@ -30,6 +30,19 @@ uv run --group dev python scripts/build_notebooks.py
 uv run --group dev pytest -q
 ```
 
+Score a checkpoint against the frozen baseline on held-out tasks, and collect
+verified trajectories from a real policy, with:
+
+```bash
+uv run --group dev python scripts/evaluate_agent.py run --policy gold --out reports/candidate.json
+uv run --group dev python scripts/evaluate_agent.py compare reports/baseline.json reports/candidate.json
+uv run --group dev python scripts/collect_trajectories.py --policy gold --attempts 3
+```
+
+The `gold` policy is a scripted stand-in that exercises the whole path on CPU.
+Supply a model-backed policy as `module:attribute`, or use notebook 07. The
+comparison exits non-zero when the gate fails.
+
 The execution-verified bootstrap training data in `data/` (native-schema SFT
 trajectories and preference pairs, with quality reports) regenerates with:
 

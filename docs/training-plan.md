@@ -85,7 +85,7 @@ Starting configuration:
 | Precision | BF16 LoRA | Fall back to 4-bit QLoRA after measured OOM only |
 | LoRA rank / alpha | 16 / 32 | Escalate to 32 / 64 as the specialisation lever once the 16 / 32 baseline passes its gate; change one axis per run |
 | LoRA dropout | 0 | Unsloth-optimised default |
-| Target | Language all-linear after module discovery | Explicitly exclude vision |
+| Target | Language all-linear after module discovery | Includes the Gated DeltaNet `in_proj_qkv/z/a/b` and `out_proj`; exclude vision, MTP and `lm_head` |
 | Sequence length | 8,192 | 4,096 smoke; profile 16,384 separately |
 | Device batch | 1 | Single GPU |
 | Gradient accumulation | Tune to token budget | Report tokens/update, not only examples/update |
@@ -110,7 +110,16 @@ Build high-confidence chosen/rejected pairs from the same task state. DPO is
 the default first experiment because it is operationally simpler than online
 multi-turn RL.
 
-Single-GPU constraints make reference handling important. Test, in order:
+Reference handling decides what the stage optimises, before it is a memory
+question. TRL's `ref_model=None` does not mean "no reference": it evaluates the
+policy with its adapters disabled. Loading the accepted SFT *adapter* and
+relying on that default therefore makes the base model the reference, so the KL
+term pulls back toward pre-SFT behaviour. Start preference training from the
+merged SFT checkpoint with a fresh adapter, so disabling it yields the accepted
+SFT policy. Note also that `5e-7` is a full-fine-tuning rate; a rank-16 adapter
+needs roughly 10-100x that, swept alongside beta.
+
+Single-GPU constraints then make reference memory important. Test, in order:
 
 1. shared-base/reference adapter techniques supported by the pinned TRL/PEFT
    versions;

@@ -15,7 +15,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-_SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
+
+# Every variable that can lead task code back to a credential cache on disk.
+_HOME_KEYS = ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "HF_HOME", "HUGGINGFACE_HUB_CACHE")
+
+# Repository code under test has no reason to reach the Hub.
+_OFFLINE_FLAGS = {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 
 READ_LIMIT_BYTES = 20_000
 SEARCH_SCAN_LIMIT_BYTES = 5_000_000
@@ -27,7 +33,15 @@ def default_test_command() -> list[str]:
     return [sys.executable, "-m", "pytest", "-q"]
 
 
-def filtered_environment() -> dict[str, str]:
+def filtered_environment(home: str | Path | None = None) -> dict[str, str]:
+    """Build the environment repository code runs under.
+
+    Dropping variables whose names look secret is not sufficient on its own:
+    ``huggingface_hub.login`` writes the Hub token to a file under ``HOME``,
+    so any test the model runs could read the token straight off disk. Point
+    the cache-bearing variables at a scratch home and disable Hub network
+    access for task subprocesses.
+    """
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -38,6 +52,11 @@ def filtered_environment() -> dict[str, str]:
     # runs bracketing a fast patch can execute the pre-patch module. Disable
     # bytecode caching inside fixture repositories entirely.
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    if home is not None:
+        scratch_home = Path(home).resolve()
+        scratch_home.mkdir(parents=True, exist_ok=True)
+        environment.update({key: str(scratch_home) for key in _HOME_KEYS})
+    environment.update(_OFFLINE_FLAGS)
     return environment
 
 
@@ -52,7 +71,10 @@ class RepoHarness:
     ):
         self.root = Path(root).resolve()
         self.visible_test_command = list(visible_test_command or default_test_command())
-        self.environment = dict(environment) if environment is not None else filtered_environment()
+        if environment is not None:
+            self.environment = dict(environment)
+        else:
+            self.environment = filtered_environment(home=self.root.parent / "task_home")
 
     def _rooted(self, relative: str) -> Path:
         candidate = (self.root / relative).resolve()
@@ -80,7 +102,7 @@ class RepoHarness:
                 return "unknown test profile"
             return self._run_tests()
         if name == "shell":
-            return "shell is disabled in the pilot; use the semantic tools"
+            return "shell is disabled by the harness allow-list; use the semantic tools"
         return f"unknown tool: {name}"
 
     def _search(self, query: str) -> str:

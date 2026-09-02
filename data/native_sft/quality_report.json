@@ -1,7 +1,7 @@
 {
   "generator_version": "scripted-gold-v1",
   "rows": 204,
-  "corpus_sha256": "73c943ded0af5614df0f3fc5f9f7f5baeba97e13edabf799c42907b017eb9fcc",
+  "corpus_sha256": "3c20ce7fb9ee43955f79078c8d46f212edf65344630bc5a6113adf19504edcc8",
   "families": {
     "bounds": 17,
     "config": 17,
@@ -24,9 +24,8 @@
     "test_author": 18
   },
   "reasoning_effort": {
-    "low": 61,
-    "medium": 102,
-    "xhigh": 41
+    "low": 81,
+    "medium": 123
   },
   "tool_calls": {
     "total": 747,
@@ -44,6 +43,7 @@
     "Python-only fixtures with pytest as the sole build system",
     "single-file gold fixes; multi-file work needs real repositories",
     "scripted gold trajectories: no model-generated exploration variance",
+    "reasoning is one scripted sentence per turn and does not vary with effort, so only low and medium are labelled; xhigh needs generated reasoning",
     "pytest observations embed wall-clock timings, so regeneration is structurally but not byte identical"
   ],
   "execution": "every observation recorded from a real harness run; run_tests invoked pytest in the fixture repository",
@@ -51,11 +51,11 @@
     "rows": 204,
     "tokenizer": "unsloth/Qwen3.8-27B",
     "tokens": {
-      "p50": 1066,
-      "p90": 1487,
-      "p99": 1753,
-      "max": 1774,
-      "total": 235555
+      "p50": 1057,
+      "p90": 1485,
+      "p99": 1735,
+      "max": 1780,
+      "total": 233300
     },
     "max_length_checked": 4096
   }

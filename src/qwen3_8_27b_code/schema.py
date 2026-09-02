@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-TOOL_SCHEMA_VERSION = "qwen38-six-tools-v1"
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
 
 TOOLS = [
     {
@@ -82,7 +82,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a restricted allow-listed command. It is disabled in the pilot.",
+            "description": "Run a command from the harness allow-list.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -122,7 +122,14 @@ TOOL_SCHEMA_JSON = canonical_tool_schema(TOOLS)
 
 
 def canonical_to_qwen(messages: list[dict]) -> list[dict]:
-    """Fold an initial developer message into system for the HF tokenizer."""
+    """Merge the leading policy messages into one system message.
+
+    The Qwen3.8 template accepts ``developer`` natively and merges any run of
+    leading system/developer messages itself. This fold is therefore not a
+    compatibility shim; it exists so that training and deployment both send
+    the template a single, deterministically joined policy message instead of
+    relying on the template's own join order.
+    """
     converted = []
     pending_system = []
     for stored_message in messages:
@@ -138,3 +145,40 @@ def canonical_to_qwen(messages: list[dict]) -> list[dict]:
     if pending_system:
         converted.append({"role": "system", "content": "\n\n".join(pending_system)})
     return converted
+
+
+def validate_tool_call(name: str, arguments: dict) -> str | None:
+    """Check one call against the deployment schema; return an error or None.
+
+    The harness needs this before executing anything so that a malformed call
+    becomes a typed observation the model can recover from, rather than a
+    Python exception or a silently wrong execution.
+    """
+    specification = next(
+        (tool["function"] for tool in TOOLS if tool["function"]["name"] == name),
+        None,
+    )
+    if specification is None:
+        known = ", ".join(sorted(tool["function"]["name"] for tool in TOOLS))
+        return f"unknown tool {name!r}; available tools are {known}"
+    if not isinstance(arguments, dict):
+        return f"{name} arguments must be an object"
+    parameters = specification["parameters"]
+    required = set(parameters.get("required", []))
+    properties = parameters.get("properties", {})
+
+    # Report every problem at once. A model that mistyped one argument name
+    # usually needs to see the whole correction, not one round per mistake.
+    problems = []
+    missing = sorted(required - set(arguments))
+    if missing:
+        problems.append(f"missing required argument(s): {', '.join(missing)}")
+    if parameters.get("additionalProperties") is False:
+        unexpected = sorted(set(arguments) - set(properties))
+        if unexpected:
+            problems.append(f"unknown argument(s): {', '.join(unexpected)}")
+    for argument in sorted(set(arguments) & set(properties)):
+        allowed = properties[argument].get("enum")
+        if allowed is not None and arguments[argument] not in allowed:
+            problems.append(f"{argument} must be one of {', '.join(map(str, allowed))}")
+    return f"{name}: " + "; ".join(problems) if problems else None

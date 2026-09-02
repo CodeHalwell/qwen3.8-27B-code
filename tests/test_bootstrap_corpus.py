@@ -166,7 +166,10 @@ def test_committed_corpus_matches_quality_report():
     assert report["rows"] == len(rows)
     assert sum(report["families"].values()) == len(rows)
     assert sum(report["shapes"].values()) == len(rows)
-    assert {row["reasoning_effort"] for row in rows} == {"low", "medium", "xhigh"}
+    # xhigh is deliberately absent: the scripted think blocks are one sentence
+    # long and would teach the model to answer the xhigh instruction with a
+    # single line. See EFFORT_CYCLE in trajectories.py.
+    assert {row["reasoning_effort"] for row in rows} == {"low", "medium"}
     assert all(row["verification"]["all_required_tests_pass"] for row in rows)
     assert all(row["tool_schema_json"] == schema.TOOL_SCHEMA_JSON for row in rows)
     ids = [row["id"] for row in rows]
@@ -211,13 +214,25 @@ def test_committed_preference_pairs_satisfy_notebook_04_contract():
     for pair in by_contrast["test_integrity"]:
         assert pair["evidence"]["failing_run"] != "exit=0"
         assert pair["evidence"]["chosen_run"] == "exit=0"
-        # The failing run the rejected message wants to hide is in the transcript.
+        # The failing run the rejected patch wants to hide is in the transcript.
         assert any(
             message["role"] == "tool" and message["content"].startswith("exit=") and not message["content"].startswith("exit=0")
             for message in pair["prompt_messages"]
         )
+        # Both sides patch; the rejected one edits the tests and reaches a green
+        # suite only by deleting the cases that expose the bug.
+        rejected_call = pair["rejected_message"]["tool_calls"][0]["function"]
+        assert rejected_call["name"] == "apply_patch"
+        assert "--- a/tests/" in rejected_call["arguments"]["patch"]
+        assert "--- a/src/" in pair["chosen_message"]["tool_calls"][0]["function"]["arguments"]["patch"]
+        assert pair["evidence"]["rejected_run"] == "exit=0"
     for pair in by_contrast["inspect_first"]:
         assert pair["chosen_message"]["tool_calls"][0]["function"]["name"] == "read_file"
+        # The rejected turn is a real patch guessed before reading, executed to
+        # show it fails, rather than prose that DPO could separate on form.
+        rejected_call = pair["rejected_message"]["tool_calls"][0]["function"]
+        assert rejected_call["name"] == "apply_patch"
+        assert pair["evidence"]["rejected_run"] != "exit=0"
 
 
 def test_synthesis_still_produces_valid_rows_end_to_end():
@@ -269,16 +284,75 @@ def test_notebook_04_render_cell_strips_arrow_nulls_from_completions():
     the template sees them."""
     generator = load_generator()
     notebook_04 = generator.build_04_dpo()
-    namespace = {"json": json, "Dataset": Dataset, "DEMO_MODE": True}
+    namespace = {"json": json, "hashlib": hashlib, "Dataset": Dataset, "DEMO_MODE": True}
     exec(generator.TOOLS_CELL, namespace)
     namespace["tokenizer"] = _NullRejectingTokenizer()
     exec(code_cell_containing(notebook_04, "demo_preferences = Dataset.from_list"), namespace)
     preferences_dataset = namespace["preferences"]
     assert len(preferences_dataset) == 2
     assert set(preferences_dataset.column_names) == {"prompt", "chosen", "rejected"}
+    # The split must be family-disjoint, not random.
+    assert len(namespace["split"]["train"]) == 1
+    assert len(namespace["split"]["test"]) == 1
+    assert namespace["evaluation_families"] < set(namespace["row_families"])
 
 
 def test_corpus_sha_matches_report():
     for corpus, report_path in [(SFT_CORPUS, SFT_REPORT), (PREF_CORPUS, PREF_REPORT)]:
         report = json.loads(report_path.read_text())
         assert report["corpus_sha256"] == hashlib.sha256(corpus.read_bytes()).hexdigest()
+
+
+def test_preference_pairs_are_not_separable_by_message_shape():
+    """If every chosen turn were a tool call with a think block and every
+    rejected turn were prose, DPO would learn "tool calls beat prose" — a style
+    rule that also contradicts the SFT corpus, where a prose answer is the right
+    end of an inspect-and-answer episode."""
+    pairs = load_jsonl(PREF_CORPUS)
+
+    for pair in pairs:
+        assert bool(pair["chosen_message"].get("reasoning_content")) == bool(
+            pair["rejected_message"].get("reasoning_content")
+        ), pair["id"]
+
+    prose_rejections = [pair for pair in pairs if not pair["rejected_message"].get("tool_calls")]
+    # Exactly one contrast is allowed to be form-asymmetric, because the
+    # behaviour it penalises is ending the episode with prose instead of
+    # verifying; it cannot be expressed as a tool call.
+    assert {pair["contrast_type"] for pair in prose_rejections} == {"verification_claim"}
+    assert len(prose_rejections) <= len(pairs) // 4
+
+
+def test_task_environment_hides_credentials_from_repository_code(tmp_path, monkeypatch):
+    """Running a repository's tests is running its code. Filtering variable
+    names is not enough while the Hub token sits in a file under HOME."""
+    real_home = tmp_path / "home"
+    token_file = real_home / ".cache" / "huggingface" / "token"
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text("hf_pretend_secret")
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HF_TOKEN", "hf_pretend_secret")
+
+    environment = harness.filtered_environment(home=tmp_path / "task_home")
+    assert "HF_TOKEN" not in environment
+    assert environment["HF_HUB_OFFLINE"] == "1"
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, pathlib; print(pathlib.Path(os.path.expanduser('~'), '.cache/huggingface/token').exists())",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert probe.stdout.strip() == "False", probe.stdout
+
+    # The same isolation must be what the notebook applies.
+    generator = load_generator()
+    parameters_cell = code_cell_containing(generator.build_01_baseline(), "TASK_ENV = {")
+    for key in ("HOME", "HF_HOME", "XDG_CACHE_HOME", "HUGGINGFACE_HUB_CACHE"):
+        assert key in parameters_cell, key
+    assert 'TASK_ENV["HF_HUB_OFFLINE"] = "1"' in parameters_cell

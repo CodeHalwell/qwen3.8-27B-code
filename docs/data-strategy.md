@@ -176,13 +176,38 @@ The repository ships that smoke corpus: `scripts/generate_sft_corpus.py`
 drives the real six-tool harness over pytest-verified fixture repositories
 and emits `data/native_sft/trajectories.jsonl` (scripted gold trajectories —
 every observation recorded from a real execution, five trajectory shapes
-including failure recovery and test authoring, reasoning-effort mix per this
-document). `scripts/generate_preference_pairs.py` produces the matching
+including failure recovery and test authoring).
+
+Those rows are labelled `low` and `medium` only. The template injects "think
+carefully through the task, validate key assumptions, consider plausible
+alternatives" for `xhigh`, and the scripted reasoning is one sentence per
+turn; labelling it `xhigh` would supervise the model to answer that
+instruction with a single line. The reasoning-effort balance below is a target
+for generated trajectories, where the reasoning actually varies with the
+requested effort — never something to reach by relabelling fixed text. `scripts/generate_preference_pairs.py` produces the matching
 execution-derived preference pairs. Both artifacts carry quality reports with
 real-tokenizer length statistics and are validated by the test suite against
 notebook 02's exact row validation. They satisfy the smoke gate only; the
 main SFT mixture still requires regenerated trajectories from real
 repositories.
+
+## Collecting native trajectories
+
+`scripts/collect_trajectories.py` implements the rejection sampling this
+document assumes: the policy attempts each task several times, every attempt is
+graded from outside the workspace, and only verified attempts become rows. The
+reasoning in those rows is the model's own, generated at the effort it ran at,
+which is what the scripted bootstrap corpus cannot supply and why `xhigh` rows
+have to come from here.
+
+The filters below are enforced in code, and each rejection is counted by reason
+so the report says why a corpus is small rather than only how small it is. Read
+the acceptance rate and the rejection breakdown before the row count: a corpus
+whose rejections are dominated by `completed_without_verification` is telling
+you the policy does not verify, and training on the survivors will not fix it.
+
+The report also bands each task by measured success, which is the difficulty
+ladder below, computed rather than assumed.
 
 ## Demonstration filtering
 
@@ -200,10 +225,33 @@ Reject or quarantine examples when:
 Keep useful recovery behaviour, but do not SFT directly on unsuccessful final
 outcomes. Failed attempts are candidates for preference data.
 
+The collector rejects an attempt for exactly these reasons, and records which:
+
+| Rejection | Meaning |
+| --- | --- |
+| `protected_files_modified` | The attempt edited a test file it was told not to |
+| `verification_failed` | Hidden or visible verification did not pass |
+| `regression` | Behaviour that worked before the attempt no longer works |
+| `completed_without_verification` | Answered without ever running the tests |
+| `malformed_tool_call` | A call that does not satisfy the tool schema |
+| `terminated_*` | Ended on a budget, a truncation or a timeout, not an answer |
+| `duplicate_actions` | Same action sequence as a row already kept |
+| `infrastructure_failure` | The harness or model server failed; never a model failure |
+
 ## Preference pairs
 
 A preference record must compare continuations from the same state. Whole
 trajectories with unrelated prompts are not valid pairs.
+
+Match the *form* of chosen and rejected continuations as closely as the
+behaviour allows. If every chosen turn is a tool call carrying reasoning while
+every rejected turn is prose, the preference stage learns "tool calls beat
+prose" rather than anything about software engineering — and that lesson
+contradicts the SFT corpus, where a prose answer correctly ends an
+inspect-and-answer episode. Where a contrast genuinely cannot be symmetric,
+because the behaviour being penalised *is* the premature prose answer, record
+that asymmetry in the dataset quality report and keep the reasoning channel
+present on both sides.
 
 Prioritise execution-derived pairs such as:
 

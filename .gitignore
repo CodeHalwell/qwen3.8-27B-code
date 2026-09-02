@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Generated evaluation reports and collected corpora. Small manifests and
+# hashes belong in Git; datasets and run artifacts do not.
+reports/
+data/collected/
