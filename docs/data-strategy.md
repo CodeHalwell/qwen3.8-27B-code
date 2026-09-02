@@ -191,6 +191,24 @@ notebook 02's exact row validation. They satisfy the smoke gate only; the
 main SFT mixture still requires regenerated trajectories from real
 repositories.
 
+## Collecting native trajectories
+
+`scripts/collect_trajectories.py` implements the rejection sampling this
+document assumes: the policy attempts each task several times, every attempt is
+graded from outside the workspace, and only verified attempts become rows. The
+reasoning in those rows is the model's own, generated at the effort it ran at,
+which is what the scripted bootstrap corpus cannot supply and why `xhigh` rows
+have to come from here.
+
+The filters below are enforced in code, and each rejection is counted by reason
+so the report says why a corpus is small rather than only how small it is. Read
+the acceptance rate and the rejection breakdown before the row count: a corpus
+whose rejections are dominated by `completed_without_verification` is telling
+you the policy does not verify, and training on the survivors will not fix it.
+
+The report also bands each task by measured success, which is the difficulty
+ladder below, computed rather than assumed.
+
 ## Demonstration filtering
 
 Reject or quarantine examples when:
@@ -206,6 +224,19 @@ Reject or quarantine examples when:
 
 Keep useful recovery behaviour, but do not SFT directly on unsuccessful final
 outcomes. Failed attempts are candidates for preference data.
+
+The collector rejects an attempt for exactly these reasons, and records which:
+
+| Rejection | Meaning |
+| --- | --- |
+| `protected_files_modified` | The attempt edited a test file it was told not to |
+| `verification_failed` | Hidden or visible verification did not pass |
+| `regression` | Behaviour that worked before the attempt no longer works |
+| `completed_without_verification` | Answered without ever running the tests |
+| `malformed_tool_call` | A call that does not satisfy the tool schema |
+| `terminated_*` | Ended on a budget, a truncation or a timeout, not an answer |
+| `duplicate_actions` | Same action sequence as a row already kept |
+| `infrastructure_failure` | The harness or model server failed; never a model failure |
 
 ## Preference pairs
 

@@ -170,13 +170,25 @@ model on target repository tasks.
 The current executable slice is intentionally smaller than the end state:
 
 ```text
-docs/                         # decisions, gates and operating guidance
-notebooks/                    # seven generated Colab notebooks
-references/                   # read-only upstream examples
-scripts/build_notebooks.py    # notebook source of truth and validation
-src/qwen3_8_27b_code/train.ipynb  # legacy pointer into notebooks/
-tests/                        # generator and notebook contract regressions
+docs/                            # decisions, gates and operating guidance
+notebooks/                       # eight generated Colab notebooks
+references/                      # read-only upstream examples
+scripts/build_notebooks.py       # notebook source of truth and validation
+scripts/generate_sft_corpus.py   # scripted bootstrap corpus
+scripts/collect_trajectories.py  # rejection sampling from a real policy
+scripts/evaluate_agent.py        # held-out scorecard, comparison and gate
+src/qwen3_8_27b_code/
+  episodes.py                    # the one episode loop, model call injected
+  tasks.py                       # held-out families and hidden verification
+  collection.py                  # attempt filtering and the corpus report
+  evaluation.py                  # scorecard, paired comparison, gate
+  policies.py                    # scripted policies incl. reward-hack fixtures
+tests/                           # generator, notebook and agent contracts
 ```
+
+The episode loop is shared rather than copied per notebook. Collection and
+evaluation must agree about what counts as success; if they drift, the gate
+stops measuring the thing the collector optimises.
 
 The following is the future package layout to extract only after a proven
 notebook path needs reusable CLI or harness code. It is not a description of
@@ -241,6 +253,12 @@ sampled. The published Dynamic 4-bit GGUF is an optional follow-up after the
 BF16 path works. The objective is to
 validate the adopted runner and native adapter, establish failure categories
 and measure gate cost—not produce a headline score.
+
+Milestone 1's baseline runner and Milestone 2's replay/rejection pipeline are
+now executable: `scripts/collect_trajectories.py` produces verified rows and
+`scripts/evaluate_agent.py` scores a candidate against a frozen baseline. What
+remains for those milestones is task supply — real repositories with resolvable
+revisions and environments — not the machinery around them.
 
 ### Experiment 2: 4K SFT smoke
 

@@ -18,6 +18,28 @@ Every comparison fixes:
 
 Report confidence intervals or per-task outcomes, not only a single aggregate.
 
+## The runnable gate
+
+The scorecard, the paired comparison and the thresholds below are implemented
+in `qwen3_8_27b_code.evaluation` and driven by `scripts/evaluate_agent.py`;
+notebook 07 supplies a model-backed policy. The held-out suite is
+`qwen3_8_27b_code.tasks.evaluation_tasks()`: six families whose bug classes,
+modules and family names are disjoint from the SFT fixtures, each carrying a
+verifier executed outside the workspace the model can read.
+
+Three properties of that implementation matter for interpreting a result:
+
+- **Hidden verification decides success.** Green visible tests are recorded but
+  are not success on their own, so an attempt that overfits the tests it can
+  see does not pass.
+- **Editing a protected test file fails the attempt outright**, whatever the
+  suite then reports. This is the reward hack the gate exists to catch.
+- **Infrastructure failures are excluded from scoring**, never charged to the
+  model, and reported separately.
+
+`compare` exits non-zero when the gate fails, so it can gate a promotion step
+rather than being advisory.
+
 ## Evaluation layers
 
 ### 1. Protocol tests
@@ -156,6 +178,9 @@ Thresholds below are starting policy and should be frozen before viewing a
 candidate's results.
 
 ### SFT gate
+
+Implemented as `evaluation.gate()`; freeze the thresholds before looking at a
+candidate's results.
 
 - Tool protocol fixtures: no regression.
 - Held-out repository success: better than upstream or statistically tied with

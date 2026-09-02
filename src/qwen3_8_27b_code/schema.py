@@ -145,3 +145,40 @@ def canonical_to_qwen(messages: list[dict]) -> list[dict]:
     if pending_system:
         converted.append({"role": "system", "content": "\n\n".join(pending_system)})
     return converted
+
+
+def validate_tool_call(name: str, arguments: dict) -> str | None:
+    """Check one call against the deployment schema; return an error or None.
+
+    The harness needs this before executing anything so that a malformed call
+    becomes a typed observation the model can recover from, rather than a
+    Python exception or a silently wrong execution.
+    """
+    specification = next(
+        (tool["function"] for tool in TOOLS if tool["function"]["name"] == name),
+        None,
+    )
+    if specification is None:
+        known = ", ".join(sorted(tool["function"]["name"] for tool in TOOLS))
+        return f"unknown tool {name!r}; available tools are {known}"
+    if not isinstance(arguments, dict):
+        return f"{name} arguments must be an object"
+    parameters = specification["parameters"]
+    required = set(parameters.get("required", []))
+    properties = parameters.get("properties", {})
+
+    # Report every problem at once. A model that mistyped one argument name
+    # usually needs to see the whole correction, not one round per mistake.
+    problems = []
+    missing = sorted(required - set(arguments))
+    if missing:
+        problems.append(f"missing required argument(s): {', '.join(missing)}")
+    if parameters.get("additionalProperties") is False:
+        unexpected = sorted(set(arguments) - set(properties))
+        if unexpected:
+            problems.append(f"unknown argument(s): {', '.join(unexpected)}")
+    for argument in sorted(set(arguments) & set(properties)):
+        allowed = properties[argument].get("enum")
+        if allowed is not None and arguments[argument] not in allowed:
+            problems.append(f"{argument} must be one of {', '.join(map(str, allowed))}")
+    return f"{name}: " + "; ".join(problems) if problems else None

@@ -2810,6 +2810,352 @@ def build_06_qat_export():
     )
 
 
+def build_07_collect_and_evaluate():
+    return notebook(
+        "07 · Collect trajectories and run the held-out gate",
+        [
+            markdown(
+                """
+                # 07 · Collection and the held-out gate
+
+                Two things this suite could not do before: generate training
+                trajectories from the model's own attempts, and measure whether
+                a trained checkpoint is actually better than the stock one.
+
+                **This notebook imports the shared code instead of restating
+                it.** Notebooks 00-06 keep self-contained cells because each one
+                needs only a handful of definitions. The episode loop, the
+                collection filters and the scorecard are none of those: three
+                hand-copied copies would drift, and a gate that drifts from the
+                collector it grades is worse than no gate. The GPU-specific part
+                — turning messages into one generated turn — is the only thing
+                defined here.
+
+                **Held-out means held out.** The evaluation families in
+                `qwen3_8_27b_code.tasks` share no bug class, module or family
+                name with the SFT fixtures, and the test suite enforces that.
+                Never collect training data from them.
+                """
+            ),
+            markdown("## Install the pinned day-zero environment"),
+            code(INSTALL_CORE),
+            markdown("After the first install, restart the runtime and rerun the notebook from the top; the install marker skips the pip work."),
+            code(AUTH_AND_RUNTIME),
+            markdown("## Bring in the shared harness, collector and gate"),
+            code(
+                r"""
+                import subprocess
+
+                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
+                REPO_DIR = Path("/content/qwen3.8-27B-code")
+
+                if not REPO_DIR.exists():
+                    subprocess.run(
+                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
+                        check=True,
+                    )
+                if str(REPO_DIR / "src") not in sys.path:
+                    sys.path.insert(0, str(REPO_DIR / "src"))
+
+                from qwen3_8_27b_code.collection import collect, write_corpus
+                from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
+                from qwen3_8_27b_code.evaluation import (
+                    compare,
+                    evaluate,
+                    gate,
+                    gate_passed,
+                    read_report,
+                    write_report,
+                )
+                from qwen3_8_27b_code.fixtures import iter_tasks
+                from qwen3_8_27b_code.tasks import evaluation_tasks, task_from_fixture
+
+                repo_revision = subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip()
+                print(json.dumps({"repo": REPO_URL, "revision": repo_revision}, indent=2))
+                """
+            ),
+            markdown("## Run configuration"),
+            code(
+                r"""
+                from unsloth import FastLanguageModel
+
+                MODEL_ID = "unsloth/Qwen3.8-27B"
+                ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
+                ACCEPTED_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
+                MAX_SEQUENCE_LENGTH = 16_384
+                MAX_NEW_TOKENS_PER_TURN = 2_048
+                REASONING_EFFORT = "medium"
+
+                # docs/evaluation.md funnel: the sentinel tier is the cheap one
+                # every candidate runs. Widen only for a candidate or release
+                # gate, and price it before starting.
+                EVAL_VARIANTS_PER_FAMILY = 1     # 6 held-out tasks
+                EVAL_ATTEMPTS = 1                # deterministic sentinel pass
+                EPISODE_BUDGET = EpisodeBudget(tool_calls=10, wall_seconds=480.0)
+
+                RUN_BASELINE_EVAL = True
+                RUN_CANDIDATE_EVAL = False       # needs an accepted adapter revision
+                RUN_COLLECTION = False           # expensive; read the cost note below first
+                PUSH_ARTIFACTS = False
+
+                COLLECTION_ATTEMPTS = 3
+                COLLECTION_VARIANTS_PER_FAMILY = 2
+                COLLECTION_SEEDS = (3407, 9176, 20261)
+
+                REPORT_DIR = RUN_ROOT / "gate"
+                REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+                if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
+                    raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
+
+                evaluation_suite = evaluation_tasks(variants_per_family=EVAL_VARIANTS_PER_FAMILY)
+                print(json.dumps({
+                    "held_out_tasks": len(evaluation_suite),
+                    "families": sorted({task.family for task in evaluation_suite}),
+                    "attempts_each": EVAL_ATTEMPTS,
+                }, indent=2))
+                """
+            ),
+            markdown("## The only GPU-specific piece: messages in, one turn out"),
+            code(
+                r"""
+                # Everything else in this notebook is shared code. A policy is a
+                # callable that renders the history, generates one assistant
+                # turn, and reports whether generation finished or was cut off.
+                def build_policy_factory(model, tokenizer, reasoning_effort=REASONING_EFFORT):
+                    generation_eos = model.generation_config.eos_token_id
+                    eos_token_ids = {
+                        token_id
+                        for token_id in (
+                            *(generation_eos if isinstance(generation_eos, (list, tuple)) else [generation_eos]),
+                            tokenizer.eos_token_id,
+                        )
+                        if token_id is not None
+                    }
+                    if not eos_token_ids:
+                        raise RuntimeError("No end-of-turn token id is available; truncation cannot be detected.")
+
+                    def policy_factory(task, seed):
+                        torch.manual_seed(seed)
+                        torch.cuda.manual_seed_all(seed)
+
+                        def policy(messages):
+                            rendered = render_chat(
+                                messages,
+                                add_generation_prompt=True,
+                                reasoning_effort=reasoning_effort,
+                            )
+                            inputs = tokenizer(
+                                text=rendered, return_tensors="pt", add_special_tokens=False
+                            ).to("cuda")
+                            prompt_tokens = int(inputs["input_ids"].numel())
+                            if prompt_tokens + MAX_NEW_TOKENS_PER_TURN > MAX_SEQUENCE_LENGTH:
+                                return TurnResult(
+                                    text="", prompt_tokens=prompt_tokens, fault="context_budget"
+                                )
+                            with torch.inference_mode():
+                                outputs = model.generate(
+                                    **inputs,
+                                    max_new_tokens=MAX_NEW_TOKENS_PER_TURN,
+                                    temperature=1.0,
+                                    top_p=0.95,
+                                    top_k=20,
+                                    do_sample=True,
+                                    use_cache=True,
+                                )
+                            new_ids = outputs[0, inputs["input_ids"].shape[1]:]
+                            completion_tokens = int(new_ids.numel())
+                            stopped_on_eos = completion_tokens > 0 and int(new_ids[-1]) in eos_token_ids
+                            return TurnResult(
+                                text=tokenizer.decode(new_ids, skip_special_tokens=False),
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                fault=None if stopped_on_eos else "output_truncated",
+                            )
+
+                        return policy
+
+                    return policy_factory
+                """
+            ),
+            code(TOOLS_CELL),
+            markdown("## Baseline: the stock model on the held-out suite"),
+            code(
+                r"""
+                baseline_report_path = REPORT_DIR / "baseline.json"
+
+                if RUN_BASELINE_EVAL:
+                    require_free_vram(60.0)
+                    model, tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=MODEL_ID,
+                        max_seq_length=MAX_SEQUENCE_LENGTH,
+                        load_in_4bit=False,
+                        full_finetuning=False,
+                        token=hf_token,
+                    )
+                    assert_model_fully_resident(model)
+                    FastLanguageModel.for_inference(model)
+
+                    baseline = evaluate(
+                        evaluation_suite,
+                        build_policy_factory(model, tokenizer),
+                        label="upstream-bf16",
+                        attempts_per_task=EVAL_ATTEMPTS,
+                        budget=EPISODE_BUDGET,
+                    )
+                    write_report(baseline, baseline_report_path)
+                    print(json.dumps(baseline.scorecard(), indent=2))
+                    print(f"wrote {baseline_report_path}")
+                else:
+                    print("Baseline evaluation is off. It is the comparison point for every later claim.")
+                """
+            ),
+            markdown(
+                """
+                ## Candidate: the accepted adapter on the same frozen suite
+
+                Release the baseline model first. Two 27B checkpoints do not
+                coexist on one card, and a partially offloaded second load
+                crawls or dies mid-episode.
+                """
+            ),
+            code(
+                r"""
+                candidate_report_path = REPORT_DIR / "candidate.json"
+
+                if RUN_CANDIDATE_EVAL:
+                    release_stale_gpu_state()
+                    require_free_vram(60.0)
+                    model, tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=ACCEPTED_ADAPTER_ID,
+                        revision=ACCEPTED_REVISION,
+                        max_seq_length=MAX_SEQUENCE_LENGTH,
+                        load_in_4bit=False,
+                        token=hf_token,
+                    )
+                    assert_model_fully_resident(model)
+                    FastLanguageModel.for_inference(model)
+
+                    candidate = evaluate(
+                        evaluation_suite,
+                        build_policy_factory(model, tokenizer),
+                        label="sft-lora-candidate",
+                        attempts_per_task=EVAL_ATTEMPTS,
+                        budget=EPISODE_BUDGET,
+                    )
+                    write_report(candidate, candidate_report_path)
+                    print(json.dumps(candidate.scorecard(), indent=2))
+                else:
+                    print("Candidate evaluation is off. Turn it on once an adapter revision is accepted.")
+                """
+            ),
+            markdown("## Apply the gate"),
+            code(
+                r"""
+                if baseline_report_path.exists() and candidate_report_path.exists():
+                    comparison = compare(
+                        read_report(baseline_report_path), read_report(candidate_report_path)
+                    )
+                    checks = gate(comparison)
+                    comparison["gate"] = [
+                        {"name": check.name, "passed": check.passed, "detail": check.detail}
+                        for check in checks
+                    ]
+                    comparison["gate_passed"] = gate_passed(checks)
+                    (REPORT_DIR / "comparison.json").write_text(json.dumps(comparison, indent=2))
+
+                    print(json.dumps(comparison["deltas"], indent=2))
+                    for check in checks:
+                        print(f"  [{'PASS' if check.passed else 'FAIL'}] {check.name}: {check.detail}")
+                    task_level = comparison["task_level"]
+                    # A suite this small reports paired outcomes; it cannot
+                    # support a percentage-point significance claim.
+                    print(
+                        f"{task_level['wins']} improved, {task_level['losses']} regressed, "
+                        f"{task_level['ties']} unchanged, of {task_level['tasks']} tasks."
+                    )
+                    print("GATE PASSED" if comparison["gate_passed"] else "GATE FAILED")
+                else:
+                    print("Both a baseline and a candidate report are required before the gate can run.")
+                """
+            ),
+            markdown(
+                """
+                ## Collect training trajectories by rejection sampling
+
+                This is the route off the scripted bootstrap corpus. The model
+                attempts each training task several times, every attempt is
+                graded from outside its workspace, and only verified attempts
+                become rows — carrying the model's own reasoning at the effort
+                it ran at, which is what the scripted corpus cannot supply.
+
+                Cost first: attempts × tasks × mean episode seconds. Measure one
+                task before enabling the full sweep, and use the acceptance rate
+                in the report to decide whether more attempts or easier tasks
+                are the better next move.
+                """
+            ),
+            code(
+                r"""
+                if RUN_COLLECTION:
+                    if "model" not in globals():
+                        raise RuntimeError("Load a model in one of the cells above before collecting.")
+                    collection_tasks = [
+                        task_from_fixture(fixture)
+                        for fixture in iter_tasks(COLLECTION_VARIANTS_PER_FAMILY)
+                    ]
+                    result = collect(
+                        collection_tasks,
+                        build_policy_factory(model, tokenizer),
+                        attempts_per_task=COLLECTION_ATTEMPTS,
+                        seeds=COLLECTION_SEEDS,
+                        budget=EPISODE_BUDGET,
+                        reasoning_effort=REASONING_EFFORT,
+                        max_rows_per_task=2,
+                    )
+                    corpus_path = REPORT_DIR / "collected_trajectories.jsonl"
+                    report = write_corpus(result, corpus_path, REPORT_DIR / "collection_report.json")
+                    print(json.dumps(report, indent=2))
+                    print(f"wrote {corpus_path}; feed it to notebook 02 as SOURCE_LOCAL_JSONL.")
+
+                    if PUSH_ARTIFACTS:
+                        from huggingface_hub import HfApi
+
+                        HfApi(token=hf_token).upload_folder(
+                            repo_id=f"{HF_USERNAME}/qwen38-code-collected-v0",
+                            repo_type="dataset",
+                            folder_path=str(REPORT_DIR),
+                            private=True,
+                        )
+                else:
+                    print("Collection is off. Enable it once the baseline scorecard shows the failure mix.")
+                """
+            ),
+            markdown(
+                """
+                ## What the numbers mean
+
+                Read the acceptance rate and the rejection breakdown before the
+                row count. A corpus of 500 rows whose rejections are dominated
+                by `completed_without_verification` is telling you the policy
+                does not verify, and training on the survivors will not fix that.
+
+                The difficulty bands come from docs/data-strategy.md: tasks in
+                the trivial band are protocol smoke tests, the learnable band is
+                the useful curriculum, and frontier tasks are for later.
+
+                Feed the collected JSONL to notebook 02, which remains the
+                publisher that validates, splits and pushes the dataset that
+                notebooks 03 and 06 consume.
+                """
+            ),
+        ],
+    )
+
 def build_legacy_pointer():
     return notebook(
         "Training notebook moved",
@@ -2848,6 +3194,7 @@ def main() -> None:
         NOTEBOOKS / "04_dpo_preferences.ipynb": build_04_dpo(),
         NOTEBOOKS / "05_agentic_grpo.ipynb": build_05_grpo(),
         NOTEBOOKS / "06_qat_and_export.ipynb": build_06_qat_export(),
+        NOTEBOOKS / "07_collect_and_evaluate.ipynb": build_07_collect_and_evaluate(),
         ROOT / "src" / "qwen3_8_27b_code" / "train.ipynb": build_legacy_pointer(),
     }
     for path, nb in outputs.items():

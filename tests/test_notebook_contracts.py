@@ -280,6 +280,7 @@ def test_generated_notebooks_have_restart_and_schema_guards():
         generator.build_04_dpo(),
         generator.build_05_grpo(),
         generator.build_06_qat_export(),
+        generator.build_07_collect_and_evaluate(),
     ]
 
     all_source = "\n".join(cell.source for notebook in notebooks for cell in notebook.cells)
@@ -318,6 +319,7 @@ def test_every_model_load_is_guarded_against_silent_offload():
         "04": generator.build_04_dpo(),
         "05": generator.build_05_grpo(),
         "06": generator.build_06_qat_export(),
+        "07": generator.build_07_collect_and_evaluate(),
     }
 
     load_cells = 0
@@ -328,7 +330,7 @@ def test_every_model_load_is_guarded_against_silent_offload():
             load_cells += 1
             assert "require_free_vram(" in cell.source, f"notebook {name} cell {index}"
             assert "assert_model_fully_resident(" in cell.source, f"notebook {name} cell {index}"
-    assert load_cells == 7
+    assert load_cells == 9
 
     auth = generator.AUTH_AND_RUNTIME
     assert "def release_stale_gpu_state" in auth
@@ -627,3 +629,53 @@ def test_notebook_02_accepts_the_documented_non_agentic_lane():
         {"role": "tool", "name": "read_file", "content": "x = 1"},
     ])
     assert validate_row(mislabelled)
+
+
+def test_notebook_07_imports_the_shared_loop_instead_of_restating_it():
+    """Three hand-copied episode loops would drift, and a gate that drifts
+    from the collector it grades is worse than no gate."""
+    generator = load_generator()
+    source = "\n".join(cell.source for cell in generator.build_07_collect_and_evaluate().cells)
+
+    assert "from qwen3_8_27b_code.evaluation import" in source
+    assert "from qwen3_8_27b_code.collection import" in source
+    for redefinition in ("def run_episode", "def execute_tool", "def rejection_reason", "def scorecard"):
+        assert redefinition not in source, redefinition
+    # The GPU-specific part is the only thing the notebook defines.
+    assert "def build_policy_factory" in source
+    assert "TurnResult(" in source
+
+
+def test_notebook_07_never_collects_from_the_held_out_suite():
+    generator = load_generator()
+    notebook = generator.build_07_collect_and_evaluate()
+    collection_cell = code_cell_containing(notebook, "result = collect(")
+
+    assert "task_from_fixture" in collection_cell
+    assert "evaluation_tasks(" not in collection_cell
+    evaluation_cell = code_cell_containing(notebook, "label=\"upstream-bf16\"")
+    assert "evaluation_suite" in evaluation_cell
+
+
+def test_notebook_07_applies_the_gate_and_persists_the_comparison():
+    generator = load_generator()
+    gate_cell = code_cell_containing(
+        generator.build_07_collect_and_evaluate(), "comparison[\"gate_passed\"]"
+    )
+    assert "compare(" in gate_cell
+    assert "gate_passed(checks)" in gate_cell
+    assert "comparison.json" in gate_cell
+    # A suite this small reports paired outcomes, not a significance claim.
+    assert "task_level" in gate_cell
+
+
+def test_notebook_07_releases_the_baseline_before_loading_the_candidate():
+    """Two 27B checkpoints do not coexist on one card."""
+    generator = load_generator()
+    candidate_cell = code_cell_containing(
+        generator.build_07_collect_and_evaluate(), "RUN_CANDIDATE_EVAL:"
+    )
+    assert "release_stale_gpu_state()" in candidate_cell
+    assert candidate_cell.index("release_stale_gpu_state()") < candidate_cell.index(
+        "FastLanguageModel.from_pretrained"
+    )
