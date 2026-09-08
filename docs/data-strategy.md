@@ -161,6 +161,13 @@ Do not rename a third-party `bash` call to `run_tests`, split a shell transcript
 into invented semantic calls or fabricate observations. That produces fluent
 but false supervision.
 
+A larger open model is the other regenerable source. Driven through the
+target adapter by `qwen3_8_27b_code.teachers`, its verified attempts are
+native-schema rows with the teacher's own reasoning, and its failed attempts
+pair against the student's; see [Distillation](distillation.md), including
+the reasoning-visibility requirement and how the rows' effort label is
+chosen.
+
 The planning assumption is **0% direct survival** until a stratified audit of
 at least 100 rows reports otherwise. Record the fraction in each lane and the
 replay success rate. Regardless of the audit, 100% of the main SFT mixture's

@@ -281,6 +281,7 @@ def test_generated_notebooks_have_restart_and_schema_guards():
         generator.build_05_grpo(),
         generator.build_06_qat_export(),
         generator.build_07_collect_and_evaluate(),
+        generator.build_08_distil(),
     ]
 
     all_source = "\n".join(cell.source for notebook in notebooks for cell in notebook.cells)
@@ -320,6 +321,7 @@ def test_every_model_load_is_guarded_against_silent_offload():
         "05": generator.build_05_grpo(),
         "06": generator.build_06_qat_export(),
         "07": generator.build_07_collect_and_evaluate(),
+        "08": generator.build_08_distil(),
     }
 
     load_cells = 0

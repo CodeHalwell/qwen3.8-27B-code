@@ -3273,6 +3273,287 @@ def build_07_collect_and_evaluate():
         ],
     )
 
+TEACHER_RUNTIME = r"""
+import json
+import os
+from pathlib import Path
+
+from huggingface_hub import login, whoami
+
+try:
+    from google.colab import userdata
+except ImportError:
+    userdata = None
+
+def secret(name: str):
+    value = userdata.get(name) if userdata is not None else None
+    return value or os.getenv(name)
+
+hf_token = secret("HF_TOKEN")
+if not hf_token:
+    raise RuntimeError("Add HF_TOKEN to Colab Secrets: it pushes artifacts and authenticates the Hugging Face router.")
+login(token=hf_token, add_to_git_credential=False)
+HF_USERNAME = whoami()["name"]
+os.environ["HF_TOKEN"] = hf_token
+
+# Vendor endpoints read their own key. Copy each one that exists in Secrets
+# into the environment name its preset expects; the task harness strips
+# anything named like a key from the environment repository code runs under.
+for key_env in ("MOONSHOT_API_KEY", "ZAI_API_KEY", "TEACHER_API_KEY"):
+    value = secret(key_env)
+    if value:
+        os.environ[key_env] = value
+
+RUN_ROOT = Path("/content/qwen38_runs")
+RUN_ROOT.mkdir(parents=True, exist_ok=True)
+print(f"Authenticated as {HF_USERNAME}")
+"""
+
+
+def build_08_distil():
+    return notebook(
+        "08 · Distil from a larger open model",
+        [
+            markdown(
+                """
+                # 08 · Distil from a larger open model
+
+                A larger open model (a bigger Qwen3.8, Kimi K3, GLM 5.3 or 5.3
+                Flash) acts as the *teacher*: it attempts the training tasks
+                through the exact six-tool harness, every attempt is graded from
+                outside its workspace, and only verified attempts become student
+                data. Nothing is translated or fabricated; this is the
+                "Regenerable" lane of docs/data-strategy.md applied to a model.
+
+                Three artifacts come out. Verified trajectories for notebook 02,
+                with the teacher's own reasoning at the effort you label them
+                with. Reasoning-length pairs from teacher attempts that verified
+                but thought more than another. And outcome pairs (teacher
+                verified, student did not, from the same state) for notebook 04
+                when a student attempts file is supplied.
+
+                **No GPU is needed.** The teacher runs behind an OpenAI-compatible
+                endpoint; this notebook only drives the CPU harness and the
+                endpoint. Read docs/distillation.md first: it covers what this
+                buys over logit distillation, the reasoning-visibility
+                requirement, how to label effort, and the vendor terms to check
+                before training on API output.
+                """
+            ),
+            markdown("## Authenticate"),
+            code(TEACHER_RUNTIME),
+            markdown("## Bring in the shared harness, collector and teacher adapter"),
+            code(
+                r"""
+                import subprocess
+                import sys
+
+                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
+                REPO_DIR = Path("/content/qwen3.8-27B-code")
+
+                if not REPO_DIR.exists():
+                    subprocess.run(
+                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
+                        check=True,
+                    )
+                if str(REPO_DIR / "src") not in sys.path:
+                    sys.path.insert(0, str(REPO_DIR / "src"))
+
+                from qwen3_8_27b_code.collection import collect, read_attempts, write_attempts, write_corpus
+                from qwen3_8_27b_code.distillation import build_outcome_pairs, write_outcome_pairs
+                from qwen3_8_27b_code.episodes import EpisodeBudget
+                from qwen3_8_27b_code.fixtures import iter_tasks
+                from qwen3_8_27b_code.long_horizon import training_tasks
+                from qwen3_8_27b_code.tasks import task_from_fixture
+                from qwen3_8_27b_code.teachers import PRESETS, TeacherConfig, probe_teacher, teacher_policy_factory
+                from qwen3_8_27b_code.thinking import build_reasoning_length_pairs, write_length_pairs
+
+                repo_revision = subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip()
+                print(json.dumps({"repo": REPO_URL, "revision": repo_revision, "presets": sorted(PRESETS)}, indent=2))
+                """
+            ),
+            markdown("## Choose the teacher"),
+            code(
+                r"""
+                TEACHER_PRESET = "hf-inference-providers"   # or "moonshot", "zai", "vllm-local", "llama-cpp-local"
+                TEACHER_MODEL = "REPLACE_WITH_TEACHER_MODEL_ID"  # the id as the endpoint names it
+                TEACHER_BASE_URL = None                     # overrides the preset when set
+                TEACHER_API_KEY_ENV = None                  # overrides the preset's key variable when set
+                SEND_REASONING_EFFORT = None                # e.g. "medium" for Qwen3.8 endpoints; None sends nothing
+                EXTRA_BODY = {}                             # vendor switches, e.g. a thinking flag
+                REQUIRE_REASONING = True                    # refuse turns whose reasoning the endpoint hides
+                MAX_TOKENS_PER_TURN = 4_096
+
+                # The label stored on every row. It tells the student what this
+                # much reasoning is worth; compare the teacher's reasoning per
+                # turn (in the collection report) with the student's effort
+                # ladder before settling on it. See docs/distillation.md.
+                EFFORT_LABEL = "medium"
+
+                RUN_PROBE = True
+                RUN_TEACHER_COLLECTION = False              # cost first: attempts x tasks x teacher price
+                COLLECTION_ATTEMPTS = 3
+                COLLECTION_VARIANTS_PER_FAMILY = 2
+                COLLECTION_SEEDS = (3407, 9176, 20261)
+                EPISODE_BUDGET = EpisodeBudget(tool_calls=10, wall_seconds=900.0)
+                STUDENT_ATTEMPTS_JSONL = ""                 # attempts.jsonl from notebook 07 / collect_trajectories.py
+                PUSH_ARTIFACTS = False
+
+                if TEACHER_MODEL.startswith("REPLACE_"):
+                    raise RuntimeError("Set TEACHER_MODEL to the teacher's model id before continuing.")
+                overrides = {
+                    "reasoning_effort": SEND_REASONING_EFFORT,
+                    "extra_body": EXTRA_BODY,
+                    "require_reasoning": REQUIRE_REASONING,
+                    "max_tokens": MAX_TOKENS_PER_TURN,
+                }
+                if TEACHER_BASE_URL:
+                    teacher = TeacherConfig(
+                        model=TEACHER_MODEL, base_url=TEACHER_BASE_URL, api_key_env=TEACHER_API_KEY_ENV, **overrides
+                    )
+                else:
+                    teacher = TeacherConfig.from_preset(TEACHER_PRESET, TEACHER_MODEL, **overrides)
+                    if TEACHER_API_KEY_ENV:
+                        teacher = TeacherConfig(**{**teacher.__dict__, "api_key_env": TEACHER_API_KEY_ENV})
+                TEACHER_DIR = RUN_ROOT / "teacher" / TEACHER_MODEL.replace("/", "-")
+                TEACHER_DIR.mkdir(parents=True, exist_ok=True)
+                print(json.dumps({"teacher": teacher.label, "endpoint": teacher.base_url, "out": str(TEACHER_DIR)}, indent=2))
+                """
+            ),
+            markdown(
+                """
+                ## Probe: can this endpoint be a teacher?
+
+                One round trip with the deployment tools. A teacher is usable
+                when it answers with a native tool call and exposes its
+                reasoning. If reasoning is hidden, do not switch
+                `REQUIRE_REASONING` off to get past this cell: rows with empty
+                think blocks teach the student to skip thinking at the labelled
+                effort. Find an endpoint that returns `reasoning_content`.
+                """
+            ),
+            code(
+                r"""
+                if RUN_PROBE:
+                    probe = probe_teacher(teacher)
+                    print(json.dumps(probe, indent=2))
+                    if not probe["usable"]:
+                        raise RuntimeError("This endpoint cannot be a teacher as configured; see the probe report.")
+                else:
+                    print("Probe skipped.")
+                """
+            ),
+            markdown(
+                """
+                ## Collect verified teacher trajectories
+
+                Same collector as notebook 07: single-file fixtures plus the
+                multi-file training families, several attempts per task, only
+                verified attempts kept, and of those the ones that reasoned
+                least. Every attempt is persisted for the outcome pairs below.
+                """
+            ),
+            code(
+                r"""
+                if RUN_TEACHER_COLLECTION:
+                    collection_tasks = [
+                        task_from_fixture(fixture)
+                        for fixture in iter_tasks(COLLECTION_VARIANTS_PER_FAMILY)
+                    ] + training_tasks(COLLECTION_VARIANTS_PER_FAMILY)
+                    result = collect(
+                        collection_tasks,
+                        teacher_policy_factory(teacher),
+                        attempts_per_task=COLLECTION_ATTEMPTS,
+                        seeds=COLLECTION_SEEDS,
+                        budget=EPISODE_BUDGET,
+                        reasoning_effort=EFFORT_LABEL,
+                        max_rows_per_task=2,
+                        selection="shortest_reasoning",
+                        policy_label=teacher.label,
+                        source=teacher.label,
+                        provenance={
+                            "teacher": {
+                                "model": teacher.model,
+                                "endpoint": teacher.base_url,
+                                "reasoning_effort_parameter": teacher.reasoning_effort,
+                                "extra_body": teacher.extra_body,
+                            }
+                        },
+                    )
+                    report = write_corpus(result, TEACHER_DIR / "trajectories.jsonl", TEACHER_DIR / "quality_report.json")
+                    print(json.dumps(report, indent=2))
+                    print(f"persisted {write_attempts(result, TEACHER_DIR / 'attempts.jsonl')} attempts")
+
+                    length_pairs = build_reasoning_length_pairs(result.attempts)
+                    print(json.dumps(write_length_pairs(
+                        length_pairs, TEACHER_DIR / "length_pairs.jsonl", TEACHER_DIR / "length_pairs_report.json"
+                    ), indent=2))
+                else:
+                    print("Teacher collection is off. Price one task first, then enable it.")
+                """
+            ),
+            markdown(
+                """
+                ## Outcome pairs: teacher against the student
+
+                Where a teacher attempt verified and a student attempt at the
+                same task did not, the pair prefers the teacher's continuation
+                at the first divergent action. Supply the student's
+                `attempts.jsonl` (notebook 07 or `scripts/collect_trajectories.py`)
+                to get teacher-versus-student pairs; without it the pairs are
+                teacher-versus-teacher across seeds.
+                """
+            ),
+            code(
+                r"""
+                if RUN_TEACHER_COLLECTION:
+                    attempts = list(result.attempts)
+                    if STUDENT_ATTEMPTS_JSONL:
+                        attempts += read_attempts(Path(STUDENT_ATTEMPTS_JSONL))
+                    outcome_pairs = build_outcome_pairs(attempts)
+                    outcome_report = write_outcome_pairs(
+                        outcome_pairs, TEACHER_DIR / "outcome_pairs.jsonl", TEACHER_DIR / "outcome_pairs_report.json"
+                    )
+                    print(json.dumps(outcome_report, indent=2))
+
+                    if PUSH_ARTIFACTS:
+                        from huggingface_hub import HfApi
+
+                        HfApi(token=hf_token).upload_folder(
+                            repo_id=f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}",
+                            repo_type="dataset",
+                            folder_path=str(TEACHER_DIR),
+                            private=True,
+                        )
+                else:
+                    print("No teacher attempts in this session; nothing to pair.")
+                """
+            ),
+            markdown(
+                """
+                ## What next
+
+                Feed `trajectories.jsonl` to notebook 02 as `SOURCE_LOCAL_JSONL`,
+                and the two pairs files to notebook 04 as `PREFERENCE_LOCAL_JSONL`
+                alongside the execution-derived pairs, keeping the length pairs a
+                minority. Read the collection report's `thinking` section before
+                either: if the teacher thinks several times longer per turn than
+                the student at the same label, the rows will move the student's
+                budget up, and the thinking gate in notebook 07 will say so.
+
+                Check the teacher's weight licence and, for a vendor API, its
+                terms on training other models with its output, before any
+                artifact from this notebook is published.
+                """
+            ),
+        ],
+    )
+
+
 def build_legacy_pointer():
     return notebook(
         "Training notebook moved",
@@ -3312,6 +3593,7 @@ def main() -> None:
         NOTEBOOKS / "05_agentic_grpo.ipynb": build_05_grpo(),
         NOTEBOOKS / "06_qat_and_export.ipynb": build_06_qat_export(),
         NOTEBOOKS / "07_collect_and_evaluate.ipynb": build_07_collect_and_evaluate(),
+        NOTEBOOKS / "08_distil_from_teacher.ipynb": build_08_distil(),
         ROOT / "src" / "qwen3_8_27b_code" / "train.ipynb": build_legacy_pointer(),
     }
     for path, nb in outputs.items():

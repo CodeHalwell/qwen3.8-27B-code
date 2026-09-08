@@ -39,6 +39,17 @@ checked on **2026-09-08**.
   the TRL cap to 1.10.0; open when last checked. The tracked route to running
   notebook 05's trainer without bypassing the resolver.
 
+## Distillation
+
+- [Kimi K3: Open Frontier Intelligence](https://arxiv.org/abs/2607.24653) —
+  the 2.8T-parameter MoE teacher candidate; open weights and vendor API.
+- [Kimi API quick start](https://platform.kimi.ai/docs/guide/start-using-kimi-api) —
+  OpenAI-compatible base URL `https://api.moonshot.ai/v1` (the `moonshot` preset).
+- [Z.ai API quick start](https://docs.z.ai/guides/overview/quick-start) —
+  OpenAI-compatible base URL `https://api.z.ai/api/paas/v4` for the GLM family (the `zai` preset).
+- [Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers) —
+  the router preset; one token, many hosted open models.
+
 ## Thinking budget
 
 - [Kimi k1.5: Scaling Reinforcement Learning with LLMs](https://arxiv.org/abs/2501.12599) —

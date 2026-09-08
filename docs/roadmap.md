@@ -71,6 +71,8 @@ Deliverables:
 - Source registry and licence metadata.
 - Normalisation to native Qwen messages.
 - Execution replay and rejection pipeline.
+- Teacher distillation route: a larger open model through the same harness
+  (`scripts/collect_from_teacher.py`, notebook 08).
 - Repository-level split and decontamination checks.
 - Token-length and quality report.
 - Versioned SFT, preference, RL and evaluation datasets.
@@ -173,11 +175,12 @@ The current executable slice is intentionally smaller than the end state:
 
 ```text
 docs/                            # decisions, gates and operating guidance
-notebooks/                       # eight generated Colab notebooks
+notebooks/                       # nine generated Colab notebooks
 references/                      # read-only upstream examples
 scripts/build_notebooks.py       # notebook source of truth and validation
 scripts/generate_sft_corpus.py   # scripted bootstrap corpus
 scripts/collect_trajectories.py  # rejection sampling from a real policy
+scripts/collect_from_teacher.py  # the same, with a larger open model as the policy
 scripts/evaluate_agent.py        # held-out scorecard, comparison and gate
 src/qwen3_8_27b_code/
   episodes.py                    # the one episode loop, model call injected
@@ -187,6 +190,8 @@ src/qwen3_8_27b_code/
   policies.py                    # scripted policies incl. reward-hack fixtures
   long_horizon.py                # multi-file training and held-out families (medium band)
   thinking.py                    # thinking budget: selection, length pairs, brevity reward
+  teachers.py                    # OpenAI-compatible teacher policy for distillation
+  distillation.py                # verified-versus-failed outcome pairs across policies
 tests/                           # generator, notebook and agent contracts
 ```
 

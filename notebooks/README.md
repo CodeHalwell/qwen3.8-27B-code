@@ -22,6 +22,7 @@ gate (see the [specialisation policy](../docs/data-strategy.md#specialisation-po
 | [04 · DPO preferences](04_dpo_preferences.ipynb) | Apply a small verifier-backed preference stage | DPO beats the accepted SFT adapter without coding, tool-protocol or preserved-thinking regressions |
 | [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment, reward tests and the correctness-gated brevity term; trainer integration is compatibility-gated | Reward and brevity fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
 | [06 · QAT and export](06_qat_and_export.ipynb) | Create separate QAT/TorchAO and standard GGUF experiments; prepare Dynamic calibration data | Quantised artifacts pass the frozen long-horizon gate against one BF16 reference |
+| [08 · Distil from a teacher](08_distil_from_teacher.ipynb) | Drive a larger open model (Qwen3.8, Kimi K3, GLM 5.3) through the same harness from a CPU runtime; keep verified trajectories, reasoning-length pairs and teacher-versus-student outcome pairs | The probe shows native tool calls with visible reasoning, and one priced task before the sweep |
 | [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Score a checkpoint on the held-out suite (single- and multi-file families), compare it to the frozen baseline including the thinking budget, and collect verified trajectories by rejection sampling with shortest-reasoning selection plus reasoning-length pairs | A candidate beats the baseline on the gate, thinking check included, before it is accepted |
 
 Notebook 07 is the only one that is not self-contained, and deliberately so.
@@ -111,6 +112,15 @@ preference contrasts put an executed tool call on *both* sides, so the pairs
 cannot be won by preferring tool calls over prose; the fourth
 (`verification_claim`) is asymmetric by nature and says so in its quality
 report.
+
+## Distilling from a larger open model
+
+Notebook 08 needs no GPU. A teacher behind an OpenAI-compatible endpoint
+attempts the training tasks through the exact six-tool harness; only verified
+attempts become student rows, and the rest become preference pairs. The
+adapter refuses turns whose reasoning the endpoint hides, because an empty
+think block labelled with an effort teaches the student not to think. See
+[docs/distillation.md](../docs/distillation.md).
 
 ## Thinking budget
 

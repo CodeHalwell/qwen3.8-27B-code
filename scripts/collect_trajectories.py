@@ -32,7 +32,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from qwen3_8_27b_code.collection import SELECTIONS, collect, write_corpus  # noqa: E402
+from qwen3_8_27b_code.collection import SELECTIONS, collect, write_attempts, write_corpus  # noqa: E402
+from qwen3_8_27b_code.distillation import build_outcome_pairs, write_outcome_pairs  # noqa: E402
 from qwen3_8_27b_code.episodes import EpisodeBudget  # noqa: E402
 from qwen3_8_27b_code.fixtures import iter_tasks  # noqa: E402
 from qwen3_8_27b_code.long_horizon import training_tasks as long_horizon_training_tasks  # noqa: E402
@@ -87,6 +88,24 @@ def main() -> None:
     )
     parser.add_argument("--min-length-ratio", type=float, default=DEFAULT_MIN_LENGTH_RATIO)
     parser.add_argument("--max-pairs-per-task", type=int, default=DEFAULT_MAX_PAIRS_PER_TASK)
+    parser.add_argument(
+        "--attempts-out",
+        type=Path,
+        default=ROOT / "data" / "collected" / "attempts.jsonl",
+        help="every attempt, kept or not; the input for teacher-versus-student outcome pairs",
+    )
+    parser.add_argument(
+        "--outcome-pairs-out",
+        type=Path,
+        default=ROOT / "data" / "collected" / "outcome_pairs.jsonl",
+        help="verified-versus-failed pairs from this policy's own attempts",
+    )
+    parser.add_argument(
+        "--outcome-pairs-report",
+        type=Path,
+        default=ROOT / "data" / "collected" / "outcome_pairs_report.json",
+    )
+    parser.add_argument("--policy-label", default=None, help="name recorded on rows and attempts; defaults to --policy")
     arguments = parser.parse_args()
 
     if arguments.suite == "evaluation":
@@ -106,6 +125,7 @@ def main() -> None:
         reasoning_effort=arguments.reasoning_effort,
         max_rows_per_task=arguments.max_rows_per_task,
         selection=arguments.selection,
+        policy_label=arguments.policy_label or arguments.policy,
     )
     report = write_corpus(result, arguments.out, arguments.report)
     report["policy"] = arguments.policy
@@ -123,6 +143,11 @@ def main() -> None:
     pairs_report["policy"] = arguments.policy
     arguments.length_pairs_report.write_text(json.dumps(pairs_report, indent=2) + "\n")
     print(f"wrote {arguments.length_pairs_out} ({len(pairs)} reasoning-length pairs)")
+
+    print(f"wrote {arguments.attempts_out} ({write_attempts(result, arguments.attempts_out)} attempts)")
+    outcome_pairs = build_outcome_pairs(result.attempts)
+    write_outcome_pairs(outcome_pairs, arguments.outcome_pairs_out, arguments.outcome_pairs_report)
+    print(f"wrote {arguments.outcome_pairs_out} ({len(outcome_pairs)} outcome pairs)")
 
 
 if __name__ == "__main__":
