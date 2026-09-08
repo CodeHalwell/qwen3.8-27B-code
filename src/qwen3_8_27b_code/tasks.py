@@ -9,6 +9,11 @@ attempt that deletes the failing test is detected rather than scored green.
 The evaluation families below are deliberately disjoint from the training
 families: different bug classes, different modules, never generated into the
 SFT corpus. ``tests/test_agent_tasks.py`` enforces that separation.
+
+Single-file families live here. The multi-file, longer-horizon families are
+in ``long_horizon.py`` and are merged into the held-out suite by
+``evaluation_family_builders``; that module imports this one, so the merge is
+a function rather than a module-level constant.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from typing import Iterator
 
 from .fixtures import FixtureTask
 from .harness import RepoHarness, default_test_command, filtered_environment
+from .trajectories import unified_patch
 
 MODULE_DIR = "src"
 TESTS_DIR = "tests"
@@ -61,10 +67,39 @@ class AgentTask:
     tests_path: str = ""
     reference_module: str | None = None
     baseline_should_fail: bool = True
+    # The fixed content of every file the gold fix touches. Single-file tasks
+    # leave this None and use module_path/reference_module; multi-file tasks
+    # set it, and ``gold_patch`` builds one multi-file unified diff from it.
+    reference_files: dict[str, str] | None = None
 
     @property
     def has_hidden_verification(self) -> bool:
         return bool(self.hidden_checks)
+
+    @property
+    def gold_files(self) -> dict[str, str]:
+        """Path -> fixed content for every file the reference fix changes."""
+        if self.reference_files is not None:
+            return {
+                path: content
+                for path, content in self.reference_files.items()
+                if self.files.get(path) != content
+            }
+        if self.reference_module is None:
+            return {}
+        return {self.module_path: self.reference_module}
+
+    @property
+    def test_paths(self) -> tuple[str, ...]:
+        return tuple(sorted(path for path in self.files if path.startswith(f"{TESTS_DIR}/")))
+
+
+def gold_patch(task: AgentTask) -> str:
+    """One git-apply-compatible diff that takes the task from broken to fixed."""
+    gold = task.gold_files
+    if not gold:
+        raise ValueError(f"{task.task_id} has no reference fix to patch to")
+    return "".join(unified_patch(path, task.files[path], content) for path, content in sorted(gold.items()))
 
 
 @dataclass
@@ -195,6 +230,29 @@ def hidden_script(module_path: str, symbol: str, assertions: str) -> str:
         f"exec((pathlib.Path.cwd() / {module_path!r}).read_text(), namespace)\n"
         f"{symbol} = namespace[{symbol!r}]\n"
         "def check():\n"
+        f"{body}\n"
+        "check()\n"
+        "print('ok')\n"
+    )
+
+
+def hidden_package_script(imports: list[str], assertions: str) -> str:
+    """Build a verifier that imports the repository as a package.
+
+    Multi-file tasks have modules that import each other, so the source-exec
+    trick of ``hidden_script`` does not apply. The task environment disables
+    bytecode caching, which is what made importing unsafe in the first place,
+    and the script puts the repository root on the path itself because a
+    script's own directory, not the working directory, is what Python adds.
+    """
+    statements = textwrap.dedent(assertions).strip().splitlines()
+    body = "\n".join(f"    {line}" if line.strip() else "" for line in statements)
+    return (
+        "import os\n"
+        "import sys\n"
+        "sys.path.insert(0, os.getcwd())\n"
+        + "".join(f"{line}\n" for line in imports)
+        + "def check():\n"
         f"{body}\n"
         "check()\n"
         "print('ok')\n"
@@ -494,11 +552,23 @@ EVALUATION_FAMILY_BUILDERS = {
 EVALUATION_VARIANTS_PER_FAMILY = 2
 
 
+def evaluation_family_builders() -> dict:
+    """Every held-out family: the single-file ones here plus the multi-file
+    ones in ``long_horizon``, which provide the medium-horizon band."""
+    from .long_horizon import EVALUATION_FAMILY_BUILDERS as long_horizon_builders
+
+    overlap = set(EVALUATION_FAMILY_BUILDERS) & set(long_horizon_builders)
+    if overlap:
+        raise RuntimeError(f"evaluation family names collide: {sorted(overlap)}")
+    return {**EVALUATION_FAMILY_BUILDERS, **long_horizon_builders}
+
+
 def evaluation_tasks(variants_per_family: int = EVALUATION_VARIANTS_PER_FAMILY) -> list[AgentTask]:
-    """The frozen held-out suite: six families, deterministic variants."""
+    """The frozen held-out suite: single-file and multi-file families, deterministic variants."""
+    builders = evaluation_family_builders()
     return [
-        EVALUATION_FAMILY_BUILDERS[family](variant)
-        for family in EVALUATION_FAMILY_BUILDERS
+        builders[family](variant)
+        for family in builders
         for variant in range(variants_per_family)
     ]
 

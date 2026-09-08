@@ -13,6 +13,7 @@ Start with:
 - [Documentation index](docs/README.md)
 - [Minimum path to the first baseline experiment](docs/minimum-path.md)
 - [Implementation roadmap](docs/roadmap.md)
+- [Thinking budget: shorter reasoning at equal quality](docs/thinking-budget.md)
 
 The immediate objective is not to build the full training platform. It is to
 run a small, reproducible upstream baseline through the intended native tool
@@ -42,6 +43,14 @@ uv run --group dev python scripts/collect_trajectories.py --policy gold --attemp
 The `gold` policy is a scripted stand-in that exercises the whole path on CPU.
 Supply a model-backed policy as `module:attribute`, or use notebook 07. The
 comparison exits non-zero when the gate fails.
+
+The gate checks quality first and then the thinking budget: a candidate may
+not spend more than 10% more reasoning tokens per turn than the baseline
+(`--max-reasoning-growth`), and its thinking-overrun rate may not rise.
+Collection keeps, of the attempts that verified, the ones that reasoned least,
+samples the multi-file training families as well as the single-file fixtures,
+and writes reasoning-length preference pairs beside the corpus. See
+[docs/thinking-budget.md](docs/thinking-budget.md).
 
 The execution-verified bootstrap training data in `data/` (native-schema SFT
 trajectories and preference pairs, with quality reports) regenerates with:

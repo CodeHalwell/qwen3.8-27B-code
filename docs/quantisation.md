@@ -130,6 +130,7 @@ Measure:
 - regression and recovery rates;
 - turns, tokens and time per successful task;
 - looping or repeated-call rate;
+- reasoning tokens per turn and thinking-overrun rate against BF16;
 - context-band degradation; and
 - throughput, latency and peak VRAM in the target runtime.
 

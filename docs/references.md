@@ -2,7 +2,8 @@
 
 Sources in this document are expected to change. Pin code and model revisions
 in experiments even when a documentation URL is unversioned. Last checked:
-**2026-08-17**.
+**2026-08-17**; the thinking-budget entries and the Unsloth pull request were
+checked on **2026-09-08**.
 
 ## Model and inference
 
@@ -34,6 +35,21 @@ in experiments even when a documentation URL is unversioned. Last checked:
   version declared by the pinned Unsloth Zoo package.
 - [NVIDIA NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) — resource-server and
   multi-environment patterns for executable RL.
+- [Unsloth PR #8810](https://github.com/unslothai/unsloth/pull/8810) — raises
+  the TRL cap to 1.10.0; open when last checked. The tracked route to running
+  notebook 05's trainer without bypassing the resolver.
+
+## Thinking budget
+
+- [Kimi k1.5: Scaling Reinforcement Learning with LLMs](https://arxiv.org/abs/2501.12599) —
+  the long2short methods: shortest rejection sampling, long-versus-short DPO
+  and the group-relative length reward adopted in [Thinking budget](thinking-budget.md).
+- [L1: Controlling How Long a Reasoning Model Thinks with Reinforcement Learning](https://arxiv.org/abs/2503.04697) —
+  length-controlled policy optimisation; the RL counterpart of Qwen3.8's
+  native `reasoning_effort` dial.
+- [DLER: Doing Length Penalty Right](https://arxiv.org/abs/2510.15110) —
+  NVIDIA's study of length penalties in RL; read before changing the weight or
+  shape of the brevity term.
 
 ## Agent and evaluation harnesses
 

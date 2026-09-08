@@ -20,9 +20,9 @@ gate (see the [specialisation policy](../docs/data-strategy.md#specialisation-po
 | [02 · Prepare SFT data](02_prepare_sft_data.ipynb) | Validate, render, measure, split and optionally publish native-schema trajectories | 100–300 replayable native trajectories; frozen repository-family split |
 | [03 · SFT LoRA](03_sft_lora.ipynb) | Train a language-only BF16 LoRA with assistant-only loss | Held-out coding and tool metrics beat the frozen baseline |
 | [04 · DPO preferences](04_dpo_preferences.ipynb) | Apply a small verifier-backed preference stage | DPO beats the accepted SFT adapter without coding, tool-protocol or preserved-thinking regressions |
-| [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment and reward tests; trainer integration is compatibility-gated | Reward fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
+| [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment, reward tests and the correctness-gated brevity term; trainer integration is compatibility-gated | Reward and brevity fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
 | [06 · QAT and export](06_qat_and_export.ipynb) | Create separate QAT/TorchAO and standard GGUF experiments; prepare Dynamic calibration data | Quantised artifacts pass the frozen long-horizon gate against one BF16 reference |
-| [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Score a checkpoint on the held-out suite, compare it to the frozen baseline, and collect verified trajectories by rejection sampling | A candidate beats the baseline on the gate before it is accepted |
+| [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Score a checkpoint on the held-out suite (single- and multi-file families), compare it to the frozen baseline including the thinking budget, and collect verified trajectories by rejection sampling with shortest-reasoning selection plus reasoning-length pairs | A candidate beats the baseline on the gate, thinking check included, before it is accepted |
 
 Notebook 07 is the only one that is not self-contained, and deliberately so.
 The episode loop, the collection filters and the scorecard live in
@@ -55,10 +55,14 @@ plumbing only; they are explicitly not training data for a capability run.
 
 Until a candidate is scored against the stock model on tasks it has never
 seen, training loss and a green notebook are the only signals, and neither
-says the model got better at the job. The held-out suite is six families in
-`qwen3_8_27b_code.tasks`, disjoint from the SFT fixtures in bug class, module
-and family name, each with a verifier that runs outside the workspace the model
-can read. Passing by deleting the failing test is detected rather than scored.
+says the model got better at the job. The held-out suite is eight families,
+six single-file ones in `qwen3_8_27b_code.tasks` and two multi-file ones in
+`qwen3_8_27b_code.long_horizon`, disjoint from the SFT fixtures in bug class,
+module and family name, each with a verifier that runs outside the workspace
+the model can read. Passing by deleting the failing test is detected rather
+than scored. The scorecard also reports reasoning tokens per turn, the share
+of generation spent thinking and the thinking-overrun rate, and the gate
+carries a thinking-budget check; see [Thinking budget](../docs/thinking-budget.md).
 
 Both paths run from the command line with a scripted policy, which is how the
 filters and the scorecard are tested without a GPU:
@@ -108,6 +112,17 @@ cannot be won by preferring tool calls over prose; the fourth
 (`verification_claim`) is asymmetric by nature and says so in its quality
 report.
 
+## Thinking budget
+
+The model-backed policy in notebook 07 counts the tokens each turn spends
+before `</think>`, so the scorecard measures thinking rather than guessing at
+it. Collection keeps, of the attempts that verified, the ones that reasoned
+least, and writes reasoning-length preference pairs (same task, same action,
+both verified, shorter think block preferred) for notebook 04. Notebook 05
+carries the correctness-gated brevity reward for RL with fixtures. The
+levers, the gate and the order to try them are in
+[docs/thinking-budget.md](../docs/thinking-budget.md).
+
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.
@@ -143,7 +158,13 @@ The agent contracts go further and run the real thing on CPU: every held-out
 task is materialised, its hidden verifiers execute, and the collector and gate
 are driven end to end by scripted policies — including the reward hacks
 (deleting the failing tests, declaring success without verifying, looping,
-malformed calls) each of which must be caught by a named filter:
+malformed calls) each of which must be caught by a named filter. The thinking
+budget has its own contracts: reasoning tokens are accumulated from the policy,
+a turn cut off inside its think block is recorded as an overrun, the gate
+fails a candidate that thinks twice as much at equal success, the collector
+keeps the verified attempt that thought least, the length pairs render through
+notebook 04's cell, the brevity reward never lifts an incorrect sample over a
+correct one, and every multi-file task is shown to need both of its fixes:
 
 ```bash
 uv run --group dev python scripts/build_notebooks.py

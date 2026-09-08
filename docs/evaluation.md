@@ -23,9 +23,12 @@ Report confidence intervals or per-task outcomes, not only a single aggregate.
 The scorecard, the paired comparison and the thresholds below are implemented
 in `qwen3_8_27b_code.evaluation` and driven by `scripts/evaluate_agent.py`;
 notebook 07 supplies a model-backed policy. The held-out suite is
-`qwen3_8_27b_code.tasks.evaluation_tasks()`: six families whose bug classes,
+`qwen3_8_27b_code.tasks.evaluation_tasks()`: eight families whose bug classes,
 modules and family names are disjoint from the SFT fixtures, each carrying a
-verifier executed outside the workspace the model can read.
+verifier executed outside the workspace the model can read. Six are
+single-file fixes; two, from `qwen3_8_27b_code.long_horizon`, plant a defect
+in each of two modules so that a fix to either alone leaves the suite red,
+which is what puts the medium horizon band on the scorecard.
 
 Three properties of that implementation matter for interpreting a result:
 
@@ -112,6 +115,11 @@ Evaluate by observed episode length rather than calling every repository task
 Also report prompt-plus-history token bands. A 30-call episode with tiny tool
 outputs differs materially from one carrying large compiler logs.
 
+The scorecard reports `horizon_bands` and `success_by_horizon` from the tool
+calls each episode actually made. Read the medium band before the aggregate
+whenever a change is meant to reduce thinking: brevity hurts the harder tasks
+first (see [Thinking budget](thinking-budget.md)).
+
 ## Core scorecard
 
 | Metric | Definition | Direction |
@@ -128,6 +136,9 @@ outputs differs materially from one carrying large compiler logs.
 | Tokens per success | Model tokens divided by successful episodes | Lower after correctness |
 | Time per success | Wall time divided by successful episodes | Lower after correctness |
 | Loop rate | Repeated equivalent actions without progress | Lower |
+| Reasoning tokens per turn | Tokens generated before `</think>`, per assistant turn | Lower after correctness |
+| Reasoning share | Reasoning tokens divided by generated tokens | Lower after correctness |
+| Thinking overrun rate | Episodes cut off inside a think block at the per-turn token cap | Lower |
 
 Do not optimise patch precision or efficiency ahead of correctness. Some tasks
 genuinely require broad changes.
@@ -188,6 +199,10 @@ candidate's results.
 - Static coding aggregate: no more than 2% relative regression.
 - Regression and unsupported-success-claim rates: no worse than upstream.
 - At least one improvement appears in both medium and long episode bands.
+- Thinking budget: reasoning tokens per turn no more than 10% above the
+  baseline where both runs counted them, and no rise in the thinking-overrun
+  rate (`thinking_budget` and `thinking_overrun_no_worse` in
+  `evaluation.gate()`; see [Thinking budget](thinking-budget.md)).
 
 ### Preference/RL gate
 

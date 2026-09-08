@@ -10,6 +10,11 @@ Filtering follows docs/data-strategy.md: reject rows whose tests were edited,
 whose episode never verified anything, that carry a malformed tool call, or
 that ended on a budget rather than an answer. Infrastructure failures are
 counted separately and never treated as model failures.
+
+Selection follows docs/thinking-budget.md: when several attempts at a task
+verify, the ones that reached the answer with the least reasoning are kept
+first (shortest rejection sampling). The attempts that did not become rows are
+retained, because the reasoning-length preference pairs are built from them.
 """
 
 from __future__ import annotations
@@ -25,8 +30,14 @@ from typing import Callable
 from .episodes import Episode, EpisodeBudget, Policy, run_episode
 from .schema import TOOL_SCHEMA_JSON, TOOL_SCHEMA_VERSION, TOOLS
 from .tasks import AgentTask, Verdict, materialise
+from .thinking import reasoning_length
 
-COLLECTOR_VERSION = "rejection-sampling-v1"
+COLLECTOR_VERSION = "rejection-sampling-v2"
+
+# Which verified attempts become rows when a task has more than the cap.
+# ``shortest_reasoning`` keeps the ones that thought least; ``first`` keeps
+# them in seed order, which is the pre-thinking-budget behaviour.
+SELECTIONS = ("shortest_reasoning", "first")
 
 PolicyFactory = Callable[[AgentTask, int], Policy]
 
@@ -45,6 +56,16 @@ class Attempt:
     @property
     def accepted(self) -> bool:
         return self.rejection is None
+
+    @property
+    def verified_success(self) -> bool:
+        """Passed every filter, whether or not it was kept as a row.
+
+        ``rejection`` is overwritten when an accepted attempt is dropped as a
+        duplicate or by the per-task cap; this re-derives the underlying fact,
+        which the length-pair builder needs.
+        """
+        return rejection_reason(self.episode, self.verdict) is None
 
     def summary(self) -> dict:
         return {
@@ -99,8 +120,10 @@ def build_row(
     attempt: Attempt,
     reasoning_effort: str,
     source: str = COLLECTOR_VERSION,
+    selection: str = "shortest_reasoning",
 ) -> dict:
     """Render one accepted attempt in the native SFT schema."""
+    length, unit = reasoning_length(attempt.episode)
     return {
         "id": f"sft/{task.family}-{task.variant:03d}-s{attempt.seed}",
         "source": source,
@@ -122,6 +145,9 @@ def build_row(
             "task_id": task.task_id,
             "seed": attempt.seed,
             "collector_version": COLLECTOR_VERSION,
+            "selection": selection,
+            "reasoning_length": length,
+            "reasoning_unit": unit,
             "usage": attempt.episode.usage(),
         },
     }
@@ -132,6 +158,51 @@ class CollectionResult:
     rows: list[dict] = field(default_factory=list)
     attempts: list[Attempt] = field(default_factory=list)
     duplicates_dropped: int = 0
+    selection: str = "shortest_reasoning"
+    reasoning_effort: str = "medium"
+
+    def verified_attempts(self) -> list[Attempt]:
+        """Every attempt that passed the filters, kept as a row or not."""
+        return [attempt for attempt in self.attempts if attempt.verified_success]
+
+    def thinking_report(self) -> dict:
+        """How much the policy thought, split by whether it worked.
+
+        Read this next to the acceptance rate: if failed attempts think far
+        more per turn than verified ones, the policy is spending tokens on
+        the tasks it cannot do, and a tighter budget costs little. If the
+        reverse holds, brevity is being bought with correctness.
+        """
+        scored = [attempt for attempt in self.attempts if not attempt.episode.is_infrastructure_failure]
+        measured = bool(scored) and all(attempt.episode.reasoning_tokens_reported for attempt in scored)
+        unit = "tokens" if measured else "chars"
+
+        def per_turn(group: list[Attempt]) -> float | None:
+            turns = sum(attempt.episode.turns for attempt in group)
+            if not turns:
+                return None
+            total = sum(
+                attempt.episode.reasoning_tokens if measured else attempt.episode.reasoning_chars
+                for attempt in group
+            )
+            return round(total / turns, 2)
+
+        verified = [attempt for attempt in scored if attempt.verified_success]
+        failed = [attempt for attempt in scored if not attempt.verified_success]
+        return {
+            "unit": unit,
+            "reasoning_tokens_reported": measured,
+            "selection": self.selection,
+            "reasoning_effort": self.reasoning_effort,
+            "per_turn": {
+                "verified": per_turn(verified),
+                "not_verified": per_turn(failed),
+                "kept_rows": per_turn(
+                    [attempt for attempt in verified if attempt.rejection is None]
+                ),
+            },
+            "thinking_overruns": sum(attempt.episode.thinking_overrun for attempt in scored),
+        }
 
     def report(self) -> dict:
         scored = [attempt for attempt in self.attempts if not attempt.episode.is_infrastructure_failure]
@@ -172,6 +243,7 @@ class CollectionResult:
                 "mean": round(statistics.mean(completions), 1) if completions else 0.0,
                 "total": sum(completions),
             },
+            "thinking": self.thinking_report(),
         }
 
 
@@ -183,15 +255,30 @@ def collect(
     budget: EpisodeBudget | None = None,
     reasoning_effort: str = "medium",
     max_rows_per_task: int | None = None,
+    selection: str = "shortest_reasoning",
 ) -> CollectionResult:
-    """Attempt every task repeatedly and keep only what verified."""
+    """Attempt every task repeatedly and keep only what verified.
+
+    With ``selection="shortest_reasoning"`` the rows kept under
+    ``max_rows_per_task`` are the verified attempts that reasoned least, so
+    the SFT corpus teaches the shortest path the policy has itself shown to
+    work. Duplicate action sequences are still dropped first: two attempts
+    that took the same actions are one demonstration, not two.
+    """
     if attempts_per_task > len(seeds):
         raise ValueError(f"{attempts_per_task} attempts requested but only {len(seeds)} seeds given")
-    result = CollectionResult()
+    if selection not in SELECTIONS:
+        raise ValueError(f"selection must be one of {SELECTIONS}, not {selection!r}")
+    result = CollectionResult(selection=selection, reasoning_effort=reasoning_effort)
     seen_actions: set[str] = set()
 
+    def preference_order(attempt: Attempt) -> tuple:
+        if selection == "shortest_reasoning":
+            return (reasoning_length(attempt.episode)[0], attempt.seed)
+        return (attempt.seed,)
+
     for task in tasks:
-        kept_for_task = 0
+        accepted: list[Attempt] = []
         for seed in seeds[:attempts_per_task]:
             with materialise(task) as workspace:
                 episode = run_episode(
@@ -212,21 +299,27 @@ def collect(
                 rejection=rejection_reason(episode, verdict),
             )
             result.attempts.append(attempt)
-            if not attempt.accepted:
-                continue
+            if attempt.accepted:
+                accepted.append(attempt)
 
-            fingerprint = action_fingerprint(episode)
+        # Two attempts that took the same actions are one demonstration. Which
+        # one survives is the selection's decision, so order first and dedupe
+        # second: under shortest_reasoning the copy that thought least wins.
+        candidates: list[Attempt] = []
+        for attempt in sorted(accepted, key=preference_order):
+            fingerprint = action_fingerprint(attempt.episode)
             if fingerprint in seen_actions:
                 result.duplicates_dropped += 1
                 attempt.rejection = "duplicate_actions"
                 continue
-            if max_rows_per_task is not None and kept_for_task >= max_rows_per_task:
+            seen_actions.add(fingerprint)
+            candidates.append(attempt)
+
+        for position, attempt in enumerate(candidates):
+            if max_rows_per_task is not None and position >= max_rows_per_task:
                 attempt.rejection = "task_row_cap"
                 continue
-
-            seen_actions.add(fingerprint)
-            kept_for_task += 1
-            result.rows.append(build_row(task, attempt, reasoning_effort))
+            result.rows.append(build_row(task, attempt, reasoning_effort, selection=selection))
 
     return result
 

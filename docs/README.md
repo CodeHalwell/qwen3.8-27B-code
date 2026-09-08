@@ -45,6 +45,7 @@ is an inference baseline and a reference for supported quant types.
 | [Model and hardware](model-and-hardware.md) | Model identity, architecture, VRAM feasibility, context constraints and the GPU assumption |
 | [Agentic harness](agentic-harness.md) | Tool protocol, sandbox, episode lifecycle and trajectory format |
 | [Data strategy](data-strategy.md) | SFT, preference and RL datasets; validation, mixing and contamination controls |
+| [Thinking budget](thinking-budget.md) | Measuring and reducing reasoning tokens per turn at equal held-out success: the effort ladder, shortest-correct selection, reasoning-length pairs, the correctness-gated brevity reward and the gate check |
 | [Training plan](training-plan.md) | Baseline, SFT, preference optimisation and agentic RL runbook |
 | [Quantisation](quantisation.md) | QAT, NVFP4 and Dynamic 4/3/2/1-bit experiment branches |
 | [Evaluation](evaluation.md) | Benchmarks, agent metrics, quantisation comparisons and stage gates |

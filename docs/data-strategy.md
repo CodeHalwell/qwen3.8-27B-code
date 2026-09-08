@@ -209,6 +209,21 @@ you the policy does not verify, and training on the survivors will not fix it.
 The report also bands each task by measured success, which is the difficulty
 ladder below, computed rather than assumed.
 
+Two further things the collector does, both from
+[Thinking budget](thinking-budget.md). With `selection="shortest_reasoning"`
+(the default) the rows kept under the per-task cap are the verified attempts
+that reasoned least, and when two attempts took identical actions the copy
+that thought less survives deduplication, so SFT learns the shortest path the
+model has itself shown to work. And the verified attempts that were not kept
+are not wasted: `scripts/collect_trajectories.py` turns them into
+reasoning-length preference pairs next to the corpus.
+
+The training suite the collector samples from is the single-file fixtures
+plus the multi-file families in `qwen3_8_27b_code.long_horizon`, whose
+trajectories land in the medium horizon band. Those families are graded by
+their visible tests, like the fixtures, and share no family with the
+held-out suite.
+
 ## Demonstration filtering
 
 Reject or quarantine examples when:
@@ -237,6 +252,7 @@ The collector rejects an attempt for exactly these reasons, and records which:
 | `terminated_*` | Ended on a budget, a truncation or a timeout, not an answer |
 | `duplicate_actions` | Same action sequence as a row already kept |
 | `infrastructure_failure` | The harness or model server failed; never a model failure |
+| `task_row_cap` | Verified, but the per-task cap was filled by attempts that reasoned less |
 
 ## Preference pairs
 
@@ -261,6 +277,13 @@ Prioritise execution-derived pairs such as:
 - failure followed by diagnosis/recovery versus repeated failure;
 - verification performed versus unsupported declaration of success; and
 - success within budget versus timeout.
+
+One further contrast is deliberately *not* about correctness: the
+reasoning-length pairs from `qwen3_8_27b_code.thinking`, where both
+continuations succeeded and took the same action and the chosen one thought
+less first. They teach brevity only, so they stay a minority of the mixture
+next to the execution-derived pairs; [Thinking budget](thinking-budget.md)
+records their construction and limits.
 
 Avoid manufacturing rejected responses solely by adding rude wording or bad
 formatting. That teaches style preferences, not software engineering.

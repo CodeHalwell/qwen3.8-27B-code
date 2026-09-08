@@ -96,6 +96,7 @@ Exit criteria:
 - The candidate passes the SFT gate in [Evaluation](evaluation.md).
 - Vision parameters remained frozen.
 - Tool-call validity and held-out coding did not regress.
+- Reasoning tokens per turn stayed within the thinking-budget ceiling.
 
 ## Milestone 4: preferences
 
@@ -103,6 +104,7 @@ Deliverables:
 
 - Candidate generation from the accepted SFT policy.
 - Execution-derived chosen/rejected pairs.
+- Reasoning-length pairs from the collection, as a minority of the mixture.
 - DPO configuration sweep with memory profiling.
 - Accepted or explicitly rejected preference checkpoint.
 
@@ -116,7 +118,7 @@ Exit criteria:
 
 Deliverables:
 
-- Unit-tested reward vector.
+- Unit-tested reward vector, including the correctness-gated brevity term.
 - Resolution of the Unsloth `trl<=0.24.0` versus TRL
   `environment_factory>=0.29.0` compatibility boundary.
 - Short-horizon GRPO/GSPO smoke run.
@@ -183,6 +185,8 @@ src/qwen3_8_27b_code/
   collection.py                  # attempt filtering and the corpus report
   evaluation.py                  # scorecard, paired comparison, gate
   policies.py                    # scripted policies incl. reward-hack fixtures
+  long_horizon.py                # multi-file training and held-out families (medium band)
+  thinking.py                    # thinking budget: selection, length pairs, brevity reward
 tests/                           # generator, notebook and agent contracts
 ```
 
@@ -281,6 +285,7 @@ generation begin.
 | Benchmark contamination | Repository-level splits, near-duplicate checks and private evaluation |
 | Single-GPU RL is too slow or memory-heavy | DPO first; alternating rollouts; shorter curriculum; optional later rollout GPU |
 | Reward hacking | Component unit tests, hidden verification and trace audits |
+| Brevity training hurts the harder tasks first | Thinking gate read with success by horizon band; multi-file families in the held-out suite |
 | Long context hides truncation errors | Length reports, bucketing and template-aware compaction tests |
 | Quantisation breaks tools before prose | Tool-schema and long-horizon quant gates, BF16 paired traces |
 | One-bit work consumes the project | Isolate behind a 2-bit success gate and explicit stop criteria |

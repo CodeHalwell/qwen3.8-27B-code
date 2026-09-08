@@ -2200,7 +2200,10 @@ def build_05_grpo():
                 TRL's newer `environment_factory` API: that TRL release conflicts
                 with the current Unsloth dependency bounds. Trainer construction
                 remains gated until a compatible Unsloth/TRL pair or a separate
-                NeMo Gym/Harbor rollout backend is validated.
+                NeMo Gym/Harbor rollout backend is validated. Upstream Unsloth
+                PR #8810 raises the TRL cap to 1.10.0; once it is released, pin
+                that Unsloth revision in the install cell and re-run this
+                notebook's compatibility probe before enabling training.
                 """
             ),
             markdown("## Install and authenticate"),
@@ -2446,6 +2449,61 @@ def build_05_grpo():
                 assert deletion.run_tests("unit").startswith("Test integrity failure")
                 assert deletion.get_reward() == 0.0
                 print("Reward and reward-hacking fixtures passed.")
+                """
+            ),
+            markdown(
+                """
+                ## Brevity term: correctness first, then fewer reasoning tokens
+
+                docs/thinking-budget.md wants the policy to reach the same
+                verified outcome with less thinking. In RL that is a
+                group-relative length reward (the long2short term of Kimi
+                k1.5), gated on correctness: within one GRPO group the shortest
+                correct sample earns a small bonus, the longest correct sample
+                a small penalty, and an incorrect sample can never gain, so
+                brevity never rewards giving up. The weight stays well below
+                the gap between a hidden pass and a hidden fail, which keeps
+                correctness in charge of the ranking.
+
+                This is the importable twin of `qwen3_8_27b_code.thinking.length_rewards`;
+                the test suite pins the two together. Reasoning length is the
+                number of completion tokens before `</think>`, which the
+                trainer has for every sample in a group. Wire it as an extra
+                reward per group once the `environment_factory` path is open;
+                until then the fixtures below are the contract.
+                """
+            ),
+            code(
+                r"""
+                def length_rewards(lengths, succeeded, weight=0.1):
+                    # Group-relative brevity reward, gated on correctness; twin of
+                    # qwen3_8_27b_code.thinking.length_rewards.
+                    if len(lengths) != len(succeeded):
+                        raise ValueError("lengths and succeeded must align")
+                    if weight < 0:
+                        raise ValueError("weight must be non-negative")
+                    if not lengths:
+                        return []
+                    shortest, longest = min(lengths), max(lengths)
+                    rewards = []
+                    for length, ok in zip(lengths, succeeded):
+                        scaled = 0.0 if longest == shortest else 0.5 - (length - shortest) / (longest - shortest)
+                        reward = weight * scaled
+                        rewards.append(round(reward if ok else min(0.0, reward), 6))
+                    return rewards
+
+                brevity = length_rewards([100, 300, 200, 50], [True, True, False, False])
+                # Correct samples: shortest up, longest down.
+                assert brevity[0] > 0 > brevity[1]
+                # Incorrect samples never gain, however short.
+                assert brevity[2] <= 0 and brevity[3] == 0.0
+                assert length_rewards([80, 80], [True, True]) == [0.0, 0.0]
+                # With the environment's 0.8 hidden-pass weight, correctness
+                # still decides the order across the pass/fail boundary.
+                correctness = [0.8, 0.8, 0.2, 0.2]
+                totals = [score + bonus for score, bonus in zip(correctness, brevity)]
+                assert min(totals[:2]) > max(totals[2:])
+                print("Brevity reward fixtures passed: correctness dominates, shorter correct samples rank first.")
                 """
             ),
             markdown("## Load the accepted adapter and configure multi-turn GRPO"),
@@ -2869,7 +2927,9 @@ def build_07_collect_and_evaluate():
                     write_report,
                 )
                 from qwen3_8_27b_code.fixtures import iter_tasks
+                from qwen3_8_27b_code.long_horizon import training_tasks
                 from qwen3_8_27b_code.tasks import evaluation_tasks, task_from_fixture
+                from qwen3_8_27b_code.thinking import build_reasoning_length_pairs, write_length_pairs
 
                 repo_revision = subprocess.run(
                     ["git", "-C", str(REPO_DIR), "rev-parse", "HEAD"],
@@ -2889,6 +2949,11 @@ def build_07_collect_and_evaluate():
                 MAX_SEQUENCE_LENGTH = 16_384
                 MAX_NEW_TOKENS_PER_TURN = 2_048
                 REASONING_EFFORT = "medium"
+                # docs/thinking-budget.md: a candidate may spend at most this
+                # fraction more reasoning tokens per turn than the baseline.
+                # Quality is gated first and separately; this only stops a
+                # "better" checkpoint that got there by thinking longer.
+                MAX_REASONING_GROWTH = 0.10
 
                 # docs/evaluation.md funnel: the sentinel tier is the cheap one
                 # every candidate runs. Widen only for a candidate or release
@@ -2912,10 +2977,13 @@ def build_07_collect_and_evaluate():
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
 
+                # Six single-file families plus the two multi-file families from
+                # long_horizon, which put the medium band on the scorecard.
                 evaluation_suite = evaluation_tasks(variants_per_family=EVAL_VARIANTS_PER_FAMILY)
                 print(json.dumps({
                     "held_out_tasks": len(evaluation_suite),
                     "families": sorted({task.family for task in evaluation_suite}),
+                    "multi_file_tasks": sum(len(task.gold_files) > 1 for task in evaluation_suite),
                     "attempts_each": EVAL_ATTEMPTS,
                 }, indent=2))
                 """
@@ -2938,6 +3006,12 @@ def build_07_collect_and_evaluate():
                     }
                     if not eos_token_ids:
                         raise RuntimeError("No end-of-turn token id is available; truncation cannot be detected.")
+                    # The thinking budget is measured in tokens generated before
+                    # the think block closes. Count them from the ids, not from
+                    # decoded text, so the number is exact.
+                    think_end_id = tokenizer.convert_tokens_to_ids("</think>")
+                    if think_end_id is None or think_end_id == tokenizer.unk_token_id:
+                        raise RuntimeError("The tokenizer has no </think> token; reasoning tokens cannot be counted.")
 
                     def policy_factory(task, seed):
                         torch.manual_seed(seed)
@@ -2970,11 +3044,24 @@ def build_07_collect_and_evaluate():
                             new_ids = outputs[0, inputs["input_ids"].shape[1]:]
                             completion_tokens = int(new_ids.numel())
                             stopped_on_eos = completion_tokens > 0 and int(new_ids[-1]) in eos_token_ids
+                            text = tokenizer.decode(new_ids, skip_special_tokens=False)
+                            closes = (new_ids == think_end_id).nonzero()
+                            if len(closes):
+                                # Everything up to and including </think> was reasoning.
+                                reasoning_tokens = int(closes[0].item()) + 1
+                            elif rendered.rstrip().endswith("<think>") or "<think>" in text:
+                                # The block never closed: the whole turn was
+                                # reasoning, which is the overrun the budget
+                                # has to see rather than hide.
+                                reasoning_tokens = completion_tokens
+                            else:
+                                reasoning_tokens = 0
                             return TurnResult(
-                                text=tokenizer.decode(new_ids, skip_special_tokens=False),
+                                text=text,
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens,
                                 fault=None if stopped_on_eos else "output_truncated",
+                                reasoning_tokens=reasoning_tokens,
                             )
 
                         return policy
@@ -3060,7 +3147,7 @@ def build_07_collect_and_evaluate():
                     comparison = compare(
                         read_report(baseline_report_path), read_report(candidate_report_path)
                     )
-                    checks = gate(comparison)
+                    checks = gate(comparison, max_reasoning_growth=MAX_REASONING_GROWTH)
                     comparison["gate"] = [
                         {"name": check.name, "passed": check.passed, "detail": check.detail}
                         for check in checks
@@ -3069,6 +3156,9 @@ def build_07_collect_and_evaluate():
                     (REPORT_DIR / "comparison.json").write_text(json.dumps(comparison, indent=2))
 
                     print(json.dumps(comparison["deltas"], indent=2))
+                    # Reasoning tokens per turn, share of generation spent thinking,
+                    # and success by horizon band, baseline against candidate.
+                    print(json.dumps(comparison["thinking"], indent=2))
                     for check in checks:
                         print(f"  [{'PASS' if check.passed else 'FAIL'}] {check.name}: {check.detail}")
                     task_level = comparison["task_level"]
@@ -3104,10 +3194,12 @@ def build_07_collect_and_evaluate():
                 if RUN_COLLECTION:
                     if "model" not in globals():
                         raise RuntimeError("Load a model in one of the cells above before collecting.")
+                    # Single-file fixtures plus the multi-file training families,
+                    # so the corpus carries the medium-horizon shape as well.
                     collection_tasks = [
                         task_from_fixture(fixture)
                         for fixture in iter_tasks(COLLECTION_VARIANTS_PER_FAMILY)
-                    ]
+                    ] + training_tasks(COLLECTION_VARIANTS_PER_FAMILY)
                     result = collect(
                         collection_tasks,
                         build_policy_factory(model, tokenizer),
@@ -3116,11 +3208,28 @@ def build_07_collect_and_evaluate():
                         budget=EPISODE_BUDGET,
                         reasoning_effort=REASONING_EFFORT,
                         max_rows_per_task=2,
+                        # Of the attempts that verified, keep the ones that
+                        # thought least: the model's own shortest working path.
+                        selection="shortest_reasoning",
                     )
                     corpus_path = REPORT_DIR / "collected_trajectories.jsonl"
                     report = write_corpus(result, corpus_path, REPORT_DIR / "collection_report.json")
                     print(json.dumps(report, indent=2))
                     print(f"wrote {corpus_path}; feed it to notebook 02 as SOURCE_LOCAL_JSONL.")
+
+                    # Verified attempts that thought more than another verified
+                    # attempt at the same action become brevity preferences.
+                    length_pairs = build_reasoning_length_pairs(result.attempts)
+                    pairs_report = write_length_pairs(
+                        length_pairs,
+                        REPORT_DIR / "length_pairs.jsonl",
+                        REPORT_DIR / "length_pairs_report.json",
+                    )
+                    print(json.dumps(pairs_report, indent=2))
+                    print(
+                        f"wrote {len(length_pairs)} reasoning-length pairs; feed length_pairs.jsonl to "
+                        "notebook 04 as PREFERENCE_LOCAL_JSONL next to the execution-derived pairs."
+                    )
 
                     if PUSH_ARTIFACTS:
                         from huggingface_hub import HfApi
@@ -3148,9 +3257,17 @@ def build_07_collect_and_evaluate():
                 the trivial band are protocol smoke tests, the learnable band is
                 the useful curriculum, and frontier tasks are for later.
 
+                The `thinking` section of the report splits reasoning per turn
+                by outcome. If the attempts that failed thought far more than
+                the ones that verified, the model is spending tokens on tasks
+                it cannot do and a tighter budget costs little; if the reverse,
+                brevity is being bought with correctness and the thinking gate
+                in the comparison above is the thing to watch.
+
                 Feed the collected JSONL to notebook 02, which remains the
                 publisher that validates, splits and pushes the dataset that
-                notebooks 03 and 06 consume.
+                notebooks 03 and 06 consume. The reasoning-length pairs go to
+                notebook 04 (see docs/thinking-budget.md).
                 """
             ),
         ],

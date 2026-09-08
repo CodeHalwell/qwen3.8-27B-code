@@ -25,13 +25,20 @@ from qwen3_8_27b_code.episodes import (
     scripted_policy,
     tool_call_text,
 )
-from qwen3_8_27b_code.tasks import evaluation_tasks, materialise, task_from_fixture
+from qwen3_8_27b_code.tasks import (
+    evaluation_family_builders,
+    evaluation_tasks,
+    gold_patch,
+    materialise,
+    task_from_fixture,
+)
 from qwen3_8_27b_code.trajectories import unified_patch
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR_PATH = ROOT / "scripts" / "build_notebooks.py"
 
-# One variant per family keeps these tests to six real repositories.
+# One variant per family keeps these tests to eight real repositories: six
+# single-file families and the two multi-file ones from long_horizon.
 SMOKE_TASKS = evaluation_tasks(variants_per_family=1)
 
 
@@ -49,10 +56,14 @@ def load_generator():
 
 def test_evaluation_families_are_disjoint_from_training_families():
     """A gate measured on families the model trained on measures memorisation."""
-    training = set(fixtures.FAMILY_BUILDERS)
-    held_out = set(tasks.EVALUATION_FAMILY_BUILDERS)
+    from qwen3_8_27b_code import long_horizon
+
+    training = set(fixtures.FAMILY_BUILDERS) | set(long_horizon.TRAINING_FAMILY_BUILDERS)
+    held_out = set(evaluation_family_builders())
     assert training & held_out == set()
-    assert len(held_out) >= 6
+    assert set(tasks.EVALUATION_FAMILY_BUILDERS) < held_out
+    assert set(long_horizon.EVALUATION_FAMILY_BUILDERS) < held_out
+    assert len(held_out) >= 8
 
 
 def test_every_evaluation_task_starts_broken_and_the_gold_fix_resolves_it():
@@ -66,10 +77,7 @@ def test_every_evaluation_task_starts_broken_and_the_gold_fix_resolves_it():
             assert before.hidden["no_regression"] is True, task.task_id
             assert not before.succeeded, task.task_id
 
-            patch = unified_patch(
-                task.module_path, task.files[task.module_path], task.reference_module
-            )
-            assert workspace.harness.execute("apply_patch", {"patch": patch}) == "patch applied"
+            assert workspace.harness.execute("apply_patch", {"patch": gold_patch(task)}) == "patch applied"
             after = workspace.verify()
             assert after.succeeded, (task.task_id, after.as_dict())
             assert not after.regression, task.task_id
@@ -92,7 +100,7 @@ def test_visible_tests_never_encode_the_hidden_contract():
     """If the visible suite covered everything, hidden verification would be
     decorative and passing by overfitting to it would be indistinguishable."""
     for task in evaluation_tasks():
-        visible = task.files[task.tests_path]
+        visible = "\n".join(task.files[path] for path in task.test_paths)
         contract = next(check for check in task.hidden_checks if check.name == "contract")
         assertions = [
             line.strip()
@@ -204,6 +212,7 @@ def test_timeout_is_reported_without_running_a_turn():
 def test_tool_call_text_round_trips_through_the_deployment_parser():
     task = SMOKE_TASKS[0]
     patch = unified_patch(task.module_path, task.files[task.module_path], task.reference_module)
+    assert patch == gold_patch(task)
     with materialise(task) as workspace:
         episode = run_episode(
             workspace.harness,
