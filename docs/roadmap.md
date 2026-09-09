@@ -71,6 +71,8 @@ Deliverables:
 - Source registry and licence metadata.
 - Normalisation to native Qwen messages.
 - Execution replay and rejection pipeline.
+- Teacher distillation route: a larger open model through the same harness
+  (`scripts/collect_from_teacher.py`, notebook 08).
 - Repository-level split and decontamination checks.
 - Token-length and quality report.
 - Versioned SFT, preference, RL and evaluation datasets.
@@ -96,6 +98,7 @@ Exit criteria:
 - The candidate passes the SFT gate in [Evaluation](evaluation.md).
 - Vision parameters remained frozen.
 - Tool-call validity and held-out coding did not regress.
+- Reasoning tokens per turn stayed within the thinking-budget ceiling.
 
 ## Milestone 4: preferences
 
@@ -103,6 +106,7 @@ Deliverables:
 
 - Candidate generation from the accepted SFT policy.
 - Execution-derived chosen/rejected pairs.
+- Reasoning-length pairs from the collection, as a minority of the mixture.
 - DPO configuration sweep with memory profiling.
 - Accepted or explicitly rejected preference checkpoint.
 
@@ -116,7 +120,7 @@ Exit criteria:
 
 Deliverables:
 
-- Unit-tested reward vector.
+- Unit-tested reward vector, including the correctness-gated brevity term.
 - Resolution of the Unsloth `trl<=0.24.0` versus TRL
   `environment_factory>=0.29.0` compatibility boundary.
 - Short-horizon GRPO/GSPO smoke run.
@@ -171,11 +175,12 @@ The current executable slice is intentionally smaller than the end state:
 
 ```text
 docs/                            # decisions, gates and operating guidance
-notebooks/                       # eight generated Colab notebooks
+notebooks/                       # nine generated Colab notebooks
 references/                      # read-only upstream examples
 scripts/build_notebooks.py       # notebook source of truth and validation
 scripts/generate_sft_corpus.py   # scripted bootstrap corpus
 scripts/collect_trajectories.py  # rejection sampling from a real policy
+scripts/collect_from_teacher.py  # the same, with a larger open model as the policy
 scripts/evaluate_agent.py        # held-out scorecard, comparison and gate
 src/qwen3_8_27b_code/
   episodes.py                    # the one episode loop, model call injected
@@ -183,6 +188,10 @@ src/qwen3_8_27b_code/
   collection.py                  # attempt filtering and the corpus report
   evaluation.py                  # scorecard, paired comparison, gate
   policies.py                    # scripted policies incl. reward-hack fixtures
+  long_horizon.py                # multi-file training and held-out families (medium band)
+  thinking.py                    # thinking budget: selection, length pairs, brevity reward
+  teachers.py                    # OpenAI-compatible teacher policy for distillation
+  distillation.py                # verified-versus-failed outcome pairs across policies
 tests/                           # generator, notebook and agent contracts
 ```
 
@@ -281,6 +290,7 @@ generation begin.
 | Benchmark contamination | Repository-level splits, near-duplicate checks and private evaluation |
 | Single-GPU RL is too slow or memory-heavy | DPO first; alternating rollouts; shorter curriculum; optional later rollout GPU |
 | Reward hacking | Component unit tests, hidden verification and trace audits |
+| Brevity training hurts the harder tasks first | Thinking gate read with success by horizon band; multi-file families in the held-out suite |
 | Long context hides truncation errors | Length reports, bucketing and template-aware compaction tests |
 | Quantisation breaks tools before prose | Tool-schema and long-horizon quant gates, BF16 paired traces |
 | One-bit work consumes the project | Isolate behind a 2-bit success gate and explicit stop criteria |

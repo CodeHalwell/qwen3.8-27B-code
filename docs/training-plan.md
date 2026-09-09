@@ -53,7 +53,8 @@ harness. Capture:
 - recovery after injected tool failures;
 - tests passed and regressed;
 - tokens, turns and wall time; and
-- behaviour at `low`, `medium` and `xhigh` reasoning effort.
+- success and reasoning tokens per turn at `low`, `medium` and `xhigh`
+  reasoning effort, the effort ladder of [Thinking budget](thinking-budget.md).
 
 Freeze this result and the exact harness version. It is the comparison point
 for every later claim.
@@ -131,6 +132,12 @@ Begin at 4K sequences with a small beta sweep rather than assuming an optimal
 KL strength. The winning model must improve execution outcomes without
 collapsing exploration, reasoning depth or general coding ability.
 
+The mixture may include the reasoning-length pairs the collector writes
+(same task, same action, both verified, the shorter think block preferred)
+as a minority next to the execution-derived pairs. The gate then reads the
+thinking check and the medium horizon band together: shorter thinking that
+costs the multi-file tasks is a regression, not a win.
+
 ## Stage 4: agentic GRPO/GSPO
 
 Use online RL only for tasks with executable rewards. Begin with 2–4 samples
@@ -149,7 +156,9 @@ proven separately:
 3. a custom, unit-tested rollout adapter whose policy/version skew is recorded.
 
 Do not bypass the resolver with `--no-deps` and call the resulting run
-reproducible.
+reproducible. Upstream Unsloth PR #8810 raises the TRL cap to 1.10.0 and was
+still open when last checked; once it ships, pin that revision in the install
+cell and re-run notebook 05's compatibility probe before enabling training.
 
 The reward is a named vector before it is a scalar:
 
@@ -161,11 +170,15 @@ The reward is a named vector before it is a scalar:
 | Regression | Previously passing tests fail | Strong negative |
 | Tool protocol | Valid name and JSON schema | Small positive / invalid negative |
 | Scope | Unrelated files or excessive churn | Negative |
-| Efficiency | Success with fewer redundant calls/tokens | Small positive |
+| Efficiency | Fewer reasoning tokens and redundant calls, paid only to correct samples (`thinking.length_rewards`) | Small positive |
 | Safety | Sandbox escape or prohibited action | Terminal negative |
 
 Correctness must dominate efficiency. Otherwise the policy may learn to stop
-early, avoid tests or make tiny but incomplete patches.
+early, avoid tests or make tiny but incomplete patches. The brevity term is
+group-relative and clipped to zero for incorrect samples, and its weight
+(0.1) sits well below the 0.6 gap between a hidden pass and a hidden fail,
+so it reorders correct samples among themselves and nothing else; notebook
+05 pins those properties with fixtures.
 
 Example scalarisation for early experiments:
 
@@ -234,7 +247,8 @@ Trackio runs should include:
 - sentinel repository success;
 - mean reward by component;
 - reward variance and fraction of zero-standard-deviation groups;
-- completion length, tool calls and timeout rate; and
+- completion length, reasoning tokens per turn, thinking-overrun rate, tool
+  calls and timeout rate; and
 - checkpoint artifact hashes.
 
 Checkpoint locally and to durable storage. Verify a checkpoint can be loaded
@@ -249,6 +263,8 @@ Stop or roll back when any of the following persists across evaluation noise:
 - general code benchmark performance regresses beyond the allowed delta;
 - reward rises while hidden-test success does not;
 - output length or patch size grows without more successful tasks;
+- reasoning tokens per turn rise past the thinking-budget ceiling, or the
+  medium horizon band drops while the short band holds;
 - the model learns repeated calls, test suppression or another reward exploit;
 - training becomes numerically unstable; or
 - dataset/reward contamination is discovered.

@@ -99,6 +99,10 @@ Preserved thinking can improve continuity but consumes context. Measure both
 enabled and disabled modes in agent evaluation rather than baking one choice
 into every task.
 
+Reasoning tokens are the deployment cost this project measures and gates.
+[Thinking budget](thinking-budget.md) describes the effort ladder to run
+first and the levers that reduce them without losing task success.
+
 ## Hardware assumption
 
 The target is a Google Colab G4 runtime using the

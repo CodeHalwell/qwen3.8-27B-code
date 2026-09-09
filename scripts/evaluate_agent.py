@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from qwen3_8_27b_code.episodes import EpisodeBudget  # noqa: E402
 from qwen3_8_27b_code.evaluation import (  # noqa: E402
+    DEFAULT_MAX_REASONING_GROWTH,
     compare,
     evaluate,
     gate,
@@ -57,7 +58,11 @@ def run(arguments: argparse.Namespace) -> int:
 
 def run_compare(arguments: argparse.Namespace) -> int:
     comparison = compare(read_report(arguments.baseline), read_report(arguments.candidate))
-    checks = gate(comparison, minimum_success_delta=arguments.minimum_success_delta)
+    checks = gate(
+        comparison,
+        minimum_success_delta=arguments.minimum_success_delta,
+        max_reasoning_growth=None if arguments.ignore_thinking_budget else arguments.max_reasoning_growth,
+    )
     comparison["gate"] = [
         {"name": check.name, "passed": check.passed, "detail": check.detail} for check in checks
     ]
@@ -67,7 +72,10 @@ def run_compare(arguments: argparse.Namespace) -> int:
         arguments.out.write_text(json.dumps(comparison, indent=2) + "\n")
 
     task_level = comparison["task_level"]
-    print(json.dumps({"deltas": comparison["deltas"], "task_level": task_level}, indent=2))
+    print(json.dumps(
+        {"deltas": comparison["deltas"], "thinking": comparison["thinking"], "task_level": task_level},
+        indent=2,
+    ))
     for check in checks:
         print(f"  [{'PASS' if check.passed else 'FAIL'}] {check.name}: {check.detail}")
     # A small suite reports paired outcomes rather than implying significance.
@@ -98,6 +106,19 @@ def main() -> int:
     comparer.add_argument("baseline", type=Path)
     comparer.add_argument("candidate", type=Path)
     comparer.add_argument("--minimum-success-delta", type=float, default=0.0)
+    comparer.add_argument(
+        "--max-reasoning-growth",
+        type=float,
+        default=DEFAULT_MAX_REASONING_GROWTH,
+        help="thinking-budget ceiling: candidate reasoning tokens per turn may exceed the "
+        "baseline by at most this fraction (default 0.10); only checked when both reports "
+        "counted reasoning tokens",
+    )
+    comparer.add_argument(
+        "--ignore-thinking-budget",
+        action="store_true",
+        help="drop the thinking-budget check from the gate",
+    )
     comparer.add_argument("--out", type=Path, default=None)
     comparer.set_defaults(handler=run_compare)
 

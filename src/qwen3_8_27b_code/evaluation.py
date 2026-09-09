@@ -10,6 +10,11 @@ Two rules from the docs are load-bearing here. Infrastructure failures are
 excluded from scoring rather than counted as model failures. And a small suite
 reports paired per-task outcomes instead of implying precision it cannot
 support.
+
+The scorecard also carries the thinking budget (reasoning tokens per turn,
+the share of generated tokens spent thinking, and turns cut off inside the
+think block) and the long-horizon bands, so "shorter thinking at equal
+quality" is something the gate can check rather than a hope.
 """
 
 from __future__ import annotations
@@ -46,17 +51,43 @@ class AttemptRecord:
     repeated_calls: int
     completion_tokens: int
     wall_seconds: float
+    # Thinking budget. Defaults keep reports written before these existed
+    # loadable; such reports simply do not measure thinking.
+    turns: int = 0
+    reasoning_tokens: int = 0
+    reasoning_chars: int = 0
+    reasoning_tokens_reported: bool = False
+    thinking_overrun: bool = False
 
     @property
     def unsupported_success_claim(self) -> bool:
         """Finished with an answer while never running the tests."""
         return self.termination == "assistant_complete" and not self.ran_tests
 
+    @property
+    def horizon_band(self) -> str:
+        """docs/evaluation.md long-horizon band, by tool calls actually made."""
+        return horizon_band(self.tool_calls)
+
     def as_dict(self) -> dict:
         payload = dict(self.__dict__)
         payload["unsupported_success_claim"] = self.unsupported_success_claim
-        payload["wall_seconds"] = round(self.wall_seconds, 3)
+        payload["horizon_band"] = self.horizon_band
+        # Stored exactly: rounding here made time-based aggregates differ by
+        # a thousandth after a JSON round trip, which is a false regression.
+        payload["wall_seconds"] = self.wall_seconds
         return payload
+
+
+HORIZON_BANDS = (("short", 5), ("medium", 15), ("long", 30))
+
+
+def horizon_band(tool_calls: int) -> str:
+    """Short 0-5, medium 6-15, long 16-30, extended 31+ tool calls."""
+    for name, upper in HORIZON_BANDS:
+        if tool_calls <= upper:
+            return name
+    return "extended"
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -89,6 +120,25 @@ class EvaluationReport:
         def per_success(values: list[float]) -> float:
             return round(sum(values) / len(successes), 3) if successes else 0.0
 
+        # Thinking is normalised per assistant turn, not per success: a
+        # candidate that solves more tasks legitimately takes more turns, and
+        # a per-success ratio against a baseline with no successes is
+        # undefined. Per turn is the budget the user actually pays at
+        # deployment, one decision at a time.
+        total_turns = sum(record.turns for record in scored)
+        total_completion = sum(record.completion_tokens for record in scored)
+        total_reasoning_tokens = sum(record.reasoning_tokens for record in scored)
+        reasoning_measured = bool(scored) and all(record.reasoning_tokens_reported for record in scored)
+
+        def per_turn(total: float) -> float:
+            return round(total / total_turns, 3) if total_turns else 0.0
+
+        bands = Counter(record.horizon_band for record in scored)
+        success_by_horizon = {
+            band: _rate(sum(1 for r in scored if r.horizon_band == band and r.succeeded), count)
+            for band, count in sorted(bands.items())
+        }
+
         return {
             "label": self.label,
             "attempts": len(self.records),
@@ -106,6 +156,19 @@ class EvaluationReport:
             "calls_per_success": per_success([float(r.tool_calls) for r in scored]),
             "tokens_per_success": per_success([float(r.completion_tokens) for r in scored]),
             "seconds_per_success": per_success([r.wall_seconds for r in scored]),
+            # Thinking budget.
+            "reasoning_tokens_reported": reasoning_measured,
+            "reasoning_tokens_per_turn": per_turn(total_reasoning_tokens) if reasoning_measured else 0.0,
+            "reasoning_chars_per_turn": per_turn(sum(r.reasoning_chars for r in scored)),
+            "completion_tokens_per_turn": per_turn(total_completion),
+            "reasoning_share_of_completion": (
+                round(total_reasoning_tokens / total_completion, 4)
+                if reasoning_measured and total_completion else 0.0
+            ),
+            "thinking_overrun_rate": _rate(sum(r.thinking_overrun for r in scored), total),
+            # Long-horizon bands, by tool calls made.
+            "horizon_bands": dict(sorted(bands.items())),
+            "success_by_horizon": success_by_horizon,
             "terminations": dict(sorted(Counter(r.termination for r in self.records).items())),
             "mean_episode_seconds": round(
                 statistics.mean([r.wall_seconds for r in self.records]), 3
@@ -128,7 +191,7 @@ class EvaluationReport:
         for row in payload["attempts"]:
             fields = {
                 key: value for key, value in row.items()
-                if key not in {"unsupported_success_claim"}
+                if key not in {"unsupported_success_claim", "horizon_band"}
             }
             report.records.append(AttemptRecord(**fields))
         return report
@@ -179,6 +242,11 @@ def _record(task: AgentTask, seed: int, episode: Episode, verdict: Verdict) -> A
         repeated_calls=episode.repeated_calls,
         completion_tokens=episode.completion_tokens,
         wall_seconds=episode.wall_seconds,
+        turns=episode.turns,
+        reasoning_tokens=episode.reasoning_tokens,
+        reasoning_chars=episode.reasoning_chars,
+        reasoning_tokens_reported=episode.reasoning_tokens_reported,
+        thinking_overrun=episode.thinking_overrun,
     )
 
 
@@ -226,12 +294,16 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
             "valid_tool_call_rate",
             "unsupported_success_claim_rate",
             "loop_rate",
+            "thinking_overrun_rate",
+            "reasoning_chars_per_turn",
+            "reasoning_tokens_per_turn",
         )
     }
     return {
         "baseline": before_card,
         "candidate": after_card,
         "deltas": deltas,
+        "thinking": thinking_comparison(before_card, after_card),
         "paired_tasks": paired,
         "task_level": {"wins": wins, "losses": losses, "ties": ties, "tasks": len(shared)},
         "only_in_baseline": sorted(set(baseline_outcomes) - set(candidate_outcomes)),
@@ -239,12 +311,61 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
     }
 
 
-def gate(comparison: dict, minimum_success_delta: float = 0.0) -> list[GateCheck]:
+def _relative_change(before: float, after: float) -> float | None:
+    if before <= 0:
+        return None
+    return round((after - before) / before, 4)
+
+
+def thinking_comparison(before_card: dict, after_card: dict) -> dict:
+    """How much the candidate thinks relative to the baseline.
+
+    Tokens are the measure the user pays for and the one the gate uses; they
+    exist only when both policies counted them. Characters are always present
+    and serve as the diagnostic when tokens are missing (scripted policies,
+    older reports).
+    """
+    measured = bool(before_card["reasoning_tokens_reported"] and after_card["reasoning_tokens_reported"])
+    return {
+        "measured_in_tokens": measured,
+        "baseline_reasoning_tokens_per_turn": before_card["reasoning_tokens_per_turn"],
+        "candidate_reasoning_tokens_per_turn": after_card["reasoning_tokens_per_turn"],
+        "relative_change_tokens_per_turn": (
+            _relative_change(before_card["reasoning_tokens_per_turn"], after_card["reasoning_tokens_per_turn"])
+            if measured else None
+        ),
+        "baseline_reasoning_chars_per_turn": before_card["reasoning_chars_per_turn"],
+        "candidate_reasoning_chars_per_turn": after_card["reasoning_chars_per_turn"],
+        "relative_change_chars_per_turn": _relative_change(
+            before_card["reasoning_chars_per_turn"], after_card["reasoning_chars_per_turn"]
+        ),
+        "baseline_reasoning_share": before_card["reasoning_share_of_completion"],
+        "candidate_reasoning_share": after_card["reasoning_share_of_completion"],
+        "baseline_success_by_horizon": before_card["success_by_horizon"],
+        "candidate_success_by_horizon": after_card["success_by_horizon"],
+    }
+
+
+DEFAULT_MAX_REASONING_GROWTH = 0.10
+
+
+def gate(
+    comparison: dict,
+    minimum_success_delta: float = 0.0,
+    max_reasoning_growth: float | None = DEFAULT_MAX_REASONING_GROWTH,
+) -> list[GateCheck]:
     """The SFT gate from docs/evaluation.md, evaluated on a comparison.
 
     Thresholds are policy, and are meant to be frozen before a candidate's
     results are seen. Nothing here claims statistical significance: on a suite
     this size the task-level record is the honest summary.
+
+    ``max_reasoning_growth`` is the thinking-budget check from
+    docs/thinking-budget.md: the candidate may not spend more than
+    ``(1 + growth)`` times the baseline's reasoning tokens per turn. It is
+    evaluated only when both policies counted reasoning tokens, and reports
+    itself as unmeasured otherwise rather than failing a run that could not
+    measure it. ``None`` removes the check.
     """
     deltas = comparison["deltas"]
     task_level = comparison["task_level"]
@@ -279,8 +400,34 @@ def gate(comparison: dict, minimum_success_delta: float = 0.0) -> list[GateCheck
             task_level["wins"] >= task_level["losses"],
             f"{task_level['wins']} wins, {task_level['losses']} losses, {task_level['ties']} ties",
         ),
+        GateCheck(
+            "thinking_overrun_no_worse",
+            deltas["thinking_overrun_rate"] <= 0.0,
+            f"turns cut off inside the think block: rate delta {deltas['thinking_overrun_rate']:+.4f}",
+        ),
     ]
+    if max_reasoning_growth is not None:
+        checks.append(thinking_budget_check(comparison, max_reasoning_growth))
     return checks
+
+
+def thinking_budget_check(comparison: dict, max_reasoning_growth: float) -> GateCheck:
+    thinking = comparison.get("thinking") or {}
+    if not thinking.get("measured_in_tokens"):
+        return GateCheck(
+            "thinking_budget",
+            True,
+            "not measured: at least one policy did not report reasoning tokens",
+        )
+    before = thinking["baseline_reasoning_tokens_per_turn"]
+    after = thinking["candidate_reasoning_tokens_per_turn"]
+    allowed = before * (1.0 + max_reasoning_growth)
+    return GateCheck(
+        "thinking_budget",
+        after <= allowed,
+        f"reasoning tokens per turn {before:.1f} -> {after:.1f}; "
+        f"ceiling {allowed:.1f} at +{max_reasoning_growth:.0%}",
+    )
 
 
 def gate_passed(checks: list[GateCheck]) -> bool:

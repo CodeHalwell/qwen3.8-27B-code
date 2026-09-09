@@ -16,7 +16,7 @@ import importlib
 from typing import Callable
 
 from .episodes import Policy, answer_text, scripted_policy, tool_call_text
-from .tasks import AgentTask
+from .tasks import AgentTask, gold_patch
 from .trajectories import unified_patch
 
 PolicyFactory = Callable[[AgentTask, int], Policy]
@@ -25,26 +25,44 @@ PLACEHOLDER_TEST = "def test_placeholder():\n    assert True\n"
 
 
 def _fix_patch(task: AgentTask) -> str:
-    if task.reference_module is None:
-        raise ValueError(f"{task.task_id} has no reference module to patch to")
-    return unified_patch(task.module_path, task.files[task.module_path], task.reference_module)
+    return gold_patch(task)
 
 
 def gold(task: AgentTask, seed: int) -> Policy:
-    """Inspect, patch minimally, verify, report. The behaviour being taught."""
+    """Inspect, patch minimally, verify, report. The behaviour being taught.
+
+    On a multi-file task the inspection is correspondingly wider: list the
+    repository, read the tests and every module the fix touches, then patch
+    once. That is the medium-horizon shape a real policy has to produce.
+    """
     del seed
-    return scripted_policy(
-        [
+    changed = sorted(task.gold_files)
+    if len(changed) > 1:
+        inspection = [
+            tool_call_text("list_files", {"path": "."}, "Several modules may be involved; I should see the layout first."),
+            *[
+                tool_call_text("read_file", {"path": path}, f"The tests in {path} say what the fix must satisfy.")
+                for path in task.test_paths
+            ],
+            *[
+                tool_call_text("read_file", {"path": path}, f"I should read {path} before changing it.")
+                for path in changed
+            ],
+        ]
+        patch_reasoning = "Each failing test points at a different module; one patch corrects both in place."
+    else:
+        inspection = [
             tool_call_text(
                 "read_file",
                 {"path": task.module_path},
                 f"I should read {task.module_path} before changing anything.",
-            ),
-            tool_call_text(
-                "apply_patch",
-                {"patch": _fix_patch(task)},
-                "The defect is in this function; the minimal edit is to correct it in place.",
-            ),
+            )
+        ]
+        patch_reasoning = "The defect is in this function; the minimal edit is to correct it in place."
+    return scripted_policy(
+        [
+            *inspection,
+            tool_call_text("apply_patch", {"patch": _fix_patch(task)}, patch_reasoning),
             tool_call_text(
                 "run_tests",
                 {"profile": "unit"},

@@ -8,6 +8,12 @@ which is what makes the collector and the evaluator testable without a GPU.
 The policy is also the only place the GPU-bound notebook has to supply code,
 so the loop cannot drift between the baseline run, trace collection and the
 evaluation gate the way three hand-copied cells would.
+
+The loop also keeps the thinking-budget books: reasoning tokens per turn as
+reported by the policy, a character proxy that is always available, and
+whether a turn was cut off inside its think block. Those feed the scorecard's
+thinking metrics, the shortest-correct selection in collection and the
+reasoning-length preference pairs.
 """
 
 from __future__ import annotations
@@ -48,12 +54,20 @@ class TurnResult:
     an end-of-turn token, and ``context_budget`` when the prompt no longer
     leaves room to generate. A truncated turn parses as "no tool calls", so a
     loop that ignores this scores a cut-off turn as a finished answer.
+
+    ``reasoning_tokens`` is the number of generated tokens spent inside the
+    think block, counted by the policy that owns the tokenizer. It is the
+    quantity the thinking-budget gate and the length-preference data are
+    built on, so a policy should report it whenever it can; ``None`` means
+    "not counted" and the loop falls back to a character proxy. A turn that
+    was truncated before ``</think>`` closed is entirely reasoning.
     """
 
     text: str
     prompt_tokens: int = 0
     completion_tokens: int = 0
     fault: str | None = None
+    reasoning_tokens: int | None = None
 
 
 class Policy(Protocol):
@@ -81,6 +95,22 @@ class Episode:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     wall_seconds: float = 0.0
+    # Thinking budget. Tokens come from the policy (see TurnResult); the
+    # character count is always available and is the CPU-side proxy. Both
+    # include a turn that was truncated inside its think block, because that
+    # is exactly the runaway-thinking cost the budget exists to catch.
+    reasoning_tokens: int = 0
+    reasoning_chars: int = 0
+    reported_reasoning_turns: int = 0
+    thinking_overrun: bool = False
+    # Per completed assistant turn, aligned with the assistant messages in
+    # order; None where the policy did not count tokens for that turn.
+    turn_reasoning_tokens: list[int | None] = field(default_factory=list)
+
+    @property
+    def reasoning_tokens_reported(self) -> bool:
+        """True when every turn carried a policy-counted reasoning length."""
+        return self.turns > 0 and self.reported_reasoning_turns == self.turns
 
     @property
     def called_tools(self) -> list[str]:
@@ -108,6 +138,10 @@ class Episode:
         return {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "reasoning_chars": self.reasoning_chars,
+            "reasoning_tokens_reported": self.reasoning_tokens_reported,
+            "thinking_overrun": self.thinking_overrun,
             "tool_calls": self.tool_calls,
             "invalid_tool_calls": self.invalid_tool_calls,
             "repeated_calls": self.repeated_calls,
@@ -158,10 +192,23 @@ def run_episode(
         episode.turns += 1
         episode.prompt_tokens += turn.prompt_tokens
         episode.completion_tokens += turn.completion_tokens
+        if turn.reasoning_tokens is not None:
+            episode.reasoning_tokens += turn.reasoning_tokens
+            episode.reported_reasoning_turns += 1
+        reasoning, _ = split_reasoning(turn.text)
+        think_closed = "</think>" in turn.text
+        if turn.fault == "output_truncated" and not think_closed:
+            # Cut off before the think block closed: the whole turn was
+            # reasoning, and the episode ended because of it.
+            episode.thinking_overrun = True
+            episode.reasoning_chars += len(turn.text.removeprefix("<think>").strip())
+        else:
+            episode.reasoning_chars += len(reasoning)
         if turn.fault is not None:
             episode.termination = turn.fault
             break
 
+        episode.turn_reasoning_tokens.append(turn.reasoning_tokens)
         reasoning, calls = parse_tool_calls(turn.text)
         if not calls:
             _, final_text = split_reasoning(turn.text)
