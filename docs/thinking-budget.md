@@ -82,6 +82,13 @@ recovers. It also tells you where the model's own judgement is miscalibrated:
 tasks that succeed at `low` but are thought about at `xhigh` length are the
 cases the training levers below exist for.
 
+Two template facts shape the ladder. `medium` renders no instruction at all
+(only `low` and `xhigh` inject one), so the `medium` rung is the model's
+uninstructed behaviour, and `high` is an alias for `xhigh`, not a fourth
+rung. And reasoning counts against the per-turn generation cap, so each
+rung needs its own cap set above that rung's p95 reasoning length;
+otherwise the `xhigh` rung reports overruns, not effort.
+
 The corpus keeps the effort each row was generated at, and the collector
 records the effort it ran at, so training preserves the dial rather than
 flattening it. Never relabel a row to a different effort; the scripted

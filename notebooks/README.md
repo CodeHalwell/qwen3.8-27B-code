@@ -136,6 +136,12 @@ levers, the gate and the order to try them are in
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.
+- Unsloth's own Qwen3.8-27B notebook loads the checkpoint with `FastModel`
+  and receives a processor rather than a tokenizer. The suite still calls
+  `FastLanguageModel`; notebook 00 records which loader the pinned stack
+  accepts, and every text tokenisation is passed by keyword so either object
+  works. Its other rules (no `fp16` flags, logits on the `lm_head` card) are
+  recorded in [Model and hardware](../docs/model-and-hardware.md#second-lane-kaggle-t4-x2).
 - LoRA starts at rank 16 over the discovered language linear modules — the
   full-attention projections, the Gated DeltaNet `in_proj_*`/`out_proj` that
   three of every four layers use, and the MLP projections — with Unsloth

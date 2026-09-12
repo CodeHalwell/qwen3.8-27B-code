@@ -42,7 +42,7 @@ is an inference baseline and a reference for supported quant types.
 | --- | --- |
 | [Colab notebooks](../notebooks/README.md) | Executable preflight, baseline, data, SFT, DPO, agentic GRPO and quantisation suite |
 | [Minimum path](minimum-path.md) | The deliberately small route to the first useful baseline, including what is adopted, built and deferred |
-| [Model and hardware](model-and-hardware.md) | Model identity, architecture, VRAM feasibility, context constraints and the GPU assumption |
+| [Model and hardware](model-and-hardware.md) | Model identity, architecture, VRAM feasibility, context constraints, the GPU assumption and the Kaggle T4 x2 plumbing lane |
 | [Agentic harness](agentic-harness.md) | Tool protocol, sandbox, episode lifecycle and trajectory format |
 | [Data strategy](data-strategy.md) | SFT, preference and RL datasets; validation, mixing and contamination controls |
 | [Distillation](distillation.md) | Using a larger open model (Qwen3.8, Kimi K3, GLM 5.3) as a teacher through the same harness: verified trajectories, reasoning-length pairs and teacher-versus-student outcome pairs, and why logit distillation is out of scope |
@@ -90,6 +90,10 @@ Training loss alone is not a success criterion.
 
 - Hardware is assumed to be a **Google Colab G4 runtime using the RTX PRO 6000
   Blackwell Server Edition with 96 GB GDDR7 ECC**.
+- A free Kaggle T4 x2 kernel is a second lane for 4-bit plumbing checks only
+  (loader, template, masking, adapter round trip). Nothing measured there is
+  a capability result; see
+  [Model and hardware](model-and-hardware.md#second-lane-kaggle-t4-x2).
 - The primary workload is text-only software engineering. Vision weights are
   preserved but frozen.
 - The native context limit is 262,144 tokens, but initial training will use
@@ -105,4 +109,7 @@ Training loss alone is not a success criterion.
 
 The model and its ecosystem are very new. Version pins, model-card facts and
 runtime support should be rechecked before each major training or export run.
-These documents were last reviewed on **2026-08-17**.
+These documents were last reviewed on **2026-08-17**. The model, template and
+hardware facts in [Model and hardware](model-and-hardware.md) and the
+[training plan](training-plan.md) were rechecked against the Hub and against
+Unsloth's own Qwen3.8-27B Kaggle notebook on **2026-09-12**.

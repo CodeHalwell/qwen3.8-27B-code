@@ -86,6 +86,17 @@ Where licences and infrastructure permit, add SWE-bench-family and
 Terminal-Bench-style tasks. Maintain a private evaluation set because public
 benchmarks are increasingly present in training corpora.
 
+The Colab kernel is not where those run: SWE-bench's harness wants Docker
+and Terminal-Bench wants its own sandboxes. Serve the checkpoint instead
+(the model card lists vLLM and SGLang as compatible runtimes, and the NVFP4
+build is the natural server artifact on Blackwell) and drive the external
+harness from a CPU machine. The project's OpenAI-compatible policy adapter
+in `qwen3_8_27b_code.teachers` already turns an endpoint into a policy for
+the episode loop, so one served checkpoint can be scored on the internal
+suite and the external slice from the same process. Until an external slice
+has been run, a checkpoint is better on this harness's held-out suite, which
+is a narrower claim than being better at coding.
+
 ### 4. Robustness tasks
 
 Inject realistic faults:

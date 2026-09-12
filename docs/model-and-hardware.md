@@ -38,15 +38,37 @@ fine-tuning.
 
 The official configuration identifies a multimodal
 `Qwen3_5ForConditionalGeneration` model with a `qwen3_5` model type. The text
-stack has:
+stack has (rechecked against the Hub `config.json` on 2026-09-12):
 
 - 64 layers and a 5,120-wide hidden state;
-- a 248,320-token vocabulary;
+- a 248,320-token vocabulary, untied from the `lm_head`;
 - a repeating hybrid layout of three linear-attention layers followed by one
-  full-attention layer;
-- untied embeddings;
-- one multi-token-prediction layer; and
-- a native 262,144-token context limit.
+  full-attention layer: 48 Gated DeltaNet layers (48 value heads, 16
+  key/query heads, head dimension 128) and 16 gated-attention layers (24
+  query heads, 4 key/value heads, head dimension 256);
+- a float32 recurrent state for the DeltaNet layers (`mamba_ssm_dtype`),
+  which is why Unsloth keeps this architecture on a float32 autocast path and
+  why pure float16 training produces NaN gradients;
+- one multi-token-prediction layer;
+- a native 262,144-token context limit; and
+- 55.6 GB of BF16 safetensors across 18 shards (51.8 GiB), written by
+  `transformers` 5.8.0.dev0. The reviewed 5.3.0 pin predates the checkpoint
+  and Unsloth's current Kaggle notebook installs 5.15.1, so the pin is a
+  preflight result to re-validate, not a settled fact.
+
+The 27.8B parameter count and the 496 language linear modules LoRA attaches
+to (64 x 3 MLP projections, 16 x 4 attention projections and 48 x 5 DeltaNet
+projections) come from Unsloth's own Qwen3.8-27B notebook
+(`references/qwen3_8_27b_kaggle_t4x2.py`). Rank 8 there is 58.4M trainable
+parameters, so the plan's rank 16 is about 117M, 0.42% of the model.
+
+Unsloth's pre-quantised `unsloth/Qwen3.8-27B-unsloth-bnb-4bit` build, which
+`load_in_4bit=True` resolves to, keeps `lm_head`, the vision tower and the
+DeltaNet `in_proj_qkv`, `in_proj_a` and `in_proj_b` projections in 16-bit
+(`llm_int8_skip_modules`). That is Unsloth's own judgement of which tensors
+do not tolerate 4-bit, it is why the 4-bit weights measure 18.80 GiB rather
+than what an all-4-bit estimate gives, and it is the starting list for every
+recipe in [Quantisation](quantisation.md).
 
 The model also includes a vision tower. “Pure coding model” should mean a
 behavioural specialisation, not removing the vision tensors. For initial work:
@@ -83,6 +105,29 @@ discovery returns anything other than the reviewed set.
 Qwen3.8-27B supports hybrid thinking, developer messages, tool calling,
 `reasoning_effort` (`xhigh`, `medium`, `low`) and preserved thinking. The
 official default is thinking mode with `xhigh` effort.
+
+What the template actually renders (checked against the Hub
+`chat_template.jinja` on 2026-09-12):
+
+- `reasoning_effort` accepts `xhigh` (the default when nothing is passed),
+  `medium` and `low`; `high` is silently resolved to `xhigh`; any other value
+  raises from inside the template, so validate labels before rendering.
+- `xhigh` and `low` inject an instruction sentence into the system block.
+  `medium` injects nothing: a `medium` row is a row with no effort
+  instruction, not a middle setting the model is told about.
+- Every assistant turn opens with `<think>`, and `enable_thinking=False`
+  renders an empty think block rather than removing it.
+- In a tool loop, every assistant turn after the last real user message keeps
+  its think block whether or not `preserve_thinking` is set; only earlier
+  turns are dropped without it. Training and deployment therefore see the
+  same growing reasoning context, which is one more reason the thinking
+  budget is a deployment cost rather than a cosmetic one.
+- Tool results render as `<|im_start|>user\n<tool_response>...`, which is
+  what lets `train_on_responses_only` mask observations with the plain
+  `<|im_start|>user\n` marker.
+- Reasoning tokens count against `max_new_tokens`. A turn that hits the cap
+  inside its think block returns no action at all, which scores exactly like
+  a wrong one; raise the per-turn cap before raising the effort.
 
 Training and inference must use the tokenizer's native chat template. The
 harness should pass declared tools to the template and retain structured
@@ -134,6 +179,37 @@ If the card is the 48 GB RTX 6000 Ada, BF16 LoRA is no longer the default.
 Use 4-bit QLoRA, shorter sequences and possibly CPU offload; treat the rest of
 this document's BF16-LoRA expectations as invalid.
 
+## Second lane: Kaggle T4 x2
+
+Unsloth's own Qwen3.8-27B notebook (`references/qwen3_8_27b_kaggle_t4x2.py`)
+runs QLoRA on a free Kaggle kernel with two 16 GB Tesla T4s. It is a second
+lane for this project, not a second target: use it to prove plumbing at no
+cost, and use the G4 for every number that will be compared or gated.
+
+What the notebook establishes:
+
+| Fact | Value | Consequence |
+| --- | --- | --- |
+| Weights resident in 4-bit | 18.80 GiB | One T4 cannot hold it; the model is sharded over two |
+| Peak reserved during a 1,024-token step | 23.71 GiB (7.08 GiB on the first card, 11.36 GiB on the second) | The card holding `lm_head` is the tight one |
+| Activations, gradients and optimiser at peak | 1.23 GiB | The rest of the reserved figure is fragmentation |
+| Largest single allocation | The logits, `tokens x 248,320`, on the `lm_head` card | Raising the batch size is the fastest way to run out of memory |
+| Loader | `FastModel`, which returns a processor rather than a tokenizer | Tokenise text by keyword (`tokenizer(text=...)`); a bare positional string is read as an image |
+| Precision | No `dtype=float16` and no `fp16=True`; Unsloth picks the dtype | The DeltaNet path produces NaN gradients in pure float16, and a T4 has no bfloat16 |
+| Placement | `device_map` left unset (Unsloth's `sequential` default) | `balanced` caps the first card, leaves the 2.37 GiB `lm_head` without a home and bitsandbytes refuses the CPU entry |
+| Merge | Not on the kernel | A merged checkpoint is about 52 GB and needs CPU RAM for the dequantised model; push the adapter and merge elsewhere |
+
+Those measurements were taken on one large card with the allocator capped to
+what two T4s add up to, so the memory transfers and the step time does not.
+
+The lane validates, for free, everything that does not depend on the weights'
+precision or the sequence length: the loader class, the template round trip,
+assistant-only masking, the tool-call parser, adapter save and reload, and
+the Hub upload path. It cannot produce a capability result. At 1,024 tokens
+no agentic trajectory fits, at 4-bit the policy is not the BF16 policy the
+gates compare, and nothing measured there transfers to the G4 except the
+facts in the table. Run notebooks 03, 04 and 05 there only in `DEMO_MODE`.
+
 ## Single-GPU feasibility
 
 | Workload | 96 GB Blackwell assessment | Starting point |
@@ -151,7 +227,27 @@ this document's BF16-LoRA expectations as invalid.
 Unsloth's generic requirements place 27B LoRA at about 64 GB minimum and QLoRA
 at about 22 GB. Those are planning numbers, not guarantees for Qwen3.8's large
 vocabulary, hybrid architecture or multi-turn RL. Record measured peak
-allocated and reserved VRAM for every smoke run.
+allocated and reserved VRAM for every smoke run. The measured 4-bit figure
+from the [Kaggle lane](#second-lane-kaggle-t4-x2), 18.80 GiB of weights,
+replaces the generic QLoRA estimate for the fallback path.
+
+### Logit memory
+
+The vocabulary, not the depth, sets the largest transient allocation in a
+training step. One bf16 logit row is 248,320 x 2 bytes, about 485 KiB, so:
+
+| Sequence | bf16 logits | float32 copy | Naive loss (bf16 logits, float32 copy, float32 gradient) |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 1.9 GiB | 3.8 GiB | about 9.5 GiB |
+| 8,192 | 3.8 GiB | 7.6 GiB | about 19 GiB |
+| 16,384 | 7.6 GiB | 15.2 GiB | about 38 GiB |
+
+Next to 51.8 GiB of BF16 weights, 8,192 tokens fits on the G4 only with the
+logits chunked (Unsloth's fused cross-entropy) and 16,384 does not fit
+naively at all. Preflight records whether the chunked loss is active for this
+architecture, and the 16K profile in the [context policy](#context-policy) is
+conditional on it. This is the same allocation that makes the batch size the
+first thing to run out of memory on the Kaggle lane.
 
 ## Inference memory guidance
 
@@ -205,12 +301,17 @@ Before the first expensive run, capture:
 1. GPU name, VRAM, driver, CUDA and PyTorch versions.
 2. Exact model, tokenizer and processor revisions.
 3. The loader class that the pinned Unsloth release supports for this
-   multimodal architecture.
+   multimodal architecture (`FastModel` in Unsloth's own Qwen3.8 notebook),
+   whether it returns a processor rather than a tokenizer, and the inner
+   text tokenizer if so.
 4. Trainable parameter names and count, proving that vision parameters are
    frozen.
 5. One native tool-call round trip through the chat template.
 6. A forward/backward pass at 4K with peak VRAM.
 7. Save, reload and merge of a tiny LoRA checkpoint.
 8. Inference parity before and after that no-op/smoke merge.
+9. The DeltaNet kernel path in use (fused linear-attention kernels or the
+   PyTorch fallback), the loss implementation (chunked or full logits) and
+   tokens per second at 4K, so that throughput and memory are attributable.
 
 Failure of any preflight blocks a full SFT run.

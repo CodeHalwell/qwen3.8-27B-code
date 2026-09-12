@@ -5,7 +5,10 @@ agentic reinforcement learning and low-bit deployment of Qwen3.8-27B for
 long-horizon software-engineering work.
 
 Training is intended to run in a Google Colab notebook on a G4 runtime with an
-NVIDIA RTX PRO 6000 Blackwell Server Edition GPU and 96 GB VRAM.
+NVIDIA RTX PRO 6000 Blackwell Server Edition GPU and 96 GB VRAM. A free Kaggle
+T4 x2 kernel can run the 4-bit plumbing lane described in
+[docs/model-and-hardware.md](docs/model-and-hardware.md#second-lane-kaggle-t4-x2);
+it cannot run the capability stages.
 
 Start with:
 
