@@ -226,10 +226,13 @@ are not wasted: `scripts/collect_trajectories.py` turns them into
 reasoning-length preference pairs next to the corpus.
 
 The training suite the collector samples from is the single-file fixtures
-plus the multi-file families in `qwen3_8_27b_code.long_horizon`, whose
-trajectories land in the medium horizon band. Those families are graded by
-their visible tests, like the fixtures, and share no family with the
-held-out suite.
+plus the multi-file families in `qwen3_8_27b_code.long_horizon`: two
+coupled-module families whose trajectories land in the medium band, and a
+four-stage pipeline (`readings_pipeline`) whose gold path is seventeen
+calls, the long band. Those families are graded by their visible tests,
+like the fixtures, and share no family, module name or bug class with the
+held-out suite. Every task records the band it was designed for, so a
+corpus report can say how much of it is long-horizon.
 
 ## Demonstration filtering
 
@@ -290,7 +293,12 @@ reasoning-length pairs from `qwen3_8_27b_code.thinking`, where both
 continuations succeeded and took the same action and the chosen one thought
 less first. They teach brevity only, so they stay a minority of the mixture
 next to the execution-derived pairs; [Thinking budget](thinking-budget.md)
-records their construction and limits.
+records their construction and limits, and notebook 04 enforces the share.
+
+Every pair records the `reasoning_effort` its continuations were generated
+under and is rendered under that label. Length pairs are built within one
+effort only; outcome pairs between two policies may cross efforts and
+record both sides' labels in their evidence.
 
 Avoid manufacturing rejected responses solely by adding rude wording or bad
 formatting. That teaches style preferences, not software engineering.

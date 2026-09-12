@@ -53,6 +53,10 @@ class Attempt:
     verdict: Verdict
     rejection: str | None = None
     policy: str = ""
+    # The effort the policy ran at. Rows and pairs render under this label,
+    # so the instruction the reasoning was written under is the one it is
+    # trained under; never relabel it.
+    reasoning_effort: str = "medium"
 
     @property
     def accepted(self) -> bool:
@@ -73,6 +77,7 @@ class Attempt:
             "task_id": self.task_id,
             "seed": self.seed,
             "policy": self.policy,
+            "reasoning_effort": self.reasoning_effort,
             "termination": self.episode.termination,
             "succeeded": self.verdict.succeeded,
             "rejection": self.rejection,
@@ -91,6 +96,7 @@ class Attempt:
             "family": self.family,
             "seed": self.seed,
             "policy": self.policy,
+            "reasoning_effort": self.reasoning_effort,
             "rejection": self.rejection,
             "episode": {
                 "messages": self.episode.messages,
@@ -102,6 +108,7 @@ class Attempt:
                 "tool_errors": self.episode.tool_errors,
                 "turns": self.episode.turns,
                 "prompt_tokens": self.episode.prompt_tokens,
+                "peak_prompt_tokens": self.episode.peak_prompt_tokens,
                 "completion_tokens": self.episode.completion_tokens,
                 "wall_seconds": self.episode.wall_seconds,
                 "reasoning_tokens": self.episode.reasoning_tokens,
@@ -124,10 +131,11 @@ class Attempt:
             task_id=payload["task_id"],
             family=payload["family"],
             seed=payload["seed"],
-            episode=Episode(**payload["episode"]),
+            episode=Episode(**{"peak_prompt_tokens": 0, **payload["episode"]}),
             verdict=Verdict(**payload["verdict"]),
             rejection=payload.get("rejection"),
             policy=payload.get("policy", ""),
+            reasoning_effort=payload.get("reasoning_effort", "medium"),
         )
 
 
@@ -364,6 +372,7 @@ def collect(
                 verdict=verdict,
                 rejection=rejection_reason(episode, verdict),
                 policy=policy_label,
+                reasoning_effort=reasoning_effort,
             )
             result.attempts.append(attempt)
             if attempt.accepted:

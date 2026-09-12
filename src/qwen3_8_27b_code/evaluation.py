@@ -58,6 +58,11 @@ class AttemptRecord:
     reasoning_chars: int = 0
     reasoning_tokens_reported: bool = False
     thinking_overrun: bool = False
+    # Long horizon. The task's designed band is fixed per task, so success
+    # per band can be compared between two policies; the band by calls made
+    # (horizon_band) moves with the policy and stays a diagnostic.
+    task_horizon: str = ""
+    peak_prompt_tokens: int = 0
 
     @property
     def unsupported_success_claim(self) -> bool:
@@ -138,6 +143,13 @@ class EvaluationReport:
             band: _rate(sum(1 for r in scored if r.horizon_band == band and r.succeeded), count)
             for band, count in sorted(bands.items())
         }
+        task_bands = Counter(record.task_horizon or "unlabelled" for record in scored)
+        success_by_task_horizon = {
+            band: _rate(
+                sum(1 for r in scored if (r.task_horizon or "unlabelled") == band and r.succeeded), count
+            )
+            for band, count in sorted(task_bands.items())
+        }
 
         return {
             "label": self.label,
@@ -166,9 +178,18 @@ class EvaluationReport:
                 if reasoning_measured and total_completion else 0.0
             ),
             "thinking_overrun_rate": _rate(sum(r.thinking_overrun for r in scored), total),
-            # Long-horizon bands, by tool calls made.
+            # Long-horizon bands, by tool calls made (diagnostic) and by the
+            # band each task was designed for (gated).
             "horizon_bands": dict(sorted(bands.items())),
             "success_by_horizon": success_by_horizon,
+            "task_horizon_bands": dict(sorted(task_bands.items())),
+            "success_by_task_horizon": success_by_task_horizon,
+            # Context: the largest prompt any turn needed, and how often an
+            # episode ended because the window ran out.
+            "peak_prompt_tokens_max": max((r.peak_prompt_tokens for r in scored), default=0),
+            "context_budget_rate": _rate(
+                sum(1 for r in scored if r.termination == "context_budget"), total
+            ),
             "terminations": dict(sorted(Counter(r.termination for r in self.records).items())),
             "mean_episode_seconds": round(
                 statistics.mean([r.wall_seconds for r in self.records]), 3
@@ -247,6 +268,8 @@ def _record(task: AgentTask, seed: int, episode: Episode, verdict: Verdict) -> A
         reasoning_chars=episode.reasoning_chars,
         reasoning_tokens_reported=episode.reasoning_tokens_reported,
         thinking_overrun=episode.thinking_overrun,
+        task_horizon=task.horizon,
+        peak_prompt_tokens=episode.peak_prompt_tokens,
     )
 
 
@@ -297,6 +320,7 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
             "thinking_overrun_rate",
             "reasoning_chars_per_turn",
             "reasoning_tokens_per_turn",
+            "context_budget_rate",
         )
     }
     return {
@@ -343,6 +367,10 @@ def thinking_comparison(before_card: dict, after_card: dict) -> dict:
         "candidate_reasoning_share": after_card["reasoning_share_of_completion"],
         "baseline_success_by_horizon": before_card["success_by_horizon"],
         "candidate_success_by_horizon": after_card["success_by_horizon"],
+        "baseline_success_by_task_horizon": before_card["success_by_task_horizon"],
+        "candidate_success_by_task_horizon": after_card["success_by_task_horizon"],
+        "baseline_peak_prompt_tokens_max": before_card["peak_prompt_tokens_max"],
+        "candidate_peak_prompt_tokens_max": after_card["peak_prompt_tokens_max"],
     }
 
 
@@ -405,10 +433,33 @@ def gate(
             deltas["thinking_overrun_rate"] <= 0.0,
             f"turns cut off inside the think block: rate delta {deltas['thinking_overrun_rate']:+.4f}",
         ),
+        task_horizon_check(comparison),
     ]
     if max_reasoning_growth is not None:
         checks.append(thinking_budget_check(comparison, max_reasoning_growth))
     return checks
+
+
+def task_horizon_check(comparison: dict) -> GateCheck:
+    """Success may not fall in any horizon band the tasks were designed for.
+
+    The aggregate can hold while the long tasks are lost: a policy taught to
+    think less on three-call fixes may stop inspecting enough on seventeen-
+    call pipelines. Bands are by the task's designed horizon, so membership
+    is identical on both sides and a drop is a drop in the same tasks.
+    """
+    before = comparison["baseline"].get("success_by_task_horizon", {})
+    after = comparison["candidate"].get("success_by_task_horizon", {})
+    shared = sorted(set(before) & set(after))
+    if not shared:
+        return GateCheck("task_horizon_no_worse", True, "not measured: no shared horizon bands")
+    dropped = [f"{band} {before[band]:.2f}->{after[band]:.2f}" for band in shared if after[band] < before[band]]
+    held = ", ".join(f"{band} {before[band]:.2f}->{after[band]:.2f}" for band in shared)
+    return GateCheck(
+        "task_horizon_no_worse",
+        not dropped,
+        f"success fell in band(s): {'; '.join(dropped)}" if dropped else f"no band fell: {held}",
+    )
 
 
 def thinking_budget_check(comparison: dict, max_reasoning_growth: float) -> GateCheck:
@@ -432,6 +483,67 @@ def thinking_budget_check(comparison: dict, max_reasoning_growth: float) -> Gate
 
 def gate_passed(checks: list[GateCheck]) -> bool:
     return all(check.passed for check in checks)
+
+
+EFFORT_ORDER = ("low", "medium", "xhigh")
+
+
+def effort_ladder(reports: dict[str, EvaluationReport], success_tolerance: float = 0.0) -> dict:
+    """Tabulate the effort ladder of docs/thinking-budget.md and pick a deployment effort.
+
+    ``reports`` maps an effort label to the held-out report scored at that
+    effort with the same policy on the same tasks. The recommendation is
+    the rung that thinks least among those whose episode success is within
+    ``success_tolerance`` of the best rung; a tie goes to the lower overrun
+    rate, then to the lower effort. It chooses the dial setting for
+    deployment and for the gate baseline; the training levers in
+    thinking-budget.md are what move the model.
+    """
+    if not reports:
+        raise ValueError("an effort ladder needs at least one report")
+    unknown = sorted(set(reports) - set(EFFORT_ORDER))
+    if unknown:
+        raise ValueError(f"unknown reasoning effort(s) {unknown}; the template accepts {EFFORT_ORDER}")
+    task_sets = {effort: set(report.task_outcomes()) for effort, report in reports.items()}
+    if len({frozenset(tasks) for tasks in task_sets.values()}) != 1:
+        raise ValueError("every rung of the ladder must score the same tasks")
+
+    rungs = {}
+    for effort in EFFORT_ORDER:
+        if effort not in reports:
+            continue
+        card = reports[effort].scorecard()
+        rungs[effort] = {
+            "label": card["label"],
+            "scored_attempts": card["scored_attempts"],
+            "episode_success": card["episode_success"],
+            "reasoning_tokens_reported": card["reasoning_tokens_reported"],
+            "reasoning_tokens_per_turn": card["reasoning_tokens_per_turn"],
+            "reasoning_chars_per_turn": card["reasoning_chars_per_turn"],
+            "thinking_overrun_rate": card["thinking_overrun_rate"],
+            "context_budget_rate": card["context_budget_rate"],
+            "peak_prompt_tokens_max": card["peak_prompt_tokens_max"],
+            "success_by_task_horizon": card["success_by_task_horizon"],
+        }
+    unit = "tokens" if all(rung["reasoning_tokens_reported"] for rung in rungs.values()) else "chars"
+    best = max(rung["episode_success"] for rung in rungs.values())
+    eligible = [effort for effort, rung in rungs.items() if rung["episode_success"] >= best - success_tolerance]
+    recommended = min(
+        eligible,
+        key=lambda effort: (
+            rungs[effort][f"reasoning_{unit}_per_turn"],
+            rungs[effort]["thinking_overrun_rate"],
+            EFFORT_ORDER.index(effort),
+        ),
+    )
+    return {
+        "unit": unit,
+        "best_success": best,
+        "success_tolerance": success_tolerance,
+        "rungs": rungs,
+        "eligible": eligible,
+        "recommended": recommended,
+    }
 
 
 def write_report(report: EvaluationReport, path: Path) -> dict:

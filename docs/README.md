@@ -67,8 +67,10 @@ is an inference baseline and a reference for supported quant types.
    evaluation share that adapter and schema.
 4. **Optimise verified outcomes.** Tests, compilation and regression results
    dominate rewards. Style and verbosity are secondary.
-5. **Earn longer horizons.** Begin with short, deterministic episodes and
-   increase the tool-call and context budgets only after reliability gates pass.
+5. **Measure every horizon from the start.** Both suites carry short,
+   medium and long tasks, budgets are ceilings sized for the long band, and
+   the gate reads success per designed band; task difficulty still advances
+   one axis at a time.
 6. **Keep a BF16 golden checkpoint.** Every quantised artifact is compared to
    the same merged BF16 model.
 7. **Separate QAT from Dynamic GGUF.** Current Unsloth/TorchAO QAT is a 4-bit

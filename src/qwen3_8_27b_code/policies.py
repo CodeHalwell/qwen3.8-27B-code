@@ -37,6 +37,34 @@ def gold(task: AgentTask, seed: int) -> Policy:
     """
     del seed
     changed = sorted(task.gold_files)
+    if len(changed) >= 3:
+        # A pipeline with several broken stages is repaired one stage at a
+        # time, re-running the suite after each fix: the long-band shape of
+        # docs/evaluation.md, where the failure count falling after every
+        # verification is the evidence the agent has to read and act on.
+        turns = [
+            tool_call_text("list_files", {"path": "."}, "Several stages may be involved; I should see the layout first."),
+            *[
+                tool_call_text("read_file", {"path": path}, f"The tests in {path} say what each stage must satisfy.")
+                for path in task.test_paths
+            ],
+        ]
+        for path in changed:
+            turns.extend([
+                tool_call_text("read_file", {"path": path}, f"I should read {path} before changing it."),
+                tool_call_text(
+                    "apply_patch",
+                    {"patch": unified_patch(path, task.files[path], task.gold_files[path])},
+                    f"The defect in {path} is local; I should correct it in place.",
+                ),
+                tool_call_text(
+                    "run_tests",
+                    {"profile": "unit"},
+                    "Re-running the suite shows whether this stage is fixed and what remains.",
+                ),
+            ])
+        turns.append(answer_text("Repaired every stage of the pipeline and verified the suite is green."))
+        return scripted_policy(turns)
     if len(changed) > 1:
         inspection = [
             tool_call_text("list_files", {"path": "."}, "Several modules may be involved; I should see the layout first."),

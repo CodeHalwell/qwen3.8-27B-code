@@ -51,7 +51,8 @@ and none of them is a hyperparameter:
    compacted preceding history, with loss on that one turn only, rather than
    truncating from the right; accept the multiplied prefix cost for those
    rows alone. The long-horizon band then stops being excluded from training
-   by construction.
+   by construction; the [long-horizon requirements](#long-horizon) below
+   are what make that exclusion measurable in the meantime.
 3. **An external gate.** The held-out suite is eight families. It detects
    regression and protocol damage; it cannot support a claim about coding
    ability in general. Before any checkpoint is called an improvement, score
@@ -95,6 +96,45 @@ in [Model and hardware](model-and-hardware.md#second-lane-kaggle-t4-x2). A
 row that renders, masks and trains for two steps there has proved the data
 path; it has proved nothing about the model, and the gates stay on the G4.
 
+## Long horizon
+
+The deliverable is a long-horizon agent, so the long band is a requirement
+at every stage rather than a later curriculum step:
+
+- **Budgets are ceilings sized for the band.** Every episode, collected or
+  evaluated, runs with 30 tool calls and 15 minutes (`EpisodeBudget`, the
+  scripts, and notebooks 01, 07 and 08). A budget of ten excluded the long
+  band by construction: the gold path through a four-stage pipeline is
+  seventeen calls.
+- **Both suites carry the band.** The training suite has a four-stage
+  pipeline family (`readings_pipeline`) and the held-out suite another
+  (`invoice_pipeline`), each with one defect per stage and a test file per
+  stage, so the suite goes green only when every stage is fixed and a
+  policy that repairs a stage and re-runs the tests watches the failure
+  count fall. Every task records the band it was designed for
+  (`AgentTask.horizon`), and the scorecard reports success per designed
+  band (`success_by_task_horizon`) next to the band by calls actually made.
+- **The gate reads the bands.** `task_horizon_no_worse` fails a candidate
+  whose success falls in any designed band, whatever the aggregate does.
+  It is the check that stops a brevity lever from being paid for with the
+  pipeline tasks.
+- **Thinking is a context cost.** Every think block after the request stays
+  in context for the rest of the episode (the template facts in
+  [Model and hardware](model-and-hardware.md#native-conversation-behaviour)),
+  so thirty turns at 2K reasoning tokens each is 60K tokens of think blocks
+  before a single observation. The scorecard records
+  `peak_prompt_tokens_max` and `context_budget_rate`; when they climb
+  towards the window, the levers are less reasoning per turn first and
+  observation compaction second.
+- **Compaction waits for per-turn views.** Folding old observations changes
+  what the model saw at every earlier turn, so a full-trajectory SFT row
+  rendered from a compacted transcript would supervise decisions on
+  evidence the model no longer has. Compaction lands together with the
+  per-turn training examples of item 2 above, not before.
+- **Evaluate at the window the agent will run in.** Notebooks 01 and 07
+  evaluate at 32,768 tokens. SFT at 8K or 16K trains on the rows that fit,
+  and per-turn slicing is what admits the rest.
+
 ## Stage 0: upstream baseline
 
 Run the stock trainable checkpoint and at least one published GGUF in the same
@@ -112,12 +152,21 @@ harness. Capture:
 Give each rung of the effort ladder its own per-turn generation cap.
 Reasoning tokens count against `max_new_tokens`, and a turn cut off inside
 its think block returns no action, so one cap sized for `medium` turns the
-`xhigh` rung into a measurement of truncation rather than of effort. Measure
-the p95 reasoning length per effort on a few tasks first, set each cap above
-it, and size the episode's context budget so that ten such turns fit.
-Notebook 07's fixed 2,048-token cap and 16,384-token context are `medium`
-settings only. Note also that `medium` renders no instruction at all, so
-that rung measures the model's uninstructed behaviour.
+`xhigh` rung into a measurement of truncation rather than of effort.
+Notebook 07 carries `MAX_NEW_TOKENS_BY_EFFORT` (2,048, 4,096 and 8,192 to
+start) and a 32,768-token window; measure the p95 reasoning length per
+effort on a few tasks first and set each cap above it. `medium` renders no
+instruction at all, so that rung measures the model's uninstructed
+behaviour.
+
+The ladder is then a decision, not only a table. `evaluation.effort_ladder()`
+(notebook 07's `RUN_EFFORT_LADDER`, or `scripts/evaluate_agent.py ladder`)
+takes the three reports and recommends the rung that thinks least among
+those whose success matches the best rung within a frozen tolerance, ties
+going to the lower overrun rate. That rung becomes the deployment default
+and the frozen baseline the gate compares against, so every later claim of
+thinking less is measured from the cheapest setting the stock model already
+supports rather than from `xhigh`.
 
 Freeze this result and the exact harness version. It is the comparison point
 for every later claim.
@@ -161,6 +210,7 @@ Starting configuration:
 | Optimizer | 8-bit AdamW initially | Verify support with pinned stack |
 | Learning rate | Begin near `2e-5` for the main run | Unsloth's own notebook uses `2e-4` for a 30-step demo and says to drop to `2e-5` for long runs; sweep `2e-5`, `5e-5` and `1e-4` at smoke scale, gated on held-out success, before committing the main run |
 | Training length | Token-budgeted, at most roughly one pass initially | Stop on held-out regression |
+| Horizon mix | Short, medium and long rows in every mixture | Bucket by length; never drop the long rows to fit a window, slice them per turn instead; report tokens per designed band |
 | Loss | Assistant tokens only | Includes assistant tool calls |
 | Tracking | Trackio plus machine-readable run manifest | Required for comparable experiments |
 
@@ -207,13 +257,21 @@ as a minority next to the execution-derived pairs. The gate then reads the
 thinking check and the medium horizon band together: shorter thinking that
 costs the multi-file tasks is a regression, not a win.
 
-Render every pair at the effort its continuations were generated at. The
-template injects an instruction for `low` and `xhigh` and nothing for
-`medium`, so a `low` pair rendered at `medium` has lost the instruction its
-reasoning was written under. Notebook 04 renders all pairs at `medium`
-today, which is consistent only while collection runs at a single effort;
-the pair rows need to carry the effort label before the mixture spans the
-ladder.
+Every pair carries the effort its continuations were generated at
+(`reasoning_effort` on the row, set by the collector, the length-pair and
+outcome-pair builders and the bootstrap generator), and notebook 04 renders
+each pair under its own label. The template injects an instruction for
+`low` and `xhigh` and nothing for `medium`, so a `low` pair rendered at
+`medium` would lose the instruction its reasoning was written under.
+Reasoning-length pairs are built only between attempts at the same effort;
+an outcome pair between a teacher and a student may cross efforts and is
+rendered under the verified side's, with both recorded in its evidence.
+
+Notebook 04 also enforces the minority rule: `LENGTH_PAIRS_LOCAL_JSONL`
+adds the length pairs, `MAX_LENGTH_PAIR_SHARE` (one third) caps their share
+of the mixture by deterministic subsampling, length pairs with no
+correctness pairs beside them are refused, and the resulting mixture is
+written next to the run.
 
 ## Stage 4: agentic GRPO/GSPO
 
@@ -320,9 +378,14 @@ Advance in this order:
 2. Inspect then answer without editing.
 3. Inspect, make one edit and run one test.
 4. Recover from a failed test or malformed assumption.
-5. Multi-file implementation with regression tests.
-6. Longer debugging involving repeated observation and replanning.
+5. Multi-file implementation with regression tests (the two-module families).
+6. Longer debugging involving repeated observation and replanning (the
+   four-stage pipelines: fix a stage, re-run, read what remains, repeat).
 7. Long-context repository work and context compaction.
+
+Steps 1 to 6 are represented in both suites today, so the curriculum orders
+difficulty within a mixture rather than deciding when the long band is
+allowed to exist.
 
 Increase one axis at a time: task difficulty, tool-call budget, output length or
 context length. Changing all four makes regressions difficult to diagnose.

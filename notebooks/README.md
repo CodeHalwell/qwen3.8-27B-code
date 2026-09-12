@@ -23,7 +23,7 @@ gate (see the [specialisation policy](../docs/data-strategy.md#specialisation-po
 | [05 · Agentic GRPO](05_agentic_grpo.ipynb) | Validate a stateful coding environment, reward tests and the correctness-gated brevity term; trainer integration is compatibility-gated | Reward and brevity fixtures pass; then resolve the recorded Unsloth/TRL blocker before any policy update |
 | [06 · QAT and export](06_qat_and_export.ipynb) | Create separate QAT/TorchAO and standard GGUF experiments; prepare Dynamic calibration data | Quantised artifacts pass the frozen long-horizon gate against one BF16 reference |
 | [08 · Distil from a teacher](08_distil_from_teacher.ipynb) | Drive a larger open model (Qwen3.8, Kimi K3, GLM 5.3) through the same harness from a CPU runtime; keep verified trajectories, reasoning-length pairs and teacher-versus-student outcome pairs | The probe shows native tool calls with visible reasoning, and one priced task before the sweep |
-| [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Score a checkpoint on the held-out suite (single- and multi-file families), compare it to the frozen baseline including the thinking budget, and collect verified trajectories by rejection sampling with shortest-reasoning selection plus reasoning-length pairs | A candidate beats the baseline on the gate, thinking check included, before it is accepted |
+| [07 · Collect and gate](07_collect_and_evaluate.ipynb) | Run the effort ladder on the stock model with a per-effort generation cap, score a checkpoint on the held-out suite (single-file, coupled-module and four-stage pipeline families), compare it to the frozen baseline including the thinking budget and the designed-horizon bands, and collect verified trajectories by rejection sampling with shortest-reasoning selection plus reasoning-length pairs | A candidate beats the baseline on the gate, thinking and horizon checks included, before it is accepted |
 
 Notebook 07 is the only one that is not self-contained, and deliberately so.
 The episode loop, the collection filters and the scorecard live in
@@ -56,9 +56,11 @@ plumbing only; they are explicitly not training data for a capability run.
 
 Until a candidate is scored against the stock model on tasks it has never
 seen, training loss and a green notebook are the only signals, and neither
-says the model got better at the job. The held-out suite is eight families,
-six single-file ones in `qwen3_8_27b_code.tasks` and two multi-file ones in
-`qwen3_8_27b_code.long_horizon`, disjoint from the SFT fixtures in bug class,
+says the model got better at the job. The held-out suite is nine families:
+six single-file ones in `qwen3_8_27b_code.tasks`, and in
+`qwen3_8_27b_code.long_horizon` two coupled-module families (the medium
+band) and a four-stage pipeline (the long band, seventeen calls on the gold
+path), disjoint from the SFT fixtures in bug class,
 module and family name, each with a verifier that runs outside the workspace
 the model can read. Passing by deleting the failing test is detected rather
 than scored. The scorecard also reports reasoning tokens per turn, the share
@@ -133,15 +135,27 @@ carries the correctness-gated brevity reward for RL with fixtures. The
 levers, the gate and the order to try them are in
 [docs/thinking-budget.md](../docs/thinking-budget.md).
 
+Three things keep brevity from being bought with capability. Notebook 07
+caps generation per effort (`MAX_NEW_TOKENS_BY_EFFORT`) and runs the effort
+ladder (`RUN_EFFORT_LADDER`), which recommends the cheapest rung that keeps
+the best success and becomes the gate baseline. Notebook 04 caps the
+reasoning-length pairs at a third of the mixture and renders every pair at
+the effort it was generated at. And the gate's `task_horizon_no_worse`
+check fails any candidate whose success falls in the short, medium or long
+band, whatever the aggregate does.
+
 ## Design choices inherited from the Unsloth examples
 
 - Unsloth is imported before Transformers/TRL where model patching is needed.
-- Unsloth's own Qwen3.8-27B notebook loads the checkpoint with `FastModel`
-  and receives a processor rather than a tokenizer. The suite still calls
-  `FastLanguageModel`; notebook 00 records which loader the pinned stack
-  accepts, and every text tokenisation is passed by keyword so either object
-  works. Its other rules (no `fp16` flags, logits on the `lm_head` card) are
-  recorded in [Model and hardware](../docs/model-and-hardware.md#second-lane-kaggle-t4-x2).
+- The suite loads with `FastModel`, as Unsloth's own Qwen3.8-27B notebook
+  does, and expects a processor rather than a tokenizer back: text is
+  tokenised by keyword, and `text_tokenizer_of` reaches the text tokenizer
+  for token-level reads (end-of-turn ids, the `</think>` id, padding side).
+  Notebook 00 prints what the loader returned. The Kaggle notebook's other
+  rules (no `fp16` flags, logits on the `lm_head` card) are recorded in
+  [Model and hardware](../docs/model-and-hardware.md#second-lane-kaggle-t4-x2).
+  This switch has not yet been run on the G4; if `FastModel` refuses the
+  checkpoint under the pinned stack, notebook 00 is where it shows.
 - LoRA starts at rank 16 over the discovered language linear modules — the
   full-attention projections, the Gated DeltaNet `in_proj_*`/`out_proj` that
   three of every four layers use, and the MLP projections — with Unsloth

@@ -281,9 +281,12 @@ Use these limits as a curriculum, subject to measured VRAM:
 | Phase | Training sequence | Episode budget |
 | --- | ---: | ---: |
 | Pipeline smoke test | 4,096 | 2–4 tool calls |
-| Initial SFT | 8,192 | 2–10 tool calls |
-| Extended SFT/RL | 16,384 if profiling passes | 5–20 tool calls |
-| Long-horizon evaluation | 32K–262K inference-only bands | 20–50+ tool calls |
+| Initial SFT | 8,192 | Short, medium and long rows (3 to 17 calls); rows past the window are sliced per turn, not truncated |
+| Extended SFT/RL | 16,384 if profiling passes | 5–30 tool calls |
+| Long-horizon evaluation | 32,768 in notebooks 01 and 07; 64K–262K inference-only bands later | 20–50+ tool calls |
+
+The episode budget is a ceiling of 30 tool calls and 15 minutes at every
+stage (see the [long-horizon requirements](training-plan.md#long-horizon)).
 
 Do not pad every example to the maximum. Bucket by token length and inspect the
 full prompt-plus-completion distribution before selecting a limit. Truncating

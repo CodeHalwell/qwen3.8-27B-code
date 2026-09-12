@@ -163,10 +163,12 @@ def test_scorecard_reports_thinking_per_turn_and_horizon_bands():
     assert 0 < card["reasoning_share_of_completion"] <= 1
     assert card["completion_tokens_per_turn"] >= card["reasoning_tokens_per_turn"]
     assert card["thinking_overrun_rate"] == 0.0
-    # Six single-file tasks take three tool calls; the two multi-file tasks
-    # take seven, which is the medium band the suite previously lacked.
-    assert card["horizon_bands"] == {"medium": 2, "short": 6}
-    assert card["success_by_horizon"] == {"medium": 1.0, "short": 1.0}
+    # Six single-file tasks take three tool calls, the two coupled-module
+    # tasks take seven, and the pipeline takes seventeen: every band the
+    # gate reads is populated.
+    assert card["horizon_bands"] == {"long": 1, "medium": 2, "short": 6}
+    assert card["success_by_horizon"] == {"long": 1.0, "medium": 1.0, "short": 1.0}
+    assert card["success_by_task_horizon"] == {"long": 1.0, "medium": 1.0, "short": 1.0}
 
 
 def test_thinking_budget_gate_fails_a_candidate_that_thinks_twice_as_much():
@@ -274,6 +276,22 @@ def test_reasoning_length_pairs_prefer_less_thinking_before_the_same_action():
     assert pair["evidence"]["rejected_seed"] == 3407
     assert pair["evidence"]["ratio"] > thinking.DEFAULT_MIN_LENGTH_RATIO
     assert pair["evidence"]["hidden_verified"] is False
+    # Rendered under the effort both attempts ran at.
+    assert pair["reasoning_effort"] == "medium"
+
+
+def test_reasoning_length_pairs_never_cross_efforts():
+    """A verbose xhigh attempt and a terse low attempt at the same task are
+    two rungs of the dial, not a brevity contrast within one."""
+    task = task_from_fixture(fixtures.FAMILY_BUILDERS["bounds"](0))
+    verbose = collect([task], verbose_on({0}), attempts_per_task=1, seeds=(3407,), reasoning_effort="xhigh")
+    terse = collect([task], verbose_on({0}), attempts_per_task=1, seeds=(9176,), reasoning_effort="low")
+    assert thinking.build_reasoning_length_pairs(verbose.attempts + terse.attempts) == []
+
+    same_effort = collect([task], verbose_on({0}), attempts_per_task=2, seeds=(3407, 9176), reasoning_effort="low")
+    pairs = thinking.build_reasoning_length_pairs(same_effort.attempts)
+    assert [pair["reasoning_effort"] for pair in pairs] == ["low"]
+    assert thinking.length_pairs_report(pairs)["reasoning_effort"] == {"low": 1}
 
 
 def test_reasoning_length_pairs_walk_the_shared_action_prefix():
@@ -359,28 +377,56 @@ def test_length_pairs_satisfy_notebook_04_after_an_arrow_round_trip(tmp_path):
 
     generator = load_generator()
     notebook_04 = generator.build_04_dpo()
-    namespace = {
-        "json": json,
-        "hashlib": __import__("hashlib"),
-        "Dataset": Dataset,
-        "load_dataset": load_dataset,
-        "DEMO_MODE": False,
-        "PREFERENCE_LOCAL_JSONL": str(corpus),
-        "PREFERENCE_DATASET_ID": "unused",
-        "PREFERENCE_DATASET_REVISION": "main",
-        "hf_token": None,
-        "tokenizer": _NullRejectingTokenizer(),
-    }
-    exec(generator.TOOLS_CELL, namespace)
     cell = next(
         cell.source
         for cell in notebook_04.cells
         if cell.cell_type == "code" and "demo_preferences = Dataset.from_list" in cell.source
     )
-    exec(cell, namespace)
-    assert len(namespace["preferences"]) == 4
+
+    def load_notebook_04(max_share, length_pairs=str(corpus)):
+        namespace = {
+            "json": json,
+            "hashlib": __import__("hashlib"),
+            "Path": Path,
+            "Dataset": Dataset,
+            "load_dataset": load_dataset,
+            "DEMO_MODE": False,
+            # The execution-derived bootstrap pairs are the correctness side
+            # the length pairs must stay a minority next to.
+            "PREFERENCE_LOCAL_JSONL": str(ROOT / "data" / "preferences" / "pairs.jsonl"),
+            "LENGTH_PAIRS_LOCAL_JSONL": length_pairs,
+            "MAX_LENGTH_PAIR_SHARE": max_share,
+            "PREFERENCE_DATASET_ID": "unused",
+            "PREFERENCE_DATASET_REVISION": "main",
+            "hf_token": None,
+            "tokenizer": _NullRejectingTokenizer(),
+        }
+        exec(generator.TOOLS_CELL, namespace)
+        exec(cell, namespace)
+        return namespace
+
+    namespace = load_notebook_04(max_share=1 / 3)
+    assert namespace["PREFERENCE_MIXTURE"] == {
+        "correctness_pairs": 60, "length_pairs_kept": 4, "length_pairs_dropped": 0, "length_share": 0.062,
+    }
+    assert len(namespace["preferences"]) == 64
     assert set(namespace["preferences"].column_names) == {"prompt", "chosen", "rejected"}
-    assert len(namespace["split"]["train"]) + len(namespace["split"]["test"]) == 4
+    assert len(namespace["split"]["train"]) + len(namespace["split"]["test"]) == 64
+
+    # A tighter share drops length pairs deterministically, never correctness pairs.
+    capped = load_notebook_04(max_share=0.05)
+    assert capped["PREFERENCE_MIXTURE"]["correctness_pairs"] == 60
+    assert capped["PREFERENCE_MIXTURE"]["length_pairs_kept"] == 3
+    assert capped["PREFERENCE_MIXTURE"]["length_pairs_dropped"] == 1
+    assert len(capped["preferences"]) == 63
+    assert load_notebook_04(max_share=0.05)["PREFERENCE_MIXTURE"] == capped["PREFERENCE_MIXTURE"]
+
+    # Length pairs alone are refused: they teach brevity only.
+    with pytest.raises(ValueError, match="execution-derived pairs"):
+        namespace = load_notebook_04(max_share=1 / 3)
+        namespace["PREFERENCE_LOCAL_JSONL"] = str(corpus)
+        namespace["LENGTH_PAIRS_LOCAL_JSONL"] = ""
+        exec(cell, namespace)
 
 
 # --------------------------------------------------------------------------

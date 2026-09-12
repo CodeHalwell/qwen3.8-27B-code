@@ -81,6 +81,10 @@ def build_outcome_pairs(attempts, *, max_pairs_per_task: int = DEFAULT_MAX_OUTCO
                         "source": OUTCOME_PAIRS_VERSION,
                         "repo_family": success.family,
                         "contrast_type": f"outcome:{reason}",
+                        # Rendered under the verified side's effort; the
+                        # evidence records the other side's, which may differ
+                        # when a teacher and a student are paired.
+                        "reasoning_effort": success.reasoning_effort,
                         "prompt_messages": [dict(message) for message in success.episode.messages[:chosen_index]],
                         "chosen_message": chosen,
                         "rejected_message": rejected,
@@ -101,6 +105,8 @@ def build_outcome_pairs(attempts, *, max_pairs_per_task: int = DEFAULT_MAX_OUTCO
                             "rejected_policy": failure.policy,
                             "chosen_seed": success.seed,
                             "rejected_seed": failure.seed,
+                            "chosen_reasoning_effort": success.reasoning_effort,
+                            "rejected_reasoning_effort": failure.reasoning_effort,
                             "chosen_verdict": success.verdict.as_dict(),
                             "rejected_verdict": failure.verdict.as_dict(),
                             "rejected_termination": failure.episode.termination,
@@ -135,6 +141,11 @@ def outcome_pairs_report(pairs: list[dict], corpus_path: Path | None = None) -> 
         "families": dict(sorted(Counter(pair["repo_family"] for pair in pairs).items())),
         "contrast_types": dict(sorted(Counter(pair["contrast_type"] for pair in pairs).items())),
         "policy_pairings": dict(sorted(sides.items())),
+        "reasoning_effort": dict(sorted(Counter(pair["reasoning_effort"] for pair in pairs).items())),
+        "cross_effort_pairs": sum(
+            1 for pair in pairs
+            if pair["evidence"]["chosen_reasoning_effort"] != pair["evidence"]["rejected_reasoning_effort"]
+        ),
         "form_matched_pairs": sum(1 for pair in pairs if pair["evidence"]["form_matched"]),
         "prose_rejections": sum(1 for pair in pairs if not pair["rejected_message"].get("tool_calls")),
         "hidden_verified_pairs": sum(1 for pair in pairs if pair["evidence"]["hidden_verified"]),

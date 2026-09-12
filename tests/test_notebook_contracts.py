@@ -327,12 +327,17 @@ def test_every_model_load_is_guarded_against_silent_offload():
     load_cells = 0
     for name, notebook in notebooks.items():
         for index, cell in enumerate(notebook.cells):
-            if cell.cell_type != "code" or "FastLanguageModel.from_pretrained" not in cell.source:
+            if cell.cell_type != "code" or "FastModel.from_pretrained" not in cell.source:
                 continue
             load_cells += 1
             assert "require_free_vram(" in cell.source, f"notebook {name} cell {index}"
             assert "assert_model_fully_resident(" in cell.source, f"notebook {name} cell {index}"
     assert load_cells == 9
+    # Unsloth's own Qwen3.8 notebook loads with FastModel; the text-only
+    # loader must not creep back in through a copied cell.
+    for name, notebook in notebooks.items():
+        for cell in notebook.cells:
+            assert "FastLanguageModel" not in cell.source, name
 
     auth = generator.AUTH_AND_RUNTIME
     assert "def release_stale_gpu_state" in auth
@@ -489,7 +494,7 @@ class _FakeQwen38Model:
                 self._parameters[f"{name}.lora_A.default.weight"] = _FakeParameter(True)
 
 
-class _FakeFastLanguageModel:
+class _FakeFastModel:
     @staticmethod
     def from_pretrained(**kwargs):
         # Notebook 04 sets tokenizer.padding_side, so the stand-in must accept
@@ -497,7 +502,10 @@ class _FakeFastLanguageModel:
         return _FakeQwen38Model(), SimpleNamespace()
 
     @staticmethod
-    def get_peft_model(model, target_modules, **kwargs):
+    def get_peft_model(model, target_modules, finetune_vision_layers=True, **kwargs):
+        # The suite passes the reviewed list and switches the vision tower
+        # off in the loader's own terms as well.
+        assert finetune_vision_layers is False
         model.attach_lora(set(target_modules))
         return model
 
@@ -513,7 +521,7 @@ def run_lora_discovery(cell: str) -> dict:
     namespace = {
         "json": json,
         "torch": _FakeTorch,
-        "FastLanguageModel": _FakeFastLanguageModel,
+        "FastModel": _FakeFastModel,
         "require_free_vram": lambda *_: 90.0,
         "assert_model_fully_resident": lambda *_, **__: None,
         "MODEL_ID": "unsloth/Qwen3.8-27B",
@@ -679,5 +687,53 @@ def test_notebook_07_releases_the_baseline_before_loading_the_candidate():
     )
     assert "release_stale_gpu_state()" in candidate_cell
     assert candidate_cell.index("release_stale_gpu_state()") < candidate_cell.index(
-        "FastLanguageModel.from_pretrained"
+        "FastModel.from_pretrained"
     )
+
+
+def test_processor_aware_tokenizer_helper_is_shared():
+    """FastModel returns a processor; token-level reads go through the text tokenizer."""
+    generator = load_generator()
+    assert "def text_tokenizer_of(tokenizer)" in generator.TOOLS_CELL
+    assert "text_tokenizer_of(tokenizer).apply_chat_template(" in generator.TOOLS_CELL
+    namespace = {"json": json}
+    exec(generator.TOOLS_CELL, namespace)
+    plain = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=plain)
+    assert namespace["text_tokenizer_of"](plain) is plain
+    assert namespace["text_tokenizer_of"](processor) is plain
+
+    policy_cell = code_cell_containing(generator.build_07_collect_and_evaluate(), "def build_policy_factory")
+    assert "text_tokenizer.eos_token_id" in policy_cell
+    assert 'text_tokenizer.convert_tokens_to_ids("</think>")' in policy_cell
+    baseline_cell = code_cell_containing(generator.build_01_baseline(), "EOS_TOKEN_IDS = {")
+    assert "text_tokenizer_of(tokenizer).eos_token_id" in baseline_cell
+
+
+def test_notebook_07_caps_generation_per_effort_and_runs_the_ladder():
+    generator = load_generator()
+    notebook = generator.build_07_collect_and_evaluate()
+    config_cell = code_cell_containing(notebook, "MAX_NEW_TOKENS_BY_EFFORT")
+    namespace = {"EpisodeBudget": lambda **kwargs: kwargs}
+    for line in config_cell.splitlines():
+        if line.startswith(("MAX_", "REASONING_EFFORT", "EPISODE_BUDGET", "RUN_EFFORT_LADDER", "EFFORT_LADDER")):
+            exec(line, namespace)
+    assert set(namespace["MAX_NEW_TOKENS_BY_EFFORT"]) == {"low", "medium", "xhigh"}
+    caps = namespace["MAX_NEW_TOKENS_BY_EFFORT"]
+    assert caps["low"] < caps["medium"] < caps["xhigh"]
+    # Ten xhigh turns of reasoning must fit the window with the caps as set.
+    assert namespace["MAX_SEQUENCE_LENGTH"] >= caps["xhigh"] + 3 * caps["medium"]
+    assert namespace["EPISODE_BUDGET"] == {"tool_calls": 30, "wall_seconds": 900.0}
+    assert namespace["RUN_EFFORT_LADDER"] is False
+
+    policy_cell = code_cell_containing(notebook, "def build_policy_factory")
+    assert "max_new_tokens = MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort]" in policy_cell
+    assert "MAX_NEW_TOKENS_PER_TURN" not in policy_cell
+    assert "prompt_tokens + max_new_tokens > MAX_SEQUENCE_LENGTH" in policy_cell
+
+    ladder_cell = code_cell_containing(notebook, "RUN_EFFORT_LADDER:")
+    for effort in ("low", "medium", "xhigh"):
+        assert f'"{effort}"' in ladder_cell
+    assert "effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)" in ladder_cell
+    assert "reasoning_effort=effort" in ladder_cell
+    assert "effort_ladder.json" in ladder_cell

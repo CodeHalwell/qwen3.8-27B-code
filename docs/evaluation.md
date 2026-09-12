@@ -126,10 +126,21 @@ Evaluate by observed episode length rather than calling every repository task
 Also report prompt-plus-history token bands. A 30-call episode with tiny tool
 outputs differs materially from one carrying large compiler logs.
 
-The scorecard reports `horizon_bands` and `success_by_horizon` from the tool
-calls each episode actually made. Read the medium band before the aggregate
-whenever a change is meant to reduce thinking: brevity hurts the harder tasks
-first (see [Thinking budget](thinking-budget.md)).
+The scorecard reports two views of the bands. `horizon_bands` and
+`success_by_horizon` come from the tool calls each episode actually made and
+move with the policy: a candidate that solves a pipeline in fewer calls
+moves it down a band. `task_horizon_bands` and `success_by_task_horizon`
+come from the band each task was designed for (`AgentTask.horizon`: short
+for a single-file fix, medium for two coupled modules, long for a four-stage
+pipeline), so membership is identical on both sides of a comparison and the
+gate's `task_horizon_no_worse` check can compare the same tasks. Read the
+long band before the aggregate whenever a change is meant to reduce
+thinking: brevity hurts the harder tasks first (see
+[Thinking budget](thinking-budget.md)).
+
+Episode budgets are ceilings sized for the long band: 30 tool calls and 15
+minutes everywhere. A smaller budget does not make a suite cheaper, it
+removes the long tasks from it.
 
 ## Core scorecard
 
@@ -150,6 +161,9 @@ first (see [Thinking budget](thinking-budget.md)).
 | Reasoning tokens per turn | Tokens generated before `</think>`, per assistant turn | Lower after correctness |
 | Reasoning share | Reasoning tokens divided by generated tokens | Lower after correctness |
 | Thinking overrun rate | Episodes cut off inside a think block at the per-turn token cap | Lower |
+| Success by designed horizon | Episode success per band the task was designed for | Higher; read the long band first |
+| Peak context tokens | Largest prompt any turn was generated from | Lower after correctness |
+| Context budget rate | Episodes that ended because the window ran out | Lower |
 
 Do not optimise patch precision or efficiency ahead of correctness. Some tasks
 genuinely require broad changes.
@@ -173,8 +187,8 @@ Initial budget ceilings are:
 | Tier | Work | Maximum scheduled GPU time per candidate |
 | --- | --- | ---: |
 | Protocol | Deterministic template/tool fixtures | 0.25 hours |
-| Sentinel | 12 repository tasks, one deterministic attempt, 8-minute timeout | 1.6 hours |
-| Candidate | 24 tasks, three sampled seeds, 12-minute timeout | 14.4 hours |
+| Sentinel | 12 repository tasks, one deterministic attempt, 15-minute timeout | 3 hours |
+| Candidate | 24 tasks, three sampled seeds, 15-minute timeout | 18 hours |
 | Release | 40 tasks, three attempts, 15-minute timeout | 30 hours |
 
 These are timeout ceilings, not expected runtimes. Replace them after the pilot
@@ -209,7 +223,9 @@ candidate's results.
   a meaningful efficiency/robustness improvement.
 - Static coding aggregate: no more than 2% relative regression.
 - Regression and unsupported-success-claim rates: no worse than upstream.
-- At least one improvement appears in both medium and long episode bands.
+- No designed horizon band loses success (`task_horizon_no_worse` in
+  `evaluation.gate()`), and at least one improvement appears in the medium
+  or long band.
 - Thinking budget: reasoning tokens per turn no more than 10% above the
   baseline where both runs counted them, and no rise in the thinking-overrun
   rate (`thinking_budget` and `thinking_overrun_no_worse` in

@@ -6,12 +6,22 @@ docs/evaluation.md. Nothing there needs the agent to hold two files in mind at
 once, decide which of several failing tests points where, or make more than
 one edit before verification. These families do.
 
-Every family plants one defect in each of two modules. The second module
-imports the first, the visible tests cover both, and an integration path runs
-through both, so a fix to either file alone leaves the suite red: the agent
-has to find both causes, edit twice (or once across files) and verify. A gold
-run takes seven tool calls, the medium band; a real policy that searches,
-re-runs tests and recovers from a partial fix lands further along it.
+The two-module families plant one defect in each of two modules. The second
+module imports the first, the visible tests cover both, and an integration
+path runs through both, so a fix to either file alone leaves the suite red:
+the agent has to find both causes, edit twice (or once across files) and
+verify. A gold run takes seven tool calls, the medium band; a real policy
+that searches, re-runs tests and recovers from a partial fix lands further
+along it.
+
+The pipeline families plant one defect in each of four stages. Every stage
+has its own test file and the last stage's tests run the whole pipeline, so
+the suite goes green only when all four are fixed, and a policy that repairs
+a stage and re-runs the suite watches the failure count fall. The gold path
+(list the repository, read the four test files, then read, patch and re-run
+for each stage) is seventeen tool calls: the long band of docs/evaluation.md,
+which nothing else in the suite reached. Every task records the band it was
+designed for as ``AgentTask.horizon``.
 
 Training families are graded by their visible tests only, like the fixtures,
 and are what the collector samples from. Evaluation families carry hidden
@@ -52,9 +62,12 @@ def _task(
     imports: tuple[str, ...] = (),
     contract: str | None = None,
     regression: str | None = None,
+    horizon: str = "medium",
 ) -> AgentTask:
     if set(buggy) != set(fixed):
         raise ValueError(f"{family}: buggy and fixed file sets differ")
+    if len(tests) != len(buggy):
+        raise ValueError(f"{family}: every module needs its own test file")
     hidden: tuple[HiddenCheck, ...] = ()
     if kind == "eval":
         if contract is None or regression is None:
@@ -78,6 +91,7 @@ def _task(
         tests_path=first_test,
         reference_module=fixed[first_module],
         reference_files=dict(fixed),
+        horizon=horizon,
     )
 
 
@@ -431,14 +445,294 @@ def _family_word_stats(variant: int) -> AgentTask:
     )
 
 
+# ---------------------------------------------------------------------------
+# Long-band families: a four-stage pipeline with one defect per stage.
+
+
+def _family_readings_pipeline(variant: int) -> AgentTask:
+    rng = _rng("train", "readings_pipeline", variant)
+    records_mod = rng.choice(["records", "samples", "entries"])
+    filters_mod = rng.choice(["filters", "screening", "gating"])
+    windows_mod = rng.choice(["windows", "smoothing", "rolling"])
+    report_mod = rng.choice(["report", "digest", "brief"])
+    parse_fn = rng.choice(["parse_record", "read_record", "split_record"])
+    load_fn = rng.choice(["load", "load_records", "parse_all"])
+    usable_fn = rng.choice(["usable", "healthy", "accepted"])
+    average_fn = rng.choice(["moving_average", "rolling_mean", "window_means"])
+    group_fn = rng.choice(["sensor_values", "values_by_sensor", "grouped_values"])
+    summarise_fn = rng.choice(["summarise", "overview", "roundup"])
+    ok = rng.choice(["ok", "good", "valid"])
+    bad = rng.choice(["warn", "fault", "stale"])
+
+    # Stage 1: the value is never converted, so every later stage sums text.
+    records_header = (
+        f"def {parse_fn}(line):\n"
+        f'    """Split "sensor,value,status" into (sensor, float value, status)."""\n'
+        '    sensor, value, status = line.strip().split(",")\n'
+    )
+    records_buggy = records_header + "    return sensor, value, status\n"
+    records_fixed = records_header + "    return sensor, float(value), status\n"
+
+    # Stage 2: the status predicate is inverted, keeping the flagged readings.
+    filters_header = (
+        f"from {MODULE_DIR}.{records_mod} import {parse_fn}\n\n\n"
+        f"def {load_fn}(lines):\n"
+        f'    """Parse every line into a record."""\n'
+        f"    return [{parse_fn}(line) for line in lines]\n\n\n"
+        f"def {usable_fn}(records):\n"
+        f'    """Records whose status is "{ok}", in their original order."""\n'
+    )
+    filters_buggy = filters_header + f'    return [record for record in records if record[2] != "{ok}"]\n'
+    filters_fixed = filters_header + f'    return [record for record in records if record[2] == "{ok}"]\n'
+
+    # Stage 3: the window range stops one short, dropping the last window.
+    windows_header = (
+        f"def {average_fn}(values, size):\n"
+        f'    """Mean of every run of size consecutive values; fewer values than size gives []."""\n'
+    )
+    windows_buggy = windows_header + (
+        "    return [sum(values[start:start + size]) / size for start in range(len(values) - size)]\n"
+    )
+    windows_fixed = windows_header + (
+        "    return [sum(values[start:start + size]) / size for start in range(len(values) - size + 1)]\n"
+    )
+
+    # Stage 4: sensors come out in arrival order rather than alphabetically.
+    report_header = (
+        f"from {MODULE_DIR}.{filters_mod} import {load_fn}, {usable_fn}\n"
+        f"from {MODULE_DIR}.{windows_mod} import {average_fn}\n\n\n"
+        f"def {group_fn}(records):\n"
+        f'    """Values per sensor, with the sensors in alphabetical order."""\n'
+        "    grouped = {}\n"
+        "    for sensor, value, _ in records:\n"
+        "        grouped.setdefault(sensor, []).append(value)\n"
+    )
+    summarise_body = (
+        f"\n\ndef {summarise_fn}(lines, size):\n"
+        f'    """Moving averages per sensor over the usable readings."""\n'
+        f"    grouped = {group_fn}({usable_fn}({load_fn}(lines)))\n"
+        f"    return [(sensor, {average_fn}(values, size)) for sensor, values in grouped.items()]\n"
+    )
+    report_buggy = report_header + "    return grouped\n" + summarise_body
+    report_fixed = report_header + (
+        "    return {sensor: grouped[sensor] for sensor in sorted(grouped)}\n"
+    ) + summarise_body
+
+    tests = {
+        f"{TESTS_DIR}/test_{records_mod}.py": (
+            f"from {MODULE_DIR}.{records_mod} import {parse_fn}\n\n\n"
+            "def test_value_is_numeric():\n"
+            f'    assert {parse_fn}("a,1.5,{ok}") == ("a", 1.5, "{ok}")\n\n\n'
+            "def test_integer_text_becomes_a_float():\n"
+            f'    assert {parse_fn}("b,2,{bad}") == ("b", 2.0, "{bad}")\n'
+        ),
+        f"{TESTS_DIR}/test_{filters_mod}.py": (
+            f"from {MODULE_DIR}.{filters_mod} import {load_fn}, {usable_fn}\n\n\n"
+            "def test_only_ok_records_are_usable():\n"
+            f'    assert {usable_fn}([("a", 1.0, "{ok}"), ("b", 2.0, "{bad}")]) == [("a", 1.0, "{ok}")]\n\n\n'
+            "def test_load_parses_values():\n"
+            f'    assert {load_fn}(["a,1,{ok}"]) == [("a", 1.0, "{ok}")]\n'
+        ),
+        f"{TESTS_DIR}/test_{windows_mod}.py": (
+            f"from {MODULE_DIR}.{windows_mod} import {average_fn}\n\n\n"
+            "def test_every_window_is_averaged():\n"
+            f"    assert {average_fn}([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5]\n\n\n"
+            "def test_exactly_one_window():\n"
+            f"    assert {average_fn}([2, 4], 2) == [3.0]\n\n\n"
+            "def test_too_few_values_gives_nothing():\n"
+            f"    assert {average_fn}([1, 2], 3) == []\n"
+        ),
+        f"{TESTS_DIR}/test_{report_mod}.py": (
+            f"from {MODULE_DIR}.{report_mod} import {group_fn}, {summarise_fn}\n\n\n"
+            "def test_sensors_are_alphabetical():\n"
+            f'    assert list({group_fn}([("b", 1.0, "{ok}"), ("a", 2.0, "{ok}")])) == ["a", "b"]\n\n\n'
+            "def test_summary_runs_the_whole_pipeline():\n"
+            f'    lines = ["b,2,{ok}", "a,1,{ok}", "a,3,{ok}", "a,9,{bad}"]\n'
+            f'    assert {summarise_fn}(lines, 2) == [("a", [2.0]), ("b", [])]\n'
+        ),
+    }
+    request = rng.choice([
+        f"{summarise_fn}() is wrong from end to end: values come back as text, flagged readings are kept, "
+        "the last window is dropped and sensors come out in arrival order. Work through the pipeline a stage "
+        "at a time, fix each minimally and re-run the unit tests after every fix until the suite is green.",
+        f"Four things are broken between {parse_fn}() and {summarise_fn}(). Find each stage's defect, patch "
+        "it and verify with the unit tests before moving on to the next stage.",
+    ])
+    return _task(
+        "train", "readings_pipeline", variant, rng, request,
+        buggy={
+            f"{MODULE_DIR}/{records_mod}.py": records_buggy,
+            f"{MODULE_DIR}/{filters_mod}.py": filters_buggy,
+            f"{MODULE_DIR}/{windows_mod}.py": windows_buggy,
+            f"{MODULE_DIR}/{report_mod}.py": report_buggy,
+        },
+        fixed={
+            f"{MODULE_DIR}/{records_mod}.py": records_fixed,
+            f"{MODULE_DIR}/{filters_mod}.py": filters_fixed,
+            f"{MODULE_DIR}/{windows_mod}.py": windows_fixed,
+            f"{MODULE_DIR}/{report_mod}.py": report_fixed,
+        },
+        tests=tests,
+        horizon="long",
+    )
+
+
+def _family_invoice_pipeline(variant: int) -> AgentTask:
+    rng = _rng("eval", "invoice_pipeline", variant)
+    discount_mod = rng.choice(["discounts", "markdowns", "rebates"])
+    tax_mod = rng.choice(["tax", "vat", "levies"])
+    group_mod = rng.choice(["grouping", "accounts", "customers"])
+    statement_mod = rng.choice(["statement", "billing", "invoicing"])
+    discount_fn = rng.choice(["apply_discount", "discounted", "less_discount"])
+    vat_fn = rng.choice(["add_vat", "with_vat", "plus_vat"])
+    totals_fn = rng.choice(["totals_by_customer", "customer_totals", "sum_by_customer"])
+    net_fn = rng.choice(["net_total", "amount_due", "payable"])
+    statement_fn = rng.choice(["statement", "bill_run", "invoices"])
+
+    # Stage 1: the percentage is subtracted as pence.
+    discount_header = (
+        f"def {discount_fn}(pence, percent):\n"
+        f'    """Reduce pence by percent, rounding the discount down to whole pence."""\n'
+    )
+    discount_buggy = discount_header + "    return pence - percent\n"
+    discount_fixed = discount_header + "    return pence - pence * percent // 100\n"
+
+    # Stage 2: fractional pence are truncated instead of rounded half up.
+    tax_header = (
+        f"def {vat_fn}(pence, rate):\n"
+        f'    """Add VAT at rate percent, rounding half up to whole pence."""\n'
+    )
+    tax_buggy = tax_header + "    return int(pence * (100 + rate) / 100)\n"
+    tax_fixed = tax_header + "    return (pence * (100 + rate) + 50) // 100\n"
+
+    # Stage 3: a repeat customer's earlier lines are overwritten, not summed.
+    group_header = (
+        f"def {totals_fn}(rows):\n"
+        f'    """Sum the pence of every (customer, pence) row per customer, customers in alphabetical order."""\n'
+        "    totals = {}\n"
+        "    for customer, pence in rows:\n"
+    )
+    group_buggy = group_header + "        totals[customer] = pence\n    return dict(sorted(totals.items()))\n"
+    group_fixed = group_header + (
+        "        totals[customer] = totals.get(customer, 0) + pence\n"
+        "    return dict(sorted(totals.items()))\n"
+    )
+
+    # Stage 4: customers owing nothing still appear on the statement.
+    statement_header = (
+        f"from {MODULE_DIR}.{discount_mod} import {discount_fn}\n"
+        f"from {MODULE_DIR}.{group_mod} import {totals_fn}\n"
+        f"from {MODULE_DIR}.{tax_mod} import {vat_fn}\n\n\n"
+        f"def {net_fn}(pence, discount, vat):\n"
+        f'    """Discount first, then VAT on the discounted amount."""\n'
+        f"    return {vat_fn}({discount_fn}(pence, discount), vat)\n\n\n"
+        f"def {statement_fn}(rows, discount, vat):\n"
+        f'    """(customer, net pence) per customer; customers owing nothing are omitted."""\n'
+        f"    totals = {totals_fn}(rows)\n"
+    )
+    statement_buggy = statement_header + (
+        f"    return [(customer, {net_fn}(total, discount, vat)) for customer, total in totals.items()]\n"
+    )
+    statement_fixed = statement_header + (
+        f"    due = [(customer, {net_fn}(total, discount, vat)) for customer, total in totals.items()]\n"
+        "    return [(customer, pence) for customer, pence in due if pence]\n"
+    )
+
+    tests = {
+        f"{TESTS_DIR}/test_{discount_mod}.py": (
+            f"from {MODULE_DIR}.{discount_mod} import {discount_fn}\n\n\n"
+            "def test_percent_is_a_percentage():\n"
+            f"    assert {discount_fn}(1000, 10) == 900\n\n\n"
+            "def test_no_discount_leaves_the_amount():\n"
+            f"    assert {discount_fn}(999, 0) == 999\n"
+        ),
+        f"{TESTS_DIR}/test_{tax_mod}.py": (
+            f"from {MODULE_DIR}.{tax_mod} import {vat_fn}\n\n\n"
+            "def test_fractional_pence_round_half_up():\n"
+            f"    assert {vat_fn}(1003, 20) == 1204\n\n\n"
+            "def test_exact_amount():\n"
+            f"    assert {vat_fn}(1000, 20) == 1200\n"
+        ),
+        f"{TESTS_DIR}/test_{group_mod}.py": (
+            f"from {MODULE_DIR}.{group_mod} import {totals_fn}\n\n\n"
+            "def test_repeat_customers_accumulate():\n"
+            f'    assert {totals_fn}([("ann", 100), ("ann", 50)]) == {{"ann": 150}}\n\n\n'
+            "def test_customers_are_alphabetical():\n"
+            f'    assert list({totals_fn}([("bo", 1), ("al", 2)])) == ["al", "bo"]\n'
+        ),
+        f"{TESTS_DIR}/test_{statement_mod}.py": (
+            f"from {MODULE_DIR}.{statement_mod} import {net_fn}, {statement_fn}\n\n\n"
+            "def test_nothing_owed_is_omitted():\n"
+            f'    assert {statement_fn}([("zed", 0)], 0, 0) == []\n\n\n'
+            "def test_statement_runs_the_whole_pipeline():\n"
+            f'    rows = [("ann", 500), ("ann", 503), ("bo", 0)]\n'
+            f'    assert {statement_fn}(rows, 10, 20) == [("ann", 1084)]\n'
+        ),
+    }
+    contract = f'''
+    assert {discount_fn}(250, 25) == 188
+    assert {discount_fn}(0, 30) == 0
+    assert {discount_fn}(10, 5) == 10
+    assert {vat_fn}(999, 20) == 1199
+    assert {vat_fn}(1, 20) == 1
+    assert {vat_fn}(5, 20) == 6
+    assert {totals_fn}([]) == {{}}
+    assert {totals_fn}([("b", 1), ("a", 2), ("b", 3)]) == {{"a": 2, "b": 4}}
+    assert {net_fn}(1003, 10, 20) == 1084
+    assert {statement_fn}([("x", 100), ("y", 0), ("x", 100)], 0, 0) == [("x", 200)]
+    assert {statement_fn}([("q", 200)], 100, 20) == []
+    '''
+    regression = f'''
+    assert {discount_fn}(1000, 0) == 1000
+    assert {vat_fn}(1000, 20) == 1200
+    assert {vat_fn}(0, 20) == 0
+    assert {totals_fn}([("a", 5)]) == {{"a": 5}}
+    assert {statement_fn}([("a", 1000)], 0, 20) == [("a", 1200)]
+    '''
+    request = rng.choice([
+        f"{statement_fn}() bills the wrong amounts: discounts are taken as pence rather than percent, VAT "
+        "truncates, repeat customers lose their earlier lines and customers owing nothing still appear. Repair "
+        "the pipeline a stage at a time, re-running the unit tests after each fix, until the suite is green.",
+        f"Every stage between {discount_fn}() and {statement_fn}() has a defect. Find each one, make the "
+        "minimal fix and verify with the unit tests before moving on.",
+    ])
+    return _task(
+        "eval", "invoice_pipeline", variant, rng, request,
+        buggy={
+            f"{MODULE_DIR}/{discount_mod}.py": discount_buggy,
+            f"{MODULE_DIR}/{tax_mod}.py": tax_buggy,
+            f"{MODULE_DIR}/{group_mod}.py": group_buggy,
+            f"{MODULE_DIR}/{statement_mod}.py": statement_buggy,
+        },
+        fixed={
+            f"{MODULE_DIR}/{discount_mod}.py": discount_fixed,
+            f"{MODULE_DIR}/{tax_mod}.py": tax_fixed,
+            f"{MODULE_DIR}/{group_mod}.py": group_fixed,
+            f"{MODULE_DIR}/{statement_mod}.py": statement_fixed,
+        },
+        tests=tests,
+        imports=(
+            f"from {MODULE_DIR}.{discount_mod} import {discount_fn}",
+            f"from {MODULE_DIR}.{tax_mod} import {vat_fn}",
+            f"from {MODULE_DIR}.{group_mod} import {totals_fn}",
+            f"from {MODULE_DIR}.{statement_mod} import {net_fn}, {statement_fn}",
+        ),
+        contract=contract,
+        regression=regression,
+        horizon="long",
+    )
+
+
 TRAINING_FAMILY_BUILDERS = {
     "quantity_pipeline": _family_quantity_pipeline,
     "inventory": _family_inventory,
+    "readings_pipeline": _family_readings_pipeline,
 }
 
 EVALUATION_FAMILY_BUILDERS = {
     "ledger": _family_ledger,
     "word_stats": _family_word_stats,
+    "invoice_pipeline": _family_invoice_pipeline,
 }
 
 TRAINING_VARIANTS_PER_FAMILY = 2

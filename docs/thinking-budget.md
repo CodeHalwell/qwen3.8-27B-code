@@ -52,6 +52,7 @@ from [Evaluation](evaluation.md):
 | --- | --- | --- |
 | `thinking_budget` | Candidate reasoning tokens per turn ≤ baseline × (1 + growth), default growth 10% | Evaluated only when both policies counted tokens; otherwise reported as *not measured* and passed, so a scripted or older report cannot fail a run it could not measure |
 | `thinking_overrun_no_worse` | Overrun rate did not increase | Always measurable: it comes from the termination reason |
+| `task_horizon_no_worse` | Success did not fall in any band the tasks were designed for | The long band is where brevity fails first; membership is per task, so the check compares the same tasks on both sides |
 
 The tolerance is a policy setting, frozen before a candidate's results are
 seen, like every other threshold:
@@ -86,8 +87,27 @@ Two template facts shape the ladder. `medium` renders no instruction at all
 (only `low` and `xhigh` inject one), so the `medium` rung is the model's
 uninstructed behaviour, and `high` is an alias for `xhigh`, not a fourth
 rung. And reasoning counts against the per-turn generation cap, so each
-rung needs its own cap set above that rung's p95 reasoning length;
-otherwise the `xhigh` rung reports overruns, not effort.
+rung has its own cap (`MAX_NEW_TOKENS_BY_EFFORT` in notebook 07), set
+above that rung's p95 reasoning length; otherwise the `xhigh` rung reports
+overruns, not effort.
+
+`evaluation.effort_ladder()` turns the three reports into a decision: the
+recommended rung is the one that thinks least among those whose success is
+within a frozen tolerance of the best, ties going to the lower overrun
+rate. Notebook 07 runs it with `RUN_EFFORT_LADDER`, and from the command
+line:
+
+```bash
+uv run --group dev python scripts/evaluate_agent.py ladder \
+    low=reports/ladder_low.json medium=reports/ladder_medium.json \
+    xhigh=reports/ladder_xhigh.json --success-tolerance 0.0
+```
+
+The recommended rung is the deployment default and the baseline report for
+every later gate, so thinking less is measured from the cheapest setting
+the stock model already supports. Read `success_by_task_horizon` in the
+ladder before the aggregate: a rung that holds the short tasks and loses
+the pipeline is not a cheaper rung.
 
 The corpus keeps the effort each row was generated at, and the collector
 records the effort it ran at, so training preserves the dial rather than
@@ -139,6 +159,11 @@ are identical, the token-level context is not. And these pairs teach brevity
 only: keep them a minority of the DPO mixture (no more than roughly a third)
 next to the execution-derived correctness pairs in `data/preferences`, or the
 preference stage learns "shorter" more strongly than it learns "right".
+Notebook 04 enforces that cap (`MAX_LENGTH_PAIR_SHARE`), refuses length
+pairs that arrive with no correctness pairs beside them, and renders each
+pair at the effort it was generated at. Pairs are only ever built between
+attempts at the same effort: a verbose `xhigh` attempt against a terse
+`low` one is two rungs of the dial, not a brevity contrast within one.
 
 ### 4. A correctness-gated brevity term (RL)
 
@@ -182,12 +207,22 @@ project is optimising for.
 
 The expected failure mode of any brevity lever is that it hurts the harder
 tasks first: a model taught to think less on three-call fixes may stop
-inspecting enough on seven-call multi-file ones. The held-out suite now
-carries two multi-file families (`qwen3_8_27b_code.long_horizon`) that land
-in the medium band, and the scorecard reports `success_by_horizon`. Read the
-medium band before the aggregate: a brevity change that holds the aggregate
-but drops the medium band has been paid for with exactly the capability
-this project exists to build.
+inspecting enough on seven-call multi-file ones, or stop re-running the
+suite on a seventeen-call pipeline. The held-out suite carries two
+coupled-module families in the medium band and a four-stage pipeline in
+the long band (`qwen3_8_27b_code.long_horizon`), and the scorecard reports
+success per band the tasks were designed for (`success_by_task_horizon`)
+next to the band by calls made. The gate's `task_horizon_no_worse` fails a
+candidate whose success falls in any designed band: a brevity change that
+holds the aggregate but drops the long band has been paid for with exactly
+the capability this project exists to build.
+
+Thinking is also a context cost on long episodes. Every think block after
+the request stays in the prompt for the rest of the episode, so the
+reasoning budget per turn multiplies by the number of turns before it
+reaches the window. The scorecard's `peak_prompt_tokens_max` and
+`context_budget_rate` show when that happens; less reasoning per turn is
+the first lever, and it is a long-horizon lever as much as a cost one.
 
 ## Experiment order
 
@@ -198,13 +233,14 @@ this project exists to build.
 2. **Collection with shortest-reasoning selection**, then SFT, then the gate
    with the thinking check at the frozen tolerance.
 3. **DPO** on the execution-derived pairs plus a minority of length pairs
-   from the collection; gate again, reading the medium band.
+   from the collection; gate again, reading the medium and long bands.
 4. **RL brevity term** once the trainer path is available, with the fixtures
    in notebook 05 as the contract.
 
-Stop and roll back when `thinking_overrun_rate` rises, when the medium band
-drops while the short band holds, or when the thinking check passes only
-because success fell.
+Stop and roll back when `thinking_overrun_rate` rises, when any designed
+band drops while the aggregate holds (`task_horizon_no_worse`), when
+`context_budget_rate` rises, or when the thinking check passes only because
+success fell.
 
 ## References
 
