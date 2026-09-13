@@ -56,7 +56,7 @@ three notebooks in order, each one a Run all with nothing to edit:
 
 | Step | Notebook | What it does as shipped |
 |---|---|---|
-| 1 | 02 | Clones this repository, publishes the bootstrap corpus privately |
+| 1 | 02 | Clones this repository, streams and converts the public sources (resolved Open-SWE-Traces windows, verified OpenCodeInstruct answers, OpenCodeReasoning), adds the bootstrap corpus and publishes the lot privately |
 | 2 | 03 | Trains the adapter for two epochs, pushes it, then publishes the merged SFT checkpoint (about 55 GB; one copy kept) |
 | 3 | 04 | Trains the DPO adapter on the merged SFT checkpoint for two epochs and pushes it |
 

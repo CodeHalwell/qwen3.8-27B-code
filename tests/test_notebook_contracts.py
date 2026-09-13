@@ -1170,3 +1170,22 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     ):
         for cell in build().cells:
             assert "REPLACE_WITH_" not in cell.source, name
+
+
+def test_notebook_02_streams_the_public_sources_into_the_corpus():
+    generator = load_generator()
+    config_cell = code_cell_containing(generator.build_02_data(), "PUBLIC_SOURCES = {")
+    assert "from qwen3_8_27b_code.public_sources import" in config_cell
+    assert config_cell.index('sys.path.insert(0, str(REPO_DIR / "src"))') < config_cell.index("from qwen3_8_27b_code.public_sources")
+    for name in ("SOURCE_OPEN_SWE: 800", "SOURCE_OPEN_CODE_INSTRUCT: 1_500", "SOURCE_OPEN_CODE_REASONING: 800"):
+        assert name in config_cell, name
+    assert "PUBLIC_TOKEN_BUDGET = 6_000" in config_cell
+    load_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
+    assert "collect_public_rows(" in load_cell
+    assert "count=count_tokens, token=hf_token" in load_cell
+    # One Dataset from plain rows, so Arrow infers one schema across sources.
+    assert "raw_dataset = Dataset.from_list(rows)" in load_cell
+    assert "concatenate_datasets" not in load_cell
+    # The windowed rows fit the training window with the rendered overhead.
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    assert "MAX_SEQ_LENGTH = 8_192" in sft_config

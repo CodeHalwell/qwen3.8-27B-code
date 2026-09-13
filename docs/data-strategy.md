@@ -157,6 +157,18 @@ Classify each audited source row into one of four lanes:
 | Non-agentic | Use code/reasoning content without tool-call supervision |
 | Reject | Drop rows that cannot be licensed, resolved, replayed or decontaminated |
 
+`qwen3_8_27b_code.public_sources` implements these lanes for three of the
+sources above, and notebook 02 streams them by default. Open-SWE-Traces
+trajectories that resolved enter the native-compatible lane with their single
+`bash` tool mapped onto this harness's `shell` tool, which has the same
+meaning (run one command), and long trajectories are cut into head and tail
+windows that fit the training context; the observations come from the
+original SWE-rebench environments, not from a replay here, and the gate in
+notebook 07 is what measures whether that supervision transfers.
+OpenCodeInstruct answers whose unit tests all passed and OpenCodeReasoning
+answers enter the non-agentic lane. Nemotron-SFT-SWE-v3 mixes several
+harnesses with different tool surfaces and has no converter yet.
+
 Do not rename a third-party `bash` call to `run_tests`, split a shell transcript
 into invented semantic calls or fabricate observations. That produces fluent
 but false supervision.

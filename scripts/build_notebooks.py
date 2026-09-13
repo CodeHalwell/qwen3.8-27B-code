@@ -1173,7 +1173,7 @@ def build_02_data():
             code(
                 r"""
                 from collections import Counter
-                from datasets import Dataset, concatenate_datasets, load_dataset
+                from datasets import Dataset, load_dataset
                 import numpy as np
                 import subprocess
 
@@ -1188,6 +1188,30 @@ def build_02_data():
                 if not REPO_DIR.exists():
                     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
                 SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")
+                if str(REPO_DIR / "src") not in sys.path:
+                    sys.path.insert(0, str(REPO_DIR / "src"))
+                from qwen3_8_27b_code.public_sources import (
+                    SOURCE_OPEN_CODE_INSTRUCT,
+                    SOURCE_OPEN_CODE_REASONING,
+                    SOURCE_OPEN_SWE,
+                    collect_public_rows,
+                )
+
+                # Public sources, streamed from the Hub and converted to the
+                # native schema (docs/data-strategy.md, public seed sources):
+                # resolved Open-SWE-Traces trajectories windowed to the budget
+                # with bash mapped onto the shell tool, OpenCodeInstruct answers
+                # whose unit tests all passed, and OpenCodeReasoning with the
+                # think block moved into the reasoning field. The value is the
+                # number of native rows each source contributes; 0 skips it.
+                PUBLIC_SOURCES = {
+                    SOURCE_OPEN_SWE: 800,
+                    SOURCE_OPEN_CODE_INSTRUCT: 1_500,
+                    SOURCE_OPEN_CODE_REASONING: 800,
+                }
+                # Content tokens per row; the rendered prompt and tool schema add
+                # about 1,500, so this fits notebook 03's 8,192 window.
+                PUBLIC_TOKEN_BUDGET = 6_000
                 OUTPUT_DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 # True runs the two-row format fixture as a plumbing check and
                 # refuses to publish it. The default is the real corpus.
@@ -1248,16 +1272,33 @@ def build_02_data():
                     },
                 ]
 
+                def read_jsonl(path):
+                    with open(path) as handle:
+                        return [json.loads(line) for line in handle if line.strip()]
+
+                def count_tokens(text):
+                    return len(tokenizer(text=text, add_special_tokens=False)["input_ids"])
+
                 if DEMO_MODE:
                     raw_dataset = Dataset.from_list(demo_rows)
                 else:
-                    parts = []
+                    # Plain rows from every source, then one Dataset: building it
+                    # from the whole list lets Arrow infer one schema across rows
+                    # whose nested tool-call arguments differ.
+                    rows = []
                     if SOURCE_LOCAL_JSONL:
-                        parts.append(load_dataset("json", data_files=SOURCE_LOCAL_JSONL, split="train"))
-                    parts.extend(load_dataset(dataset_id, split="train") for dataset_id in SOURCE_DATASET_IDS)
-                    if not parts:
-                        raise ValueError("Set SOURCE_LOCAL_JSONL or SOURCE_DATASET_IDS to native-schema sources.")
-                    raw_dataset = concatenate_datasets(parts) if len(parts) > 1 else parts[0]
+                        rows += read_jsonl(SOURCE_LOCAL_JSONL)
+                    for dataset_id in SOURCE_DATASET_IDS:
+                        rows += load_dataset(dataset_id, split="train").to_list()
+                    if any(PUBLIC_SOURCES.values()):
+                        public_rows, public_report = collect_public_rows(
+                            PUBLIC_SOURCES, PUBLIC_TOKEN_BUDGET, count=count_tokens, token=hf_token
+                        )
+                        print(json.dumps(public_report, indent=2))
+                        rows += public_rows
+                    if not rows:
+                        raise ValueError("Set SOURCE_LOCAL_JSONL, SOURCE_DATASET_IDS or PUBLIC_SOURCES to native-schema sources.")
+                    raw_dataset = Dataset.from_list(rows)
 
                 print(raw_dataset)
                 print(raw_dataset[0])
@@ -1521,7 +1562,7 @@ def build_03_sft():
                 # on the Hub. Published at the end of training, about 55 GB, with
                 # the repo history squashed so only the latest merge is stored.
                 MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-merged"
-                MAX_SEQ_LENGTH = 4_096       # the longest bootstrap row renders to 1,780 tokens; 8_192 after this run
+                MAX_SEQ_LENGTH = 8_192       # public rows are windowed to fit this; the 4k run measured the headroom
                 # Two passes over whatever the dataset holds; the trainer counts
                 # the updates. A positive MAX_STEPS would override the epochs.
                 NUM_TRAIN_EPOCHS = 2
