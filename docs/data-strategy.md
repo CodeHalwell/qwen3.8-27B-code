@@ -161,13 +161,19 @@ Classify each audited source row into one of four lanes:
 sources above, and notebook 02 streams them by default. Open-SWE-Traces
 trajectories that resolved enter the native-compatible lane with their single
 `bash` tool mapped onto this harness's `shell` tool, which has the same
-meaning (run one command), and long trajectories are cut into head and tail
-windows that fit the training context; the observations come from the
-original SWE-rebench environments, not from a replay here, and the gate in
-notebook 07 is what measures whether that supervision transfers.
-OpenCodeInstruct answers whose unit tests all passed and OpenCodeReasoning
-answers enter the non-agentic lane. Nemotron-SFT-SWE-v3 mixes several
-harnesses with different tool surfaces and has no converter yet.
+meaning (run one command) and the same observation shape (a non-zero exit
+code, then bounded output); a trajectory longer than the training context
+is cut to a head window, a faithful prefix, and never to a tail, whose test
+results would vouch for edits the transcript leaves out. The observations
+come from the original SWE-rebench environments, not from a replay here,
+and the gate in notebook 07 is what measures whether that supervision
+transfers. OpenCodeInstruct answers whose unit tests all passed enter the
+non-agentic lane as verified; OpenCodeReasoning answers enter it as the
+corpus's one unverified slice, labelled so (`runner: none`), which the
+validator admits to the non-agentic lane only. Each source is streamed at a
+pinned commit, recorded with the corpus in `public_sources.json`.
+Nemotron-SFT-SWE-v3 mixes several harnesses with different tool surfaces
+and has no converter yet.
 
 Do not rename a third-party `bash` call to `run_tests`, split a shell transcript
 into invented semantic calls or fabricate observations. That produces fluent

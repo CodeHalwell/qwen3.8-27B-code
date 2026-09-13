@@ -945,7 +945,28 @@ def build_01_baseline():
                         )
                         return f"exit={result.returncode}\n{(result.stdout + result.stderr)[-12000:]}"
                     if name == "shell":
-                        return "shell is disabled by the harness allow-list; use the semantic tools"
+                        # The same scrubbed environment, working directory,
+                        # time limit and bounded observation as run_tests;
+                        # the package twin is RepoHarness._shell.
+                        try:
+                            result = subprocess.run(
+                                ["bash", "-c", arguments["command"]],
+                                cwd=root,
+                                env=TASK_ENV,
+                                text=True,
+                                errors="replace",
+                                capture_output=True,
+                                timeout=120,
+                            )
+                        except subprocess.TimeoutExpired:
+                            return "[timed out after 120s]"
+                        observation = ("" if result.returncode == 0 else f"[exit code {result.returncode}]\n")
+                        observation += result.stdout + result.stderr
+                        marker = "\n... [output trimmed] ...\n"
+                        if len(observation) > 12_000:
+                            keep = (12_000 - len(marker)) // 2
+                            observation = observation[:keep] + marker + observation[-keep:]
+                        return observation
                     return f"unknown tool: {name}"
                 """
             ),
@@ -1197,13 +1218,15 @@ def build_02_data():
                     collect_public_rows,
                 )
 
-                # Public sources, streamed from the Hub and converted to the
-                # native schema (docs/data-strategy.md, public seed sources):
-                # resolved Open-SWE-Traces trajectories windowed to the budget
-                # with bash mapped onto the shell tool, OpenCodeInstruct answers
-                # whose unit tests all passed, and OpenCodeReasoning with the
-                # think block moved into the reasoning field. The value is the
-                # number of native rows each source contributes; 0 skips it.
+                # Public sources, streamed from the Hub at pinned commits and
+                # converted to the native schema (docs/data-strategy.md, public
+                # seed sources): resolved Open-SWE-Traces trajectories cut to
+                # the budget with bash mapped onto the shell tool,
+                # OpenCodeInstruct answers whose unit tests all passed, and
+                # OpenCodeReasoning answers, which nothing executed: they are
+                # the corpus's one unverified slice, labelled as such. The
+                # value is the number of native rows each source contributes;
+                # 0 skips it.
                 PUBLIC_SOURCES = {
                     SOURCE_OPEN_SWE: 800,
                     SOURCE_OPEN_CODE_INSTRUCT: 1_500,
@@ -1373,7 +1396,16 @@ def build_02_data():
                         errors.append("agentic trajectory has no tool call")
                     elif lane == "non_agentic" and saw_tool_call:
                         errors.append("non-agentic row supervises a tool call; label it agentic")
-                    if not row.get("verification", {}).get("all_required_tests_pass", False):
+                    # Verified means the row says so. The one exception is
+                    # an answer nothing executed (runner "none"), admitted to
+                    # the non-agentic lane with that stated; never to the
+                    # agentic lane, whose observations vouch for outcomes.
+                    verification = row.get("verification") or {}
+                    verified = verification.get("all_required_tests_pass")
+                    unverified_answer = (
+                        lane == "non_agentic" and verified is None and verification.get("runner") == "none"
+                    )
+                    if verified is not True and not unverified_answer:
                         errors.append("trajectory is not execution-verified")
                     return errors
 
@@ -1494,6 +1526,20 @@ def build_02_data():
                     require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
+                    if globals().get("public_report"):
+                        # Which public commits and how many rows of each went
+                        # in, kept beside the corpus so it can be rebuilt.
+                        from huggingface_hub import HfApi
+
+                        report_path = RUN_ROOT / "public_sources.json"
+                        report_path.write_text(json.dumps(public_report, indent=2))
+                        HfApi(token=hf_token).upload_file(
+                            path_or_fileobj=str(report_path),
+                            path_in_repo="public_sources.json",
+                            repo_id=OUTPUT_DATASET_ID,
+                            repo_type="dataset",
+                            commit_message="public source commits and row counts",
+                        )
                 else:
                     print("Demo mode: the fixture stays local." if DEMO_MODE else "PUSH_DATASET is off; nothing published.")
                 """
@@ -1994,7 +2040,12 @@ def build_03_sft():
                     if PUSH_MERGED_SFT:
                         # The merged weights notebook 04 starts from. The marker
                         # goes up after the weights, and the history is squashed
-                        # so the repo holds one copy, not one per run.
+                        # so the repo holds one copy (about 55 GB), not one per
+                        # run. That discards the parent of any DPO adapter
+                        # trained on the previous merge, which is why this run
+                        # removed that adapter's completion marker when training
+                        # started: nothing downstream treats it as current, and
+                        # its manifest keeps the commit it was trained on.
                         from huggingface_hub import HfApi
 
                         hub = HfApi(token=hf_token)
@@ -2114,6 +2165,11 @@ def build_04_dpo():
                 LEARNING_RATE = 5e-6
                 DPO_BETA = 0.1
 
+                # The commit the merged checkpoint resolves to, recorded with
+                # this adapter: notebook 03 keeps one merge on the Hub, so a
+                # later SFT run replaces this parent and, at the same time,
+                # removes this adapter's completion marker.
+                MERGED_SFT_COMMIT = None
                 if RUN_TRAINING and not DEMO_MODE:
                     from huggingface_hub import HfApi
 
@@ -2128,6 +2184,7 @@ def build_04_dpo():
                             f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. Notebook 03 "
                             "publishes it at the end of training; run notebook 03 to completion first."
                         )
+                    MERGED_SFT_COMMIT = api.repo_info(MERGED_SFT_MODEL_ID, revision=MERGED_SFT_REVISION).sha
                 # The trainer creates the Hub repo when it is built, so an
                 # existing public repo is caught here, before that happens.
                 if PUSH_ADAPTER:
@@ -2138,6 +2195,7 @@ def build_04_dpo():
                     "objective": "agentic-coding",
                     "model_id": MERGED_SFT_MODEL_ID,
                     "model_revision": MERGED_SFT_REVISION,
+                    "model_commit": MERGED_SFT_COMMIT,
                     "sft_adapter_id": SFT_ADAPTER_ID,
                     "sft_adapter_revision": SFT_ADAPTER_REVISION,
                     # Filled in by the loading cell from what is actually read:

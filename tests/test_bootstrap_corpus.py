@@ -139,7 +139,8 @@ def test_package_harness_matches_notebook_executor(tmp_path):
         ("search", {"query": task.search_query}),
         ("search", {"query": "["}),
         ("apply_patch", {"patch": trajectories.unified_patch(task.module_path, task.buggy_module, task.fixed_module)}),
-        ("shell", {"command": "rm -rf /"}),
+        ("shell", {"command": "printf hello; printf oops >&2; exit 3"}),
+        ("shell", {"command": "printf ok"}),
     ]
     for name, arguments in calls:
         assert namespace["execute_tool"](pilot, name, arguments) == package.execute(name, arguments), name

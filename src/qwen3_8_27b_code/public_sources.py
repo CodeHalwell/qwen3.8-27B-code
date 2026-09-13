@@ -23,28 +23,47 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator
 import json
 import re
+from collections import Counter
 
+from .harness import TRUNCATION_MARKER as TRUNCATION_MARKER  # re-exported for callers
+from .harness import format_command_observation, trim_output
 from .schema import TOOL_SCHEMA_JSON, TOOL_SCHEMA_VERSION, TOOLS
 
-CONVERTER_VERSION = "public-sources-v1"
+CONVERTER_VERSION = "public-sources-v2"
 TokenCounter = Callable[[str], int]
 
 # Roughly one token per 3.6 characters of mixed code and prose; used only
 # when no tokenizer is supplied.
 CHARS_PER_TOKEN = 3.6
-# A tool observation longer than this keeps its head and tail.
+# A tool observation longer than this keeps its head and tail, in the
+# executor's own format (harness.format_command_observation) at a training
+# budget rather than the executor's bound.
 MAX_TOOL_OUTPUT_CHARS = 3_000
-TRUNCATION_MARKER = "\n... [output trimmed] ...\n"
 
 SOURCE_OPEN_SWE = "nvidia/Open-SWE-Traces"
+# mini-swe-agent ends an episode with this command; its observation is the
+# end of the episode and is never recorded.
+SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 SOURCE_OPEN_CODE_INSTRUCT = "nvidia/OpenCodeInstruct"
 SOURCE_OPEN_CODE_REASONING = "nvidia/OpenCodeReasoning"
 
-# How each source is loaded: the ``datasets`` config and split to stream.
+# How each source is loaded: the ``datasets`` config and split to stream,
+# at a pinned commit so one configuration always yields one corpus. The
+# commit is recorded with the corpus (notebook 02 uploads the report as
+# public_sources.json beside the dataset).
 SOURCE_LOADERS = {
-    SOURCE_OPEN_SWE: {"name": "v1.2", "split": "minisweagent", "reasoning_effort": "xhigh"},
-    SOURCE_OPEN_CODE_INSTRUCT: {"name": None, "split": "train", "reasoning_effort": "low"},
-    SOURCE_OPEN_CODE_REASONING: {"name": "split_0", "split": "split_0", "reasoning_effort": "xhigh"},
+    SOURCE_OPEN_SWE: {
+        "name": "v1.2", "split": "minisweagent",
+        "revision": "31cfd32021f674a1bbd5ff9f56a2151436fe2be3", "reasoning_effort": "xhigh",
+    },
+    SOURCE_OPEN_CODE_INSTRUCT: {
+        "name": None, "split": "train",
+        "revision": "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d", "reasoning_effort": "low",
+    },
+    SOURCE_OPEN_CODE_REASONING: {
+        "name": "split_0", "split": "split_0",
+        "revision": "20a1ca19c0d050fe9057fc08339d6b370ec1c67a", "reasoning_effort": "xhigh",
+    },
 }
 
 
@@ -67,10 +86,7 @@ def _base_row(row_id: str, source: str, repo_family: str, lane: str, reasoning_e
 
 
 def trim_tool_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    keep = (limit - len(TRUNCATION_MARKER)) // 2
-    return text[:keep] + TRUNCATION_MARKER + text[-keep:]
+    return trim_output(text, limit)
 
 
 def _tool_content(raw: str | None) -> str:
@@ -81,10 +97,9 @@ def _tool_content(raw: str | None) -> str:
     except (TypeError, ValueError):
         return trim_tool_output(text)
     if isinstance(payload, dict) and "output" in payload:
-        output = str(payload.get("output") or "")
-        code = payload.get("returncode")
-        prefix = "" if code in (None, 0) else f"[exit code {code}]\n"
-        return trim_tool_output(prefix + output)
+        return format_command_observation(
+            payload.get("returncode"), str(payload.get("output") or ""), MAX_TOOL_OUTPUT_CHARS
+        )
     return trim_tool_output(text)
 
 
@@ -92,8 +107,11 @@ def convert_open_swe_messages(messages: list[dict]) -> list[dict] | None:
     """Map a mini-swe-agent conversation onto the native roles and tools.
 
     Returns ``None`` when a turn cannot be expressed: a tool other than
-    ``bash``, arguments that are not a JSON object with a command, or a
-    tool response that answers no call.
+    ``bash``, arguments that are not a JSON object with a command, a tool
+    response that answers no call, or a call left unanswered other than
+    the final submit. The submit turn itself is dropped: nothing answers
+    it, and it is the harness's protocol, not the repair. What remains is
+    a faithful prefix of the episode, ending on the last observation.
     """
     converted: list[dict] = []
     pending = 0
@@ -136,7 +154,14 @@ def convert_open_swe_messages(messages: list[dict]) -> list[dict] | None:
         else:
             return None
     if pending:
-        return None
+        last = converted[-1]
+        calls = last.get("tool_calls") or []
+        submit = bool(calls) and pending == len(calls) and all(
+            SUBMIT_MARKER in call["function"]["arguments"]["command"] for call in calls
+        )
+        if not submit:
+            return None
+        converted.pop()
     return converted
 
 
@@ -167,12 +192,13 @@ def _turn_groups(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
 def window_trajectory(
     messages: list[dict], budget_tokens: int, count: TokenCounter = approximate_tokens
 ) -> list[tuple[str, list[dict]]]:
-    """Cut a trajectory into windows that fit ``budget_tokens``.
+    """Cut a trajectory down to one window that fits ``budget_tokens``.
 
     A trajectory that fits is one ``whole`` window. A longer one yields a
-    ``head`` window (the prefix and the first turns that fit) and a
-    ``tail`` window (the prefix and the last turns that fit), so both the
-    exploration and the finishing behaviour are represented. Turns are
+    ``head`` window: the prefix and the first turns that fit, which is a
+    faithful prefix of what happened. No tail window is cut: the last
+    turns depend on edits made in the turns left out, so a passing test
+    there would vouch for a patch the transcript never shows. Turns are
     never split from the tool responses that answer them. Nothing is
     returned when even one turn does not fit beside the prefix.
     """
@@ -192,20 +218,9 @@ def window_trajectory(
             break
         head.append(group)
         used += size
-    tail: list[list[dict]] = []
-    used = 0
-    for group, size in zip(reversed(groups), reversed(group_tokens)):
-        if used + size > available:
-            break
-        tail.insert(0, group)
-        used += size
-
-    windows: list[tuple[str, list[dict]]] = []
-    if head:
-        windows.append(("head", prefix + [m for group in head for m in group]))
-    if tail and tail != head:
-        windows.append(("tail", prefix + [m for group in tail for m in group]))
-    return windows
+    if not head:
+        return []
+    return [("head", prefix + [m for group in head for m in group])]
 
 
 def convert_open_swe_row(row: dict, budget_tokens: int, count: TokenCounter = approximate_tokens) -> list[dict]:
@@ -224,6 +239,8 @@ def convert_open_swe_row(row: dict, budget_tokens: int, count: TokenCounter = ap
             SOURCE_OPEN_SWE, repo, "agentic", effort,
         )
         base["messages"] = window
+        # The flag records the episode's outcome; ``window`` says whether
+        # the row is that whole episode or a prefix of it.
         base["verification"] = {"all_required_tests_pass": True, "runner": "swe-rebench hidden tests", "window": kind}
         rows.append(base)
     return rows
@@ -277,7 +294,9 @@ def convert_open_code_reasoning_row(row: dict) -> list[dict]:
     if reasoning:
         assistant["reasoning_content"] = reasoning
     base["messages"] = [{"role": "user", "content": prompt}, assistant]
-    base["verification"] = {"all_required_tests_pass": True, "runner": "opencodereasoning (unverified answer)"}
+    # Nothing executed these answers. The row says so, and notebook 02
+    # admits an unverified answer to the non-agentic lane only.
+    base["verification"] = {"all_required_tests_pass": None, "runner": "none"}
     return [base]
 
 
@@ -319,7 +338,9 @@ def stream_source(source: str, token: str | None = None):
     from datasets import load_dataset
 
     spec = SOURCE_LOADERS[source]
-    return load_dataset(source, spec["name"], split=spec["split"], streaming=True, token=token)
+    return load_dataset(
+        source, spec["name"], split=spec["split"], revision=spec["revision"], streaming=True, token=token
+    )
 
 
 def collect_public_rows(
@@ -341,10 +362,10 @@ def collect_public_rows(
         rows.extend(convert_rows(source, stream_source(source, token), cap, budget_tokens, count))
         kept = rows[before:]
         report["sources"][source] = {
+            "revision": SOURCE_LOADERS[source]["revision"],
             "rows": len(kept),
+            "unverified": sum(r["verification"].get("all_required_tests_pass") is not True for r in kept),
             "families": len({r["repo_family"] for r in kept}),
-            "windows": dict(sorted(
-                __import__("collections").Counter(r["verification"].get("window", "n/a") for r in kept).items()
-            )),
+            "windows": dict(sorted(Counter(r["verification"].get("window", "n/a") for r in kept).items())),
         }
     return rows, report

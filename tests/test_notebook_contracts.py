@@ -642,6 +642,14 @@ def test_notebook_02_accepts_the_documented_non_agentic_lane():
     ])
     assert validate_row(mislabelled)
 
+    # An answer nothing executed is admitted only when it says so, and only
+    # to the non-agentic lane; a claimed failure or a bare omission is not.
+    unverified = dict(reasoning_row, verification={"all_required_tests_pass": None, "runner": "none"})
+    assert validate_row(unverified) == []
+    assert validate_row(dict(unverified, verification={"all_required_tests_pass": None}))
+    assert validate_row(dict(unverified, verification={"all_required_tests_pass": False, "runner": "none"}))
+    assert validate_row(dict(mislabelled, lane="agentic", verification={"all_required_tests_pass": None, "runner": "none"}))
+
 
 def test_notebook_07_imports_the_shared_loop_instead_of_restating_it():
     """Three hand-copied episode loops would drift, and a gate that drifts
@@ -1194,6 +1202,10 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     # One Dataset from plain rows, so Arrow infers one schema across sources.
     assert "raw_dataset = Dataset.from_list(rows)" in load_cell
     assert "concatenate_datasets" not in load_cell
+    # The pinned source commits and counts travel with the published corpus.
+    publish_cell = code_cell_containing(generator.build_02_data(), "dataset_dict.push_to_hub(")
+    assert 'path_in_repo="public_sources.json"' in publish_cell
+    assert publish_cell.index("dataset_dict.push_to_hub(") < publish_cell.index('path_in_repo="public_sources.json"')
     # The windowed rows fit the training window with the rendered overhead.
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
     assert "MAX_SEQ_LENGTH = 8_192" in sft_config

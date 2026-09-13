@@ -27,6 +27,29 @@ READ_LIMIT_BYTES = 20_000
 SEARCH_SCAN_LIMIT_BYTES = 5_000_000
 SEARCH_MATCH_LIMIT = 200
 TEST_OUTPUT_TAIL = 12_000
+# A shell observation keeps its head and tail inside this bound.
+SHELL_OUTPUT_LIMIT = 12_000
+SHELL_TIMEOUT_SECONDS = 120
+TRUNCATION_MARKER = "\n... [output trimmed] ...\n"
+
+
+def trim_output(text: str, limit: int) -> str:
+    """Keep the head and tail of ``text`` inside ``limit`` characters."""
+    if len(text) <= limit:
+        return text
+    keep = (limit - len(TRUNCATION_MARKER)) // 2
+    return text[:keep] + TRUNCATION_MARKER + text[-keep:]
+
+
+def format_command_observation(returncode: int | None, output: str, limit: int = SHELL_OUTPUT_LIMIT) -> str:
+    """The ``shell`` observation: a non-zero exit code first, then the output.
+
+    Training rows converted from third-party shell transcripts go through
+    the same function, so what the model learns to expect is what this
+    executor returns.
+    """
+    prefix = "" if returncode in (None, 0) else f"[exit code {returncode}]\n"
+    return trim_output(prefix + output, limit)
 
 
 def default_test_command() -> list[str]:
@@ -102,7 +125,7 @@ class RepoHarness:
                 return "unknown test profile"
             return self._run_tests()
         if name == "shell":
-            return "shell is disabled by the harness allow-list; use the semantic tools"
+            return self._shell(arguments["command"])
         return f"unknown tool: {name}"
 
     def _search(self, query: str) -> str:
@@ -159,3 +182,22 @@ class RepoHarness:
             timeout=120,
         )
         return f"exit={result.returncode}\n{(result.stdout + result.stderr)[-TEST_OUTPUT_TAIL:]}"
+
+    def _shell(self, command: str) -> str:
+        # The same scrubbed environment, working directory, time limit and
+        # bounded observation as run_tests. run_tests already executes
+        # whatever the repository and the model's patches contain, so a
+        # command here adds no exposure a test file could not.
+        try:
+            result = subprocess.run(
+                ["bash", "-c", command],
+                cwd=self.root,
+                env=self.environment,
+                text=True,
+                errors="replace",
+                capture_output=True,
+                timeout=SHELL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return f"[timed out after {SHELL_TIMEOUT_SECONDS}s]"
+        return format_command_observation(result.returncode, result.stdout + result.stderr)

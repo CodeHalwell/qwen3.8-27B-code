@@ -60,7 +60,7 @@ Prefer a narrow semantic interface over unrestricted shell access.
 | `search` | Search text using `rg` semantics | Match and output limits; no path escape |
 | `apply_patch` | Apply an explicit unified patch | Reject paths outside repository; retain patch result |
 | `run_tests` | Run allow-listed test profiles | CPU, memory, process and wall-time limits |
-| `shell` | Exceptional commands not covered above | Disabled initially or strict allow-list; no network by default |
+| `shell` | One command in the task repository | Same scrubbed environment, time limit and bounded observation as `run_tests`; a non-zero exit code opens the observation; Hub access is off in that environment, and there is no other network isolation, as for `run_tests` |
 
 Tool outputs should be concise but faithful. Truncation must be explicit and
 include enough metadata for the model to request a narrower view.
