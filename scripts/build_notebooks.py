@@ -1535,7 +1535,8 @@ def build_03_sft():
                 frozen baseline.
 
                 **Input:** a private dataset from notebook 02.
-                **Output:** a versioned LoRA adapter, not a merged base model.
+                **Output:** a versioned LoRA adapter and, at the end of a full run,
+                the merged SFT checkpoint that notebook 04 starts from.
                 """
             ),
             markdown("## Install the pinned day-zero environment"),
@@ -1562,6 +1563,11 @@ def build_03_sft():
                 # on the Hub. Published at the end of training, about 55 GB, with
                 # the repo history squashed so only the latest merge is stored.
                 MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-merged"
+                # Notebook 04's adapter is trained on the merged weights above. A
+                # new SFT run replaces them, so that adapter stops being the latest
+                # finished stage: its completion marker is removed when training
+                # starts, and notebook 07 gates this adapter until 04 reruns.
+                DPO_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
                 MAX_SEQ_LENGTH = 8_192       # public rows are windowed to fit this; the 4k run measured the headroom
                 # Two passes over whatever the dataset holds; the trainer counts
                 # the updates. A positive MAX_STEPS would override the epochs.
@@ -1957,6 +1963,13 @@ def build_03_sft():
                                 "run_manifest.json", OUTPUT_ADAPTER_ID,
                                 commit_message="training started: completion marker removed",
                             )
+                        # The DPO adapter descends from the merged weights this run
+                        # replaces, so it is no longer the latest finished stage.
+                        if hub.repo_exists(DPO_ADAPTER_ID) and hub.file_exists(DPO_ADAPTER_ID, "run_manifest.json"):
+                            hub.delete_file(
+                                "run_manifest.json", DPO_ADAPTER_ID,
+                                commit_message="SFT lineage replaced: completion marker removed",
+                            )
                     result = trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)
                     peak_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
@@ -2148,7 +2161,7 @@ def build_04_dpo():
                 print(json.dumps(run_manifest, indent=2))
                 """
             ),
-            markdown("## Load the accepted SFT adapter"),
+            markdown("## Load the merged SFT checkpoint"),
             code(
                 r"""
                 from collections import Counter
@@ -3314,6 +3327,7 @@ def build_07_collect_and_evaluate():
                 # it has pushed one, else notebook 03's. False gates
                 # ACCEPTED_ADAPTER_ID as configured.
                 DPO_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
+                DPO_REVISION = "main"  # a commit of the DPO repo; ACCEPTED_REVISION pins the SFT repo
                 GATE_LATEST_STAGE = True
                 # Every think block after the request stays in context for the rest
                 # of the episode, so a thirty-call episode carries thirty turns of
@@ -3448,11 +3462,14 @@ def build_07_collect_and_evaluate():
                 # revision that carries it is a training run that finished.
                 api = HfApi(token=hf_token)
                 CANDIDATE_REVISION = None
-                candidate_ids = (DPO_ADAPTER_ID, ACCEPTED_ADAPTER_ID) if GATE_LATEST_STAGE else (ACCEPTED_ADAPTER_ID,)
-                for adapter_id in candidate_ids:
+                candidates = (
+                    ((DPO_ADAPTER_ID, DPO_REVISION), (ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION))
+                    if GATE_LATEST_STAGE else ((ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION),)
+                )
+                for adapter_id, pinned in candidates:
                     if not api.repo_exists(adapter_id):
                         continue
-                    revision = resolved_revision(adapter_id, ACCEPTED_REVISION)
+                    revision = resolved_revision(adapter_id, pinned)
                     if api.file_exists(adapter_id, "run_manifest.json", revision=revision):
                         ACCEPTED_ADAPTER_ID, CANDIDATE_REVISION = adapter_id, revision
                         break
@@ -3698,6 +3715,10 @@ def build_07_collect_and_evaluate():
                 # must not survive a gate that is skipped or refused now, or the
                 # persist cell would push it as if it were this run's.
                 comparison_path.unlink(missing_ok=True)
+                # The same goes for an acceptance: it is written only by a gate
+                # that passed in this run.
+                accepted_path = REPORT_DIR / "accepted.json"
+                accepted_path.unlink(missing_ok=True)
                 # The baseline is, in order: the named file this session wrote (a
                 # ladder rung), the baseline this session measured, then the pulled
                 # copy of the named file. A fresh measurement always outranks the
@@ -3754,7 +3775,7 @@ def build_07_collect_and_evaluate():
                     if comparison["gate_passed"]:
                         # The acceptance record, pushed with the reports: which
                         # adapter, at which commit, passed against which baseline.
-                        (REPORT_DIR / "accepted.json").write_text(json.dumps({
+                        accepted_path.write_text(json.dumps({
                             "adapter": candidate_model_ref,
                             "baseline": baseline_for_gate.name,
                             "harness_revision": repo_revision,
@@ -3848,10 +3869,11 @@ def build_07_collect_and_evaluate():
                         repo_type="dataset",
                         folder_path=str(REPORT_DIR),
                         allow_patterns=["*.json", "*.jsonl"],
-                        # An earlier verdict on the Hub must not outlive a gate
-                        # that was skipped or refused here: the remote file is
-                        # deleted unless this session's copy replaces it.
-                        delete_patterns=["comparison.json"],
+                        # An earlier verdict or acceptance on the Hub must not
+                        # outlive a gate that was skipped, refused or failed here:
+                        # the remote file is deleted unless this session's copy
+                        # replaces it (a file uploaded in the same commit is kept).
+                        delete_patterns=["comparison.json", "accepted.json"],
                         commit_message=f"gate reports from {repo_revision[:12]}",
                     )
                     print(f"pushed {sorted(p.name for p in REPORT_DIR.iterdir())} to {GATE_REPORTS_REPO}")

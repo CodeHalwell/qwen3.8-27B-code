@@ -914,7 +914,7 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
     # The candidate commit is pinned in the configuration cell, before the
     # evaluation, and the same commit is loaded and recorded.
-    assert "revision = resolved_revision(adapter_id, ACCEPTED_REVISION)" in config_cell
+    assert "revision = resolved_revision(adapter_id, pinned)" in config_cell
     assert "ACCEPTED_ADAPTER_ID, CANDIDATE_REVISION = adapter_id, revision" in config_cell
     assert "revision=CANDIDATE_REVISION," in candidate_cell
     assert 'candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{CANDIDATE_REVISION}"' in candidate_cell
@@ -940,6 +940,9 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "comparison_path.unlink(missing_ok=True)" in gate_cell
     assert gate_cell.index("comparison_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
     assert "comparison_path.write_text(" in gate_cell
+    # Likewise an earlier acceptance: only a gate that passes now writes one.
+    assert gate_cell.index("accepted_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
+    assert gate_cell.index("pairing_problems(") < gate_cell.index("accepted_path.write_text(")
     # A baseline measured this session outranks the pulled copy it replaced,
     # whatever name GATE_BASELINE_FILE selects.
     assert "baseline_candidates.append(baseline_report_path)" in gate_cell
@@ -952,8 +955,8 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "exist_ok=True" in persist_cell
     assert "folder_path=str(REPORT_DIR)" in persist_cell
     assert "repo_revision" in persist_cell
-    # A remote verdict is deleted unless this session's copy replaces it.
-    assert 'delete_patterns=["comparison.json"]' in persist_cell
+    # A remote verdict or acceptance is deleted unless this session's copy replaces it.
+    assert 'delete_patterns=["comparison.json", "accepted.json"]' in persist_cell
     # The persist cell is the last code cell, after the collection cell,
     # so it carries everything the session produced.
     code_cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]
@@ -1143,6 +1146,9 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert "hub.delete_file(" not in sft_config
     train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
     assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in train_cell
+    # A new SFT run supersedes the DPO adapter trained on the previous merge,
+    # so its marker goes at the same moment and 07 gates the SFT adapter.
+    assert train_cell.index('"run_manifest.json", DPO_ADAPTER_ID,') < train_cell.index("trainer.train(")
     assert train_cell.index("if RUN_TRAINING:") < train_cell.index("hub.delete_file(") < train_cell.index("trainer.train(")
     assert "RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None" in gate_config
     # A baseline left by an earlier run in this runtime cannot shadow the pulled one.
@@ -1156,7 +1162,9 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     # The gate records acceptance with the reports; it publishes no weights,
     # and it gates the latest finished stage.
     assert "GATE_LATEST_STAGE = True" in gate_config
-    assert "candidate_ids = (DPO_ADAPTER_ID, ACCEPTED_ADAPTER_ID) if GATE_LATEST_STAGE" in gate_config
+    # Each candidate repo resolves its own pin; a commit of one repo is not a commit of the other.
+    assert "((DPO_ADAPTER_ID, DPO_REVISION), (ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION))" in gate_config
+    assert "for adapter_id, pinned in candidates:" in gate_config
     for cell in generator.build_07_collect_and_evaluate().cells:
         assert "push_to_hub_merged(" not in cell.source
     accept_cell = code_cell_containing(generator.build_07_collect_and_evaluate(), '"accepted.json"')
