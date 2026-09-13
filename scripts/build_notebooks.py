@@ -1548,7 +1548,7 @@ def build_03_sft():
                     from huggingface_hub import HfApi
 
                     hub = HfApi(token=hf_token)
-                    if hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
+                    if hub.repo_exists(OUTPUT_ADAPTER_ID) and hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
                         hub.delete_file(
                             "run_manifest.json", OUTPUT_ADAPTER_ID,
                             commit_message="training started: completion marker removed",
@@ -2031,8 +2031,10 @@ def build_04_dpo():
 
                     # The run manifest is uploaded last, after the weights, so it
                     # proves the merge finished; a repo alone does not.
-                    if not HfApi(token=hf_token).file_exists(
-                        MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION
+                    api = HfApi(token=hf_token)
+                    if not (
+                        api.repo_exists(MERGED_SFT_MODEL_ID)
+                        and api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION)
                     ):
                         raise RuntimeError(
                             f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. DPO starts "
