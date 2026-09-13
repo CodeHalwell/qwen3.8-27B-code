@@ -268,6 +268,24 @@ if not hf_token:
 login(token=hf_token, add_to_git_credential=False)
 HF_USERNAME = whoami()["name"]
 
+
+def require_private_repo(repo_id: str, repo_type: str = "model") -> None:
+    # Refuse to publish into a Hub repo that already exists and is public.
+    # private=True on create_repo, push_to_hub and hub_private_repo applies
+    # only when the repo is created; an existing public repo stays public
+    # and every later push lands in the open.
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    if not api.repo_exists(repo_id, repo_type=repo_type):
+        return
+    if not api.repo_info(repo_id, repo_type=repo_type).private:
+        raise RuntimeError(
+            f"{repo_type} repo {repo_id} exists and is public. Make it private first with "
+            f"HfApi(token=hf_token).update_repo_settings(repo_id={repo_id!r}, repo_type={repo_type!r}, "
+            "private=True), or publish under a new id."
+        )
+
 def package_version(name: str) -> str:
     try:
         return version(name)
@@ -1112,6 +1130,7 @@ def build_01_baseline():
                 PUSH_PRIVATE_RESULTS = False
                 if PUSH_PRIVATE_RESULTS:
                     from huggingface_hub import HfApi
+                    require_private_repo(f"{HF_USERNAME}/qwen38-code-pilot-results", "dataset")
                     HfApi().upload_folder(
                         repo_id=f"{HF_USERNAME}/qwen38-code-pilot-results",
                         repo_type="dataset",
@@ -1410,6 +1429,7 @@ def build_02_data():
                 if PUSH_DATASET:
                     if DEMO_MODE:
                         raise RuntimeError("Refusing to publish the synthetic format fixture as training data.")
+                    require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
                 else:
@@ -1494,6 +1514,12 @@ def build_03_sft():
 
                 if DEMO_MODE and (PUSH_ADAPTER or PUSH_MERGED_BF16 or MAX_STEPS > 2):
                     raise RuntimeError("Demo mode is limited to two local smoke steps and cannot be published.")
+                # The trainer creates the Hub repo when it is built, so an
+                # existing public repo is caught here, before that happens.
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
+                if PUSH_MERGED_BF16:
+                    require_private_repo(MERGED_MODEL_ID)
 
                 run_manifest = {
                     "stage": "sft",
@@ -1504,6 +1530,11 @@ def build_03_sft():
                     "dataset_revision": DATASET_REVISION,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "gradient_accumulation_steps": 8,
+                    "optimizer": "adamw_8bit",
+                    "eval_every_steps": EVAL_EVERY_STEPS,
+                    "save_every_steps": SAVE_EVERY_STEPS,
                     "demo_mode": DEMO_MODE,
                     "tool_schema_version": TOOL_SCHEMA_VERSION,
                     "harness_version": "pilot-local-v1",
@@ -1853,6 +1884,7 @@ def build_03_sft():
                     if PUSH_MERGED_BF16:
                         from huggingface_hub import HfApi
 
+                        require_private_repo(MERGED_MODEL_ID)
                         HfApi(token=hf_token).create_repo(
                             repo_id=MERGED_MODEL_ID,
                             repo_type="model",
@@ -1947,6 +1979,12 @@ def build_04_dpo():
                 # save pushes the adapter and each eval scores the held-out split.
                 EVAL_EVERY_STEPS = 1 if DEMO_MODE else 10
                 SAVE_EVERY_STEPS = 1 if DEMO_MODE else 10
+                # 5e-7 is a full-fine-tuning DPO rate. A rank-16 adapter sees
+                # a small fraction of the parameters and barely moves at that
+                # rate; 5e-6 is the conservative end of the usual LoRA band.
+                # Sweep it alongside beta rather than treating it as settled.
+                LEARNING_RATE = 5e-6
+                DPO_BETA = 0.1
 
                 if RUN_TRAINING and MERGED_SFT_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the merged accepted SFT commit before DPO.")
@@ -1954,6 +1992,33 @@ def build_04_dpo():
                     raise RuntimeError("Record the accepted SFT adapter commit for lineage before DPO.")
                 if DEMO_MODE and (PUSH_ADAPTER or MAX_STEPS > 2):
                     raise RuntimeError("Demo preferences are limited to two local smoke steps and cannot be published.")
+                # The trainer creates the Hub repo when it is built, so an
+                # existing public repo is caught here, before that happens.
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
+
+                run_manifest = {
+                    "stage": "dpo",
+                    "objective": "agentic-coding",
+                    "model_id": MERGED_SFT_MODEL_ID,
+                    "model_revision": MERGED_SFT_REVISION,
+                    "sft_adapter_id": SFT_ADAPTER_ID,
+                    "sft_adapter_revision": SFT_ADAPTER_REVISION,
+                    "preference_dataset_id": PREFERENCE_DATASET_ID,
+                    "max_seq_length": MAX_SEQ_LENGTH,
+                    "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "beta": DPO_BETA,
+                    "loss_type": "sigmoid",
+                    "gradient_accumulation_steps": 8,
+                    "optimizer": "adamw_8bit",
+                    "eval_every_steps": EVAL_EVERY_STEPS,
+                    "save_every_steps": SAVE_EVERY_STEPS,
+                    "max_length_pair_share": MAX_LENGTH_PAIR_SHARE,
+                    "demo_mode": DEMO_MODE,
+                    "run_training": RUN_TRAINING,
+                }
+                print(json.dumps(run_manifest, indent=2))
                 """
             ),
             markdown("## Load the accepted SFT adapter"),
@@ -2221,16 +2286,12 @@ def build_04_dpo():
                 dpo_args = DPOConfig(
                     output_dir=str(RUN_ROOT / "dpo"),
                     max_length=MAX_SEQ_LENGTH,
-                    beta=0.1,
+                    beta=DPO_BETA,
                     loss_type="sigmoid",
                     per_device_train_batch_size=1,
                     per_device_eval_batch_size=1,
                     gradient_accumulation_steps=8,
-                    # 5e-7 is a full-fine-tuning DPO rate. A rank-16 adapter sees
-                    # a small fraction of the parameters and barely moves at that
-                    # rate; 5e-6 is the conservative end of the usual LoRA band.
-                    # Sweep it alongside beta rather than treating it as settled.
-                    learning_rate=5e-6,
+                    learning_rate=LEARNING_RATE,
                     warmup_ratio=0.05,
                     lr_scheduler_type="cosine",
                     max_steps=MAX_STEPS,
@@ -2270,6 +2331,10 @@ def build_04_dpo():
                         ).items())),
                     }, indent=2))
                     result = trainer.train()
+                    run_manifest["tool_schema_version"] = TOOL_SCHEMA_VERSION
+                    run_manifest["preference_mixture"] = PREFERENCE_MIXTURE
+                    run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
+                    (RUN_ROOT / "dpo" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="DPO adapter from verifier-backed preferences")
@@ -2354,6 +2419,8 @@ def build_05_grpo():
                     raise RuntimeError(AGENTIC_RL_BLOCKER)
                 if RUN_TRAINING and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin an accepted adapter revision before RL.")
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
                 if ROLLOUT_POLICY_PRECISION not in {"bf16", "bnb4"}:
                     raise ValueError("ROLLOUT_POLICY_PRECISION must be 'bf16' or 'bnb4'.")
                 if ROLLOUT_POLICY_PRECISION == "bnb4" and not ALLOW_QUANTIZED_ROLLOUT_POLICY:
@@ -2667,6 +2734,7 @@ def build_05_grpo():
                         run_name="qwen38-code-agent-grpo-smoke",
                         push_to_hub=PUSH_ADAPTER,
                         hub_model_id=OUTPUT_ADAPTER_ID,
+                        hub_private_repo=True,
                         seed=3407,
                     )
                     trainer = GRPOTrainer(
@@ -2887,6 +2955,8 @@ def build_06_qat_export():
                     qat_tokenizer.save_pretrained(str(qat_dir))
                     if PUSH_QAT:
                         from huggingface_hub import HfApi
+                        require_private_repo(QAT_OUTPUT_ID)
+                        HfApi(token=hf_token).create_repo(QAT_OUTPUT_ID, repo_type="model", private=True, exist_ok=True)
                         HfApi(token=hf_token).upload_folder(
                             repo_id=QAT_OUTPUT_ID,
                             folder_path=str(qat_dir),
@@ -2910,6 +2980,7 @@ def build_06_qat_export():
                         token=hf_token,
                     )
                     assert_model_fully_resident(export_model)
+                    require_private_repo(GGUF_OUTPUT_ID)
                     export_model.push_to_hub_gguf(
                         GGUF_OUTPUT_ID,
                         export_tokenizer,
@@ -3503,6 +3574,7 @@ def build_07_collect_and_evaluate():
                 if PUSH_ARTIFACTS:
                     from huggingface_hub import HfApi
 
+                    require_private_repo(GATE_REPORTS_REPO, "dataset")
                     api = HfApi(token=hf_token)
                     api.create_repo(GATE_REPORTS_REPO, repo_type="dataset", private=True, exist_ok=True)
                     commit = api.upload_folder(
@@ -3577,6 +3649,23 @@ if not hf_token:
 login(token=hf_token, add_to_git_credential=False)
 HF_USERNAME = whoami()["name"]
 os.environ["HF_TOKEN"] = hf_token
+
+def require_private_repo(repo_id: str, repo_type: str = "model") -> None:
+    # Refuse to publish into a Hub repo that already exists and is public.
+    # private=True on create_repo, push_to_hub and hub_private_repo applies
+    # only when the repo is created; an existing public repo stays public
+    # and every later push lands in the open.
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    if not api.repo_exists(repo_id, repo_type=repo_type):
+        return
+    if not api.repo_info(repo_id, repo_type=repo_type).private:
+        raise RuntimeError(
+            f"{repo_type} repo {repo_id} exists and is public. Make it private first with "
+            f"HfApi(token=hf_token).update_repo_settings(repo_id={repo_id!r}, repo_type={repo_type!r}, "
+            "private=True), or publish under a new id."
+        )
 
 # Vendor endpoints read their own key. Copy each one that exists in Secrets
 # into the environment name its preset expects; the task harness strips
@@ -3805,8 +3894,10 @@ def build_08_distil():
                     if PUSH_ARTIFACTS:
                         from huggingface_hub import HfApi
 
+                        teacher_repo = f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}"
+                        require_private_repo(teacher_repo, "dataset")
                         HfApi(token=hf_token).upload_folder(
-                            repo_id=f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}",
+                            repo_id=teacher_repo,
                             repo_type="dataset",
                             folder_path=str(TEACHER_DIR),
                             private=True,

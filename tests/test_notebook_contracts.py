@@ -769,6 +769,74 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
     assert "LEARNING_RATE = 2e-5" in sft_config
 
+    # The run inputs a checkpoint must be attributed to are in its manifest.
+    for cell, keys in (
+        (sft_config, ("learning_rate", "eval_every_steps", "save_every_steps", "optimizer")),
+        (
+            code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
+            ("learning_rate", "beta", "eval_every_steps", "save_every_steps", "optimizer", "max_length_pair_share"),
+        ),
+    ):
+        manifest = cell[cell.index("run_manifest = {"):]
+        for key in keys:
+            assert f'"{key}":' in manifest, key
+    dpo_args = code_cell_containing(generator.build_04_dpo(), "dpo_args = DPOConfig(")
+    assert "learning_rate=LEARNING_RATE," in dpo_args
+    assert "beta=DPO_BETA," in dpo_args
+    dpo_train = code_cell_containing(generator.build_04_dpo(), "preference_mixture.json")
+    assert '"dpo" / "run_manifest.json"' in dpo_train
+
+
+PUBLISH_MARKERS = (
+    "push_to_hub(",
+    "push_to_hub_merged(",
+    "push_to_hub_gguf(",
+    "upload_folder(",
+    "training_args = SFTConfig(",
+    "dpo_args = DPOConfig(",
+    "GRPOConfig(",
+)
+
+
+def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
+    """`private=True` and `hub_private_repo` apply only when a repo is
+    created; an existing public repo stays public. Every publish site must
+    check first, and a trainer's check must run before the trainer is built,
+    which is when it creates the repo."""
+    generator = load_generator()
+    for runtime in (generator.AUTH_AND_RUNTIME, generator.TEACHER_RUNTIME):
+        assert "def require_private_repo(" in runtime
+        assert "repo_info(repo_id, repo_type=repo_type).private" in runtime
+    notebooks = {
+        "01": generator.build_01_baseline(),
+        "02": generator.build_02_data(),
+        "03": generator.build_03_sft(),
+        "04": generator.build_04_dpo(),
+        "05": generator.build_05_grpo(),
+        "06": generator.build_06_qat_export(),
+        "07": generator.build_07_collect_and_evaluate(),
+        "08": generator.build_08_distil(),
+    }
+    guarded = 0
+    for name, notebook in notebooks.items():
+        cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]
+        seen_guard = False
+        for index, source in enumerate(cells):
+            if "require_private_repo(" in source and "def require_private_repo" not in source:
+                seen_guard = True
+            if not any(marker in source for marker in PUBLISH_MARKERS):
+                continue
+            if "Config(" in source and "push_to_hub=PUSH_ADAPTER" in source:
+                # The guard for a trainer lives in an earlier cell.
+                assert seen_guard, f"notebook {name} cell {index}: trainer built before the repo check"
+                assert "hub_private_repo=True" in source, f"notebook {name} cell {index}"
+            elif "trainer.push_to_hub(" in source:
+                assert seen_guard, f"notebook {name} cell {index}"
+            else:
+                assert "require_private_repo(" in source, f"notebook {name} cell {index}"
+            guarded += 1
+    assert guarded >= 12
+
 
 def test_notebook_07_persists_reports_across_colab_sessions():
     """The gate pairs a candidate with a baseline measured in an earlier
