@@ -310,16 +310,27 @@ def convert_row(source: str, row: dict, budget_tokens: int, count: TokenCounter 
     raise ValueError(f"No converter for {source!r}; known: {sorted(SOURCE_LOADERS)}")
 
 
+# Source rows read per native row wanted before a stream is given up on,
+# so a source that yields nothing cannot be streamed to its end.
+SCAN_ROWS_PER_NATIVE_ROW = 25
+
+
 def convert_rows(
     source: str,
     rows: Iterable[dict],
     limit: int,
     budget_tokens: int,
     count: TokenCounter = approximate_tokens,
+    max_scanned: int | None = None,
 ) -> Iterator[dict]:
-    """Convert streamed rows until ``limit`` native rows have been yielded."""
+    """Convert streamed rows until ``limit`` native rows have been yielded
+    or ``max_scanned`` source rows have been read (default: 25 per native
+    row wanted)."""
+    bound = limit * SCAN_ROWS_PER_NATIVE_ROW if max_scanned is None else max_scanned
     produced = 0
+    scanned = 0
     for row in rows:
+        scanned += 1
         for converted in convert_row(source, row, budget_tokens, count):
             if converted_tokens(converted, count) > budget_tokens:
                 continue
@@ -327,6 +338,8 @@ def convert_rows(
             produced += 1
             if produced >= limit:
                 return
+        if scanned >= bound:
+            return
 
 
 def converted_tokens(row: dict, count: TokenCounter = approximate_tokens) -> int:
@@ -359,10 +372,19 @@ def collect_public_rows(
         if cap <= 0:
             continue
         before = len(rows)
-        rows.extend(convert_rows(source, stream_source(source, token), cap, budget_tokens, count))
+        scanned = 0
+
+        def counted(stream=stream_source(source, token)):
+            nonlocal scanned
+            for row in stream:
+                scanned += 1
+                yield row
+
+        rows.extend(convert_rows(source, counted(), cap, budget_tokens, count))
         kept = rows[before:]
         report["sources"][source] = {
             "revision": SOURCE_LOADERS[source]["revision"],
+            "scanned": scanned,
             "rows": len(kept),
             "unverified": sum(r["verification"].get("all_required_tests_pass") is not True for r in kept),
             "families": len({r["repo_family"] for r in kept}),

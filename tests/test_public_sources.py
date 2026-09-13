@@ -126,6 +126,7 @@ def test_sources_are_pinned_and_the_report_records_the_commit(monkeypatch):
     entry = report["sources"][ps.SOURCE_OPEN_SWE]
     assert entry["revision"] == ps.SOURCE_LOADERS[ps.SOURCE_OPEN_SWE]["revision"]
     assert entry["rows"] == 1 and entry["unverified"] == 0 and entry["windows"] == {"whole": 1}
+    assert entry["scanned"] == 2
     assert ps.SOURCE_OPEN_CODE_REASONING not in report["sources"]
 
 
@@ -155,6 +156,18 @@ def test_convert_rows_stops_at_the_limit_and_drops_rows_over_budget():
     rows = [_swe_row(turns=1), _swe_row(turns=1), _swe_row(turns=40, output_chars=2_000)]
     out = list(ps.convert_rows(ps.SOURCE_OPEN_SWE, rows, limit=2, budget_tokens=10_000))
     assert len(out) == 2
+    # A source that yields nothing is given up on after a bounded number
+    # of rows, not streamed to its end.
+    consumed = 0
+
+    def endless():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield _swe_row(resolved=0)
+
+    assert list(ps.convert_rows(ps.SOURCE_OPEN_SWE, endless(), limit=2, budget_tokens=10_000)) == []
+    assert consumed == 2 * ps.SCAN_ROWS_PER_NATIVE_ROW
     with pytest.raises(ValueError, match="No converter"):
         list(ps.convert_rows("nobody/nothing", rows, limit=1, budget_tokens=10))
 
