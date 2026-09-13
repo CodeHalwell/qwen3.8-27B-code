@@ -19,8 +19,10 @@ the cheapest effort that keeps the best success (docs/thinking-budget.md):
         xhigh=reports/ladder_xhigh.json --out reports/effort_ladder.json
 
 The gate thresholds come from docs/evaluation.md and should be frozen before a
-candidate's results are looked at. Exit status is non-zero when the gate fails,
-so this can sit in front of a promotion step.
+candidate's results are looked at. Exit status is 1 when the gate fails and 2
+when the two reports were not measured the same way (different effort, caps,
+budget or attempt count, or the same model on both sides), so this can sit in
+front of a promotion step.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,11 +39,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from qwen3_8_27b_code.episodes import EpisodeBudget  # noqa: E402
 from qwen3_8_27b_code.evaluation import (  # noqa: E402
     DEFAULT_MAX_REASONING_GROWTH,
+    build_provenance,
     compare,
     effort_ladder,
     evaluate,
     gate,
     gate_passed,
+    pairing_problems,
     read_report,
     write_report,
 )
@@ -48,15 +53,39 @@ from qwen3_8_27b_code.policies import load_policy_factory  # noqa: E402
 from qwen3_8_27b_code.tasks import EVALUATION_VARIANTS_PER_FAMILY, evaluation_tasks  # noqa: E402
 
 
+def harness_revision() -> str:
+    """The commit this harness ran at, or ``unknown`` outside a checkout."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True, capture_output=True, check=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return completed.stdout.strip() or "unknown"
+
+
 def run(arguments: argparse.Namespace) -> int:
     tasks = evaluation_tasks(variants_per_family=arguments.variants_per_family)
+    budget = EpisodeBudget(tool_calls=arguments.tool_calls, wall_seconds=arguments.wall_seconds)
     report = evaluate(
         tasks,
         load_policy_factory(arguments.policy),
         label=arguments.label,
         attempts_per_task=arguments.attempts,
         seeds=tuple(arguments.seeds),
-        budget=EpisodeBudget(tool_calls=arguments.tool_calls, wall_seconds=arguments.wall_seconds),
+        budget=budget,
+    )
+    # The same record notebook 07 writes, so `compare` can refuse to pair
+    # this report with one measured differently.
+    report.metadata = build_provenance(
+        model=arguments.model or arguments.policy,
+        harness_revision=harness_revision(),
+        reasoning_effort=arguments.reasoning_effort,
+        max_new_tokens=arguments.max_new_tokens,
+        max_sequence_length=arguments.max_sequence_length,
+        episode_budget=budget,
+        attempts_per_task=arguments.attempts,
+        variants_per_family=arguments.variants_per_family,
     )
     write_report(report, arguments.out)
     print(json.dumps(report.scorecard(), indent=2))
@@ -65,7 +94,22 @@ def run(arguments: argparse.Namespace) -> int:
 
 
 def run_compare(arguments: argparse.Namespace) -> int:
-    comparison = compare(read_report(arguments.baseline), read_report(arguments.candidate))
+    baseline = read_report(arguments.baseline)
+    candidate = read_report(arguments.candidate)
+    blocking, advisory = pairing_problems(baseline, candidate)
+    if blocking:
+        for problem in blocking:
+            print(f"  [REFUSED] {problem}")
+        print("GATE NOT RUN: the two reports were not measured the same way.")
+        return 2
+    for note in advisory:
+        print(f"  [NOTE] {note}")
+    comparison = compare(baseline, candidate)
+    comparison["provenance"] = {
+        "baseline": {**baseline.metadata, "path": str(arguments.baseline)},
+        "candidate": {**candidate.metadata, "path": str(arguments.candidate)},
+        "notes": advisory,
+    }
     checks = gate(
         comparison,
         minimum_success_delta=arguments.minimum_success_delta,
@@ -130,6 +174,15 @@ def main() -> int:
     runner.add_argument("--seeds", type=int, nargs="+", default=[3407, 9176, 20261])
     runner.add_argument("--tool-calls", type=int, default=30)
     runner.add_argument("--wall-seconds", type=float, default=900.0)
+    runner.add_argument(
+        "--model",
+        default=None,
+        help="what the policy measures, recorded as provenance (a Hub id, adapter@revision, ...); "
+        "defaults to the --policy reference",
+    )
+    runner.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="medium")
+    runner.add_argument("--max-new-tokens", type=int, default=None, help="generation cap the policy ran with")
+    runner.add_argument("--max-sequence-length", type=int, default=None, help="context window the policy ran with")
     runner.add_argument("--out", type=Path, default=ROOT / "reports" / "evaluation.json")
     runner.set_defaults(handler=run)
 

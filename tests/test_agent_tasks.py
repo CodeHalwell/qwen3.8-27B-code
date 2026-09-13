@@ -8,6 +8,7 @@ exercised on CPU.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -692,6 +693,57 @@ def test_report_provenance_round_trips_through_the_report_file(tmp_path):
     assert evaluation.read_report(tmp_path / "old.json").metadata == {}
 
 
+def test_build_provenance_records_every_key_the_pairing_check_requires():
+    provenance = evaluation.build_provenance(
+        model="gold",
+        harness_revision="abc123",
+        reasoning_effort="medium",
+        max_new_tokens=None,
+        max_sequence_length=None,
+        episode_budget=EpisodeBudget(tool_calls=30, wall_seconds=900.0),
+        attempts_per_task=1,
+        variants_per_family=1,
+        measured_at="2026-09-13T00:00:00+00:00",
+    )
+    assert set(evaluation.PROVENANCE_REQUIRED_KEYS) <= set(provenance)
+    assert provenance["episode_budget"] == {"tool_calls": 30, "wall_seconds": 900.0}
+    assert provenance["measured_at"] == "2026-09-13T00:00:00+00:00"
+
+
+def test_cli_compare_refuses_reports_without_matching_provenance(tmp_path, capsys):
+    """The CLI gate applies the same pairing check as notebook 07."""
+    spec = importlib.util.spec_from_file_location("evaluate_agent", ROOT / "scripts" / "evaluate_agent.py")
+    assert spec and spec.loader
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    def report(label: str, model: str | None) -> Path:
+        scored = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label=label)
+        if model is not None:
+            scored.metadata = _provenance(model)
+        return Path(evaluation.write_report(scored, tmp_path / f"{label}.json") and tmp_path / f"{label}.json")
+
+    def compare(baseline: Path, candidate: Path) -> int:
+        arguments = argparse.Namespace(
+            baseline=baseline, candidate=candidate, minimum_success_delta=0.0,
+            max_reasoning_growth=0.1, ignore_thinking_budget=False, out=tmp_path / "comparison.json",
+        )
+        return cli.run_compare(arguments)
+
+    assert compare(report("bare-a", None), report("bare-b", None)) == 2
+    assert "GATE NOT RUN" in capsys.readouterr().out
+    assert not (tmp_path / "comparison.json").exists()
+
+    assert compare(report("same-a", "gold"), report("same-b", "gold")) == 2
+    assert "both reports measure 'gold'" in capsys.readouterr().out
+
+    status = compare(report("base", "gold"), report("cand", "gold-v2"))
+    assert status in (0, 1)
+    written = json.loads((tmp_path / "comparison.json").read_text())
+    assert written["provenance"]["baseline"]["model"] == "gold"
+    assert written["provenance"]["candidate"]["model"] == "gold-v2"
+
+
 def test_gate_pairing_refuses_reports_measured_differently():
     """A stale report pulled from storage must not be gated against a fresh
     one unless both record the same measurement settings."""
@@ -704,6 +756,13 @@ def test_gate_pairing_refuses_reports_measured_differently():
     baseline.metadata = _provenance("unsloth/Qwen3.8-27B")
     candidate.metadata = _provenance("me/adapter@deadbeef")
     assert evaluation.pairing_problems(baseline, candidate) == ([], [])
+
+    # A partial record is no evidence: a missing setting cannot "match".
+    partial = _provenance("me/adapter@deadbeef")
+    del partial["max_new_tokens"], partial["model"]
+    candidate.metadata = partial
+    blocking, _ = evaluation.pairing_problems(baseline, candidate)
+    assert blocking == ["candidate report 'candidate' lacks provenance keys ['model', 'max_new_tokens']; re-measure it"]
 
     # Same model on both sides is a baseline paired with itself.
     candidate.metadata = _provenance("unsloth/Qwen3.8-27B")

@@ -834,8 +834,27 @@ def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
                 assert seen_guard, f"notebook {name} cell {index}"
             else:
                 assert "require_private_repo(" in source, f"notebook {name} cell {index}"
+            if "upload_folder(" in source or "push_to_hub_gguf(" in source:
+                # Neither call creates a private repo on its own: upload_folder
+                # has no private flag and push_to_hub_gguf uses its own default.
+                assert "private=True, exist_ok=True" in source, f"notebook {name} cell {index}"
+                assert "private=True,\n" not in source.split("upload_folder(")[-1], f"notebook {name} cell {index}"
             guarded += 1
     assert guarded >= 12
+
+    # Where the publish follows an expensive job, an existing public target
+    # is found at configuration time, not after the GPU or the teacher bill.
+    for name, marker, guard in (
+        ("03", "PUSH_MERGED_BF16 = False", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("04", "LENGTH_PAIRS_LOCAL_JSONL", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("05", "ROLLOUT_POLICY_PRECISION = ", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(QAT_OUTPUT_ID)"),
+        ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(GGUF_OUTPUT_ID)"),
+        ("07", "GATE_REPORTS_REPO =", 'require_private_repo(GATE_REPORTS_REPO, "dataset")'),
+        ("08", "TEACHER_REPO = ", 'require_private_repo(TEACHER_REPO, "dataset")'),
+    ):
+        config_cell = code_cell_containing(notebooks[name], marker)
+        assert guard in config_cell, (name, guard)
 
 
 def test_notebook_07_persists_reports_across_colab_sessions():
@@ -854,8 +873,12 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "local_dir=str(REPORT_DIR)" not in config_cell
     assert 'GATE_BASELINE_FILE = "baseline.json"' in config_cell
     assert "def report_provenance(" in config_cell
+    # One writer for the notebook and the CLI: the notebook passes its
+    # settings to the shared builder rather than assembling the dict itself.
+    assert "return build_provenance(" in config_cell
     for key in ("model", "harness_revision", "reasoning_effort", "max_new_tokens", "episode_budget", "attempts_per_task"):
-        assert f'"{key}":' in config_cell
+        assert f"{key}=" in config_cell
+    assert '"measured_at"' not in config_cell
 
     # Every report this notebook writes records how it was measured.
     for marker, model_ref in (
@@ -876,6 +899,11 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "pairing_problems(" in gate_cell
     assert "GATE NOT RUN" in gate_cell
     assert 'comparison["provenance"]' in gate_cell
+    # A rerun in the same runtime never republishes an earlier verdict: the
+    # old comparison is removed before the gate decides whether to run.
+    assert "comparison_path.unlink(missing_ok=True)" in gate_cell
+    assert gate_cell.index("comparison_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
+    assert "comparison_path.write_text(" in gate_cell
 
     persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
     assert "private=True" in persist_cell

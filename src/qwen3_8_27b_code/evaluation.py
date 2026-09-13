@@ -19,6 +19,8 @@ quality" is something the gate can check rather than a hope.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from collections import Counter
 from dataclasses import dataclass, field
 import json
@@ -315,10 +317,47 @@ PROVENANCE_STRICT_KEYS = (
     "attempts_per_task",
     "variants_per_family",
 )
-# Recorded on the comparison when they differ, but not fatal: ``compare``
-# already refuses a different task set, and a harness revision can change
-# without touching the suite.
+# Recorded on the comparison when they differ, but not fatal. A harness
+# change that touched the suite is caught elsewhere: ``compare`` refuses
+# reports with no shared task and the horizon gate fails any task present
+# in only one report. A harness change that did not touch the suite is
+# what this records.
 PROVENANCE_ADVISORY_KEYS = ("harness_revision",)
+# Every key a report must carry before it can be paired at all.
+PROVENANCE_REQUIRED_KEYS = ("model",) + PROVENANCE_STRICT_KEYS
+
+
+def build_provenance(
+    *,
+    model: str,
+    harness_revision: str,
+    reasoning_effort: str,
+    max_new_tokens: int | None,
+    max_sequence_length: int | None,
+    episode_budget: EpisodeBudget | dict,
+    attempts_per_task: int,
+    variants_per_family: int,
+    measured_at: str | None = None,
+) -> dict:
+    """The provenance every scored report records.
+
+    One writer for the notebook and the CLI, so the keys ``pairing_problems``
+    requires cannot drift between them. ``model`` is whatever was measured:
+    a Hub id, an adapter id with its revision, or a scripted policy name.
+    """
+    if isinstance(episode_budget, EpisodeBudget):
+        episode_budget = {"tool_calls": episode_budget.tool_calls, "wall_seconds": episode_budget.wall_seconds}
+    return {
+        "model": model,
+        "harness_revision": harness_revision,
+        "reasoning_effort": reasoning_effort,
+        "max_new_tokens": max_new_tokens,
+        "max_sequence_length": max_sequence_length,
+        "episode_budget": dict(episode_budget),
+        "attempts_per_task": attempts_per_task,
+        "variants_per_family": variants_per_family,
+        "measured_at": measured_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
 
 
 def pairing_problems(
@@ -326,25 +365,30 @@ def pairing_problems(
 ) -> tuple[list[str], list[str]]:
     """Why two reports must not be gated against each other.
 
-    Returns ``(blocking, advisory)``. Blocking: a report with no recorded
-    provenance, a measurement setting in ``PROVENANCE_STRICT_KEYS`` that
-    differs, or two reports of the same model reference, which is a
-    baseline paired with itself. Advisory: an ``PROVENANCE_ADVISORY_KEYS``
-    value that differs, worth recording next to the verdict.
+    Returns ``(blocking, advisory)``. Blocking: a report missing any of
+    ``PROVENANCE_REQUIRED_KEYS`` (a partial record is no evidence), a
+    measurement setting in ``PROVENANCE_STRICT_KEYS`` that differs, or two
+    reports of the same model reference, which is a baseline paired with
+    itself. Advisory: a ``PROVENANCE_ADVISORY_KEYS`` value that differs,
+    worth recording next to the verdict.
     """
     blocking: list[str] = []
     advisory: list[str] = []
     for name, report in (("baseline", baseline), ("candidate", candidate)):
         if not report.metadata:
             blocking.append(f"{name} report {report.label!r} carries no provenance; re-measure it")
+            continue
+        missing = [key for key in PROVENANCE_REQUIRED_KEYS if key not in report.metadata]
+        if missing:
+            blocking.append(f"{name} report {report.label!r} lacks provenance keys {missing}; re-measure it")
     if blocking:
         return blocking, advisory
     for key in PROVENANCE_STRICT_KEYS:
-        before, after = baseline.metadata.get(key), candidate.metadata.get(key)
+        before, after = baseline.metadata[key], candidate.metadata[key]
         if before != after:
             blocking.append(f"{key}: baseline {before!r}, candidate {after!r}")
-    if baseline.metadata.get("model") == candidate.metadata.get("model"):
-        blocking.append(f"both reports measure {baseline.metadata.get('model')!r}")
+    if baseline.metadata["model"] == candidate.metadata["model"]:
+        blocking.append(f"both reports measure {baseline.metadata['model']!r}")
     for key in PROVENANCE_ADVISORY_KEYS:
         before, after = baseline.metadata.get(key), candidate.metadata.get(key)
         if before != after:

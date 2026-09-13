@@ -1130,13 +1130,11 @@ def build_01_baseline():
                 PUSH_PRIVATE_RESULTS = False
                 if PUSH_PRIVATE_RESULTS:
                     from huggingface_hub import HfApi
-                    require_private_repo(f"{HF_USERNAME}/qwen38-code-pilot-results", "dataset")
-                    HfApi().upload_folder(
-                        repo_id=f"{HF_USERNAME}/qwen38-code-pilot-results",
-                        repo_type="dataset",
-                        folder_path=str(RESULTS_DIR),
-                        private=True,
-                    )
+                    results_repo = f"{HF_USERNAME}/qwen38-code-pilot-results"
+                    require_private_repo(results_repo, "dataset")
+                    api = HfApi(token=hf_token)
+                    api.create_repo(results_repo, repo_type="dataset", private=True, exist_ok=True)
+                    api.upload_folder(repo_id=results_repo, repo_type="dataset", folder_path=str(RESULTS_DIR))
                 """
             ),
             markdown(
@@ -2852,6 +2850,12 @@ def build_06_qat_export():
                 if any([RUN_QAT, RUN_STANDARD_GGUF_EXPORT, BUILD_CALIBRATION_CORPUS]):
                     if ACCEPTED_REVISION.startswith("REPLACE_"):
                         raise RuntimeError("Pin the accepted adapter revision before export.")
+                # An existing public destination is found here, before the
+                # QAT run or the GGUF conversion spends the GPU.
+                if PUSH_QAT:
+                    require_private_repo(QAT_OUTPUT_ID)
+                if RUN_STANDARD_GGUF_EXPORT:
+                    require_private_repo(GGUF_OUTPUT_ID)
                 """
             ),
             markdown("## QAT-LoRA branch (fresh adapter from an accepted merged checkpoint)"),
@@ -2980,7 +2984,11 @@ def build_06_qat_export():
                         token=hf_token,
                     )
                     assert_model_fully_resident(export_model)
+                    from huggingface_hub import HfApi
                     require_private_repo(GGUF_OUTPUT_ID)
+                    # push_to_hub_gguf creates a missing repo with its own
+                    # default visibility; create it private first.
+                    HfApi(token=hf_token).create_repo(GGUF_OUTPUT_ID, repo_type="model", private=True, exist_ok=True)
                     export_model.push_to_hub_gguf(
                         GGUF_OUTPUT_ID,
                         export_tokenizer,
@@ -3101,6 +3109,7 @@ def build_07_collect_and_evaluate():
                     effort_ladder,
                     evaluate,
                     gate,
+                    build_provenance,
                     gate_passed,
                     pairing_problems,
                     read_report,
@@ -3199,26 +3208,25 @@ def build_07_collect_and_evaluate():
                     else:
                         print(f"no earlier reports at {GATE_REPORTS_REPO}; starting fresh.")
 
-                from datetime import datetime, timezone
-
+                # Recorded on every report this notebook writes, with the same
+                # writer the CLI uses. The gate refuses to pair two reports
+                # whose settings differ, and records a harness revision that does.
                 def report_provenance(model_ref: str, reasoning_effort: str = REASONING_EFFORT) -> dict:
-                    # Recorded on every report this notebook writes. The gate
-                    # refuses to pair two reports whose settings differ, and
-                    # records a harness revision that does.
-                    return {
-                        "model": model_ref,
-                        "harness_revision": repo_revision,
-                        "reasoning_effort": reasoning_effort,
-                        "max_new_tokens": MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort],
-                        "max_sequence_length": MAX_SEQUENCE_LENGTH,
-                        "episode_budget": {
-                            "tool_calls": EPISODE_BUDGET.tool_calls,
-                            "wall_seconds": EPISODE_BUDGET.wall_seconds,
-                        },
-                        "attempts_per_task": EVAL_ATTEMPTS,
-                        "variants_per_family": EVAL_VARIANTS_PER_FAMILY,
-                        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    }
+                    return build_provenance(
+                        model=model_ref,
+                        harness_revision=repo_revision,
+                        reasoning_effort=reasoning_effort,
+                        max_new_tokens=MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort],
+                        max_sequence_length=MAX_SEQUENCE_LENGTH,
+                        episode_budget=EPISODE_BUDGET,
+                        attempts_per_task=EVAL_ATTEMPTS,
+                        variants_per_family=EVAL_VARIANTS_PER_FAMILY,
+                    )
+
+                # Publishing is the last cell, but an existing public target
+                # is found now, before any GPU time is spent.
+                if PUSH_ARTIFACTS:
+                    require_private_repo(GATE_REPORTS_REPO, "dataset")
 
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
@@ -3443,6 +3451,11 @@ def build_07_collect_and_evaluate():
                 # one, else the pulled copy. A pulled candidate is never used:
                 # a fresh baseline gated against a stale candidate would
                 # republish a verdict nobody asked for.
+                comparison_path = REPORT_DIR / "comparison.json"
+                # A verdict from an earlier run of this cell in the same runtime
+                # must not survive a gate that is skipped or refused now, or the
+                # persist cell would push it as if it were this run's.
+                comparison_path.unlink(missing_ok=True)
                 baseline_for_gate = next(
                     (
                         path
@@ -3478,7 +3491,7 @@ def build_07_collect_and_evaluate():
                         for check in checks
                     ]
                     comparison["gate_passed"] = gate_passed(checks)
-                    (REPORT_DIR / "comparison.json").write_text(json.dumps(comparison, indent=2))
+                    comparison_path.write_text(json.dumps(comparison, indent=2))
 
                     print(json.dumps(comparison["deltas"], indent=2))
                     # Reasoning tokens per turn, share of generation spent thinking,
@@ -3792,6 +3805,11 @@ def build_08_distil():
                         teacher = TeacherConfig(**{**teacher.__dict__, "api_key_env": TEACHER_API_KEY_ENV})
                 TEACHER_DIR = RUN_ROOT / "teacher" / TEACHER_MODEL.replace("/", "-")
                 TEACHER_DIR.mkdir(parents=True, exist_ok=True)
+                TEACHER_REPO = f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}"
+                # An existing public destination is found here, before any
+                # teacher calls are paid for.
+                if PUSH_ARTIFACTS:
+                    require_private_repo(TEACHER_REPO, "dataset")
                 print(json.dumps({"teacher": teacher.label, "endpoint": teacher.base_url, "out": str(TEACHER_DIR)}, indent=2))
                 """
             ),
@@ -3894,14 +3912,10 @@ def build_08_distil():
                     if PUSH_ARTIFACTS:
                         from huggingface_hub import HfApi
 
-                        teacher_repo = f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}"
-                        require_private_repo(teacher_repo, "dataset")
-                        HfApi(token=hf_token).upload_folder(
-                            repo_id=teacher_repo,
-                            repo_type="dataset",
-                            folder_path=str(TEACHER_DIR),
-                            private=True,
-                        )
+                        require_private_repo(TEACHER_REPO, "dataset")
+                        api = HfApi(token=hf_token)
+                        api.create_repo(TEACHER_REPO, repo_type="dataset", private=True, exist_ok=True)
+                        api.upload_folder(repo_id=TEACHER_REPO, repo_type="dataset", folder_path=str(TEACHER_DIR))
                 else:
                     print("No teacher attempts in this session; nothing to pair.")
                 """
