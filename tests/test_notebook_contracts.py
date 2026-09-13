@@ -1125,7 +1125,9 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert "hub.delete_file(" in sft_config
     assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in sft_config
     assert sft_config.index("require_private_repo(OUTPUT_ADAPTER_ID)") < sft_config.index("hub.delete_file(")
-    assert "repo_exists(ACCEPTED_ADAPTER_ID)" not in gate_config
+    # Existence only guards resolving the commit; the decision itself keys on
+    # the completion marker at that commit.
+    assert "RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None and api.file_exists(" in gate_config
     # A baseline left by an earlier run in this runtime cannot shadow the pulled one.
     assert "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)" in gate_config
     assert gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)") < gate_config.index(
