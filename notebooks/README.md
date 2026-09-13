@@ -34,7 +34,7 @@ in, one generated turn out.
 
 Its reports outlive the runtime. Colab runtimes are per notebook and per
 session, so the baseline measured in one sitting is gone before the candidate
-exists; with `PUSH_ARTIFACTS = True` the last cell pushes everything under
+exists; the last cell (`PUSH_ARTIFACTS`, on by default) pushes everything under
 `REPORT_DIR` to a private dataset repo (`{HF_USERNAME}/qwen38-code-gate-reports`)
 and the configuration cell pulls it into a separate directory at the start of
 the next session. Every report records how it was measured (the model or
@@ -47,10 +47,29 @@ candidate measured in the current session with the baseline named by
 
 1. Select the **G4** GPU runtime.
 2. Add a write-capable `HF_TOKEN` in Colab Secrets and grant the notebook access.
-3. Open notebook 00 and run the install cell once.
-4. Restart the runtime when instructed, then rerun the notebook from the top.
-   The pinned install marker makes the repeated install cell a cheap no-op.
-5. Record immutable Hugging Face commit revisions before any non-demo run.
+3. Open the notebook and **Run all**. After the first install it asks for a
+   runtime restart; run all again and the pinned install marker makes the
+   install cell a cheap no-op.
+
+The notebooks ship configured for the real run, not a demo. The SFT loop is
+three notebooks in order, each one a Run all with nothing to edit:
+
+| Step | Notebook | What it does as shipped |
+|---|---|---|
+| 1 | 02 | Clones this repository, publishes the bootstrap corpus privately |
+| 2 | 03 | Trains the adapter on it for two epochs and pushes it privately |
+| 3 | 07 | Pulls earlier reports; measures a baseline only if none exists; gates the pushed adapter against it and pushes the reports |
+
+Notebook 07 works this out from the Hub each time, so the first run measures
+the baseline and every later run gates the current adapter. Notebook 04 (DPO)
+starts from the merged checkpoint of an adapter the gate accepted; it fails
+early with that message until notebook 03 has published one with
+`SAVE_MERGED_BF16 = PUSH_MERGED_BF16 = True`. Notebook 05 stays off until the
+pinned TRL grows the agentic trainer, and notebook 06's exports are opt-in.
+
+`DEMO_MODE = True` in notebooks 02 to 04 runs a two-step plumbing smoke on
+synthetic rows and publishes nothing. Every revision defaults to `main`; pin a
+commit to repeat a run exactly.
 
 The install cell keeps a detailed log at
 `/content/qwen38_pip_install.log` and prints its final 120 lines if a phase
@@ -59,9 +78,8 @@ fails. The reviewed core matrix is Transformers 5.3.0, TRL 0.22.2, Datasets
 Colab PyTorch minor. This matches the current Unsloth dependency bounds and
 the adjacent official Qwen3.5 27B example.
 
-Every expensive or externally persistent operation is off by default behind a
-`RUN_*`, `PUSH_*`, `SAVE_*` or `BUILD_*` flag. The included fixture rows prove
-plumbing only; they are explicitly not training data for a capability run.
+The included fixture rows prove plumbing only; they are explicitly not
+training data, and both the publish step and notebook 03 refuse them.
 
 ## Measuring whether any of this worked
 

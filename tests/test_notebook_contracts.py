@@ -767,7 +767,7 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     sft_args = code_cell_containing(generator.build_03_sft(), "training_args = SFTConfig(")
     assert "learning_rate=LEARNING_RATE," in sft_args
     sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
-    assert "LEARNING_RATE = 2e-5" in sft_config
+    assert "LEARNING_RATE = 1e-4" in sft_config
 
     # The run inputs a checkpoint must be attributed to are in its manifest.
     for cell, keys in (
@@ -1049,13 +1049,55 @@ def test_fixture_rows_are_refused_at_publish_and_at_training():
     """Flipping DEMO_MODE and rerunning only the publish cell once pushed
     the two-row fixture as the corpus. The guards read the rows, not the flag."""
     generator = load_generator()
-    publish_cell = code_cell_containing(generator.build_02_data(), "PUSH_DATASET = False")
+    publish_cell = code_cell_containing(generator.build_02_data(), "PUSH_DATASET = True")
     assert 'str(row_id).startswith("fixture/")' in publish_cell
-    assert "if DEMO_MODE or fixture_rows:" in publish_cell
-    assert publish_cell.index("if DEMO_MODE or fixture_rows:") < publish_cell.index("require_private_repo(")
+    assert "if DEMO_MODE:\n    PUSH_DATASET = False" in publish_cell
+    assert "if fixture_rows:" in publish_cell
+    assert publish_cell.index("if fixture_rows:") < publish_cell.index("require_private_repo(")
     load_cell = code_cell_containing(generator.build_03_sft(), "loaded = load_dataset(DATASET_ID")
     assert 'str(row_id).startswith("fixture/")' in load_cell
     assert "Rerun notebook 02 with DEMO_MODE=False" in load_cell
     # The fixture rows really are marked that way.
     demo_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
     assert demo_cell.count('"id": "fixture/') >= 2
+
+
+def test_notebooks_run_the_real_pipeline_as_shipped():
+    """Open, Run all: no demo default, no publish flag to flip, no placeholder
+    to fill in. Notebook 07 decides from the Hub what a session needs."""
+    generator = load_generator()
+    data_config = code_cell_containing(generator.build_02_data(), "SOURCE_LOCAL_JSONL")
+    assert "DEMO_MODE = False" in data_config
+    assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
+    assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
+    assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
+
+    sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
+    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 46"):
+        assert line in sft_config, line
+    # Demo mode clamps rather than raising, so a smoke needs one flag.
+    assert "MAX_STEPS, PUSH_ADAPTER, PUSH_MERGED_BF16 = 2, False, False" in sft_config
+
+    dpo_config = code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL")
+    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 16"):
+        assert line in dpo_config, line
+    assert 'PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")' in dpo_config
+    assert "repo_exists(MERGED_SFT_MODEL_ID)" in dpo_config
+
+    gate_config = code_cell_containing(generator.build_07_collect_and_evaluate(), "GATE_REPORTS_REPO =")
+    assert "EVAL_ATTEMPTS = 2" in gate_config
+    assert "PUSH_ARTIFACTS = True" in gate_config
+    assert "RUN_BASELINE_EVAL = None" in gate_config
+    assert "RUN_CANDIDATE_EVAL = None" in gate_config
+    assert "RUN_BASELINE_EVAL = not (HUB_REPORT_DIR / GATE_BASELINE_FILE).exists()" in gate_config
+    assert "RUN_CANDIDATE_EVAL = HfApi(token=hf_token).repo_exists(ACCEPTED_ADAPTER_ID)" in gate_config
+    # The decision comes after the pull that informs it.
+    assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = not")
+
+    for name, build in (
+        ("02", generator.build_02_data), ("03", generator.build_03_sft), ("04", generator.build_04_dpo),
+        ("05", generator.build_05_grpo), ("06", generator.build_06_qat_export),
+        ("07", generator.build_07_collect_and_evaluate),
+    ):
+        for cell in build().cells:
+            assert "REPLACE_WITH_" not in cell.source, name
