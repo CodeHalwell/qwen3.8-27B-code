@@ -1482,6 +1482,15 @@ def build_03_sft():
                 PUSH_ADAPTER = False
                 SAVE_MERGED_BF16 = False
                 PUSH_MERGED_BF16 = False
+                # 2e-5 is the main-run default (docs/training-plan.md, Stage 1);
+                # the sweep points are 5e-5 and 1e-4. A bootstrap-scale run of a
+                # few dozen steps sits at the top of that band, not the bottom.
+                LEARNING_RATE = 2e-5
+                # Every step in demo mode so the smoke exercises save and eval;
+                # every ten in a real run, because a save of this adapter pushes
+                # to the Hub and an eval pass runs the held-out split.
+                EVAL_EVERY_STEPS = 1 if DEMO_MODE else 10
+                SAVE_EVERY_STEPS = 1 if DEMO_MODE else 10
 
                 if DEMO_MODE and (PUSH_ADAPTER or PUSH_MERGED_BF16 or MAX_STEPS > 2):
                     raise RuntimeError("Demo mode is limited to two local smoke steps and cannot be published.")
@@ -1698,7 +1707,7 @@ def build_03_sft():
                     per_device_train_batch_size=1,
                     per_device_eval_batch_size=1,
                     gradient_accumulation_steps=8,
-                    learning_rate=2e-5,
+                    learning_rate=LEARNING_RATE,
                     warmup_ratio=0.05,
                     lr_scheduler_type="cosine",
                     max_steps=MAX_STEPS,
@@ -1708,9 +1717,9 @@ def build_03_sft():
                     weight_decay=0.01,
                     logging_steps=1,
                     eval_strategy="steps",
-                    eval_steps=1,
+                    eval_steps=EVAL_EVERY_STEPS,
                     save_strategy="steps",
-                    save_steps=1,
+                    save_steps=SAVE_EVERY_STEPS,
                     save_total_limit=2,
                     seed=3407,
                     report_to="trackio",
@@ -1718,6 +1727,7 @@ def build_03_sft():
                     push_to_hub=PUSH_ADAPTER,
                     hub_model_id=OUTPUT_ADAPTER_ID,
                     hub_strategy="every_save",
+                    hub_private_repo=True,
                 )
                 trainer = SFTTrainer(
                     model=model,
@@ -1933,6 +1943,10 @@ def build_04_dpo():
                 DEMO_MODE = True
                 RUN_TRAINING = False
                 PUSH_ADAPTER = False
+                # Every step in demo mode; every ten in a real run, since each
+                # save pushes the adapter and each eval scores the held-out split.
+                EVAL_EVERY_STEPS = 1 if DEMO_MODE else 10
+                SAVE_EVERY_STEPS = 1 if DEMO_MODE else 10
 
                 if RUN_TRAINING and MERGED_SFT_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the merged accepted SFT commit before DPO.")
@@ -2224,9 +2238,9 @@ def build_04_dpo():
                     optim="adamw_8bit",
                     logging_steps=1,
                     eval_strategy="steps",
-                    eval_steps=1,
+                    eval_steps=EVAL_EVERY_STEPS,
                     save_strategy="steps",
-                    save_steps=1,
+                    save_steps=SAVE_EVERY_STEPS,
                     save_total_limit=2,
                     precompute_ref_log_probs=True,
                     report_to="trackio",
@@ -2234,6 +2248,7 @@ def build_04_dpo():
                     push_to_hub=PUSH_ADAPTER,
                     hub_model_id=OUTPUT_ADAPTER_ID,
                     hub_strategy="every_save",
+                    hub_private_repo=True,
                     seed=3407,
                 )
                 trainer = DPOTrainer(
@@ -3084,6 +3099,28 @@ def build_07_collect_and_evaluate():
                 REPORT_DIR = RUN_ROOT / "gate"
                 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
+                # Colab runtimes are per notebook and per session, so a baseline
+                # measured today is gone before the candidate exists. The reports
+                # live in a private dataset repo; the last cell pushes them and
+                # this pulls whatever is already there so the gate can pair a
+                # fresh candidate with an earlier baseline.
+                GATE_REPORTS_REPO = f"{HF_USERNAME}/qwen38-code-gate-reports"
+                PULL_REPORTS_FROM_HUB = True
+                if PULL_REPORTS_FROM_HUB:
+                    from huggingface_hub import HfApi, snapshot_download
+
+                    if HfApi(token=hf_token).repo_exists(GATE_REPORTS_REPO, repo_type="dataset"):
+                        snapshot_download(
+                            GATE_REPORTS_REPO,
+                            repo_type="dataset",
+                            local_dir=str(REPORT_DIR),
+                            allow_patterns=["*.json", "*.jsonl"],
+                            token=hf_token,
+                        )
+                        print(f"pulled earlier reports: {sorted(p.name for p in REPORT_DIR.iterdir())}")
+                    else:
+                        print(f"no earlier reports at {GATE_REPORTS_REPO}; starting fresh.")
+
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
 
@@ -3384,20 +3421,41 @@ def build_07_collect_and_evaluate():
                     print(json.dumps(pairs_report, indent=2))
                     print(
                         f"wrote {len(length_pairs)} reasoning-length pairs; feed length_pairs.jsonl to "
-                        "notebook 04 as PREFERENCE_LOCAL_JSONL next to the execution-derived pairs."
+                        "notebook 04 as LENGTH_PAIRS_LOCAL_JSONL next to the execution-derived pairs."
                     )
-
-                    if PUSH_ARTIFACTS:
-                        from huggingface_hub import HfApi
-
-                        HfApi(token=hf_token).upload_folder(
-                            repo_id=f"{HF_USERNAME}/qwen38-code-collected-v0",
-                            repo_type="dataset",
-                            folder_path=str(REPORT_DIR),
-                            private=True,
-                        )
                 else:
                     print("Collection is off. Enable it once the baseline scorecard shows the failure mix.")
+                """
+            ),
+            markdown(
+                """
+                ## Persist the reports
+
+                Everything this notebook wrote under `REPORT_DIR` — baseline,
+                candidate, comparison, ladder rungs, any collected corpus and
+                its length pairs — goes to one private dataset repo, tagged
+                with the harness revision that produced it. The configuration
+                cell pulls the same repo back at the start of the next session.
+                """
+            ),
+            code(
+                r"""
+                if PUSH_ARTIFACTS:
+                    from huggingface_hub import HfApi
+
+                    api = HfApi(token=hf_token)
+                    api.create_repo(GATE_REPORTS_REPO, repo_type="dataset", private=True, exist_ok=True)
+                    commit = api.upload_folder(
+                        repo_id=GATE_REPORTS_REPO,
+                        repo_type="dataset",
+                        folder_path=str(REPORT_DIR),
+                        allow_patterns=["*.json", "*.jsonl"],
+                        commit_message=f"gate reports from {repo_revision[:12]}",
+                    )
+                    print(f"pushed {sorted(p.name for p in REPORT_DIR.iterdir())} to {GATE_REPORTS_REPO}")
+                    print(commit)
+                else:
+                    print("PUSH_ARTIFACTS is off; the reports stay in this runtime and vanish with it.")
                 """
             ),
             markdown(

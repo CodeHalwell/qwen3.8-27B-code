@@ -737,3 +737,60 @@ def test_notebook_07_caps_generation_per_effort_and_runs_the_ladder():
     assert "effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)" in ladder_cell
     assert "reasoning_effort=effort" in ladder_cell
     assert "effort_ladder.json" in ladder_cell
+
+
+def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
+    """A real run must not push an adapter to a public repo, and must not
+    save-and-push after every optimiser step."""
+    generator = load_generator()
+    for build, config_marker, args_marker in (
+        (generator.build_03_sft, "PUSH_MERGED_BF16 = False", "training_args = SFTConfig("),
+        (generator.build_04_dpo, "LENGTH_PAIRS_LOCAL_JSONL", "dpo_args = DPOConfig("),
+    ):
+        notebook = build()
+        config_cell = code_cell_containing(notebook, config_marker)
+        for demo_mode, expected in ((True, 1), (False, 10)):
+            namespace = {"DEMO_MODE": demo_mode}
+            for line in config_cell.splitlines():
+                if line.startswith(("EVAL_EVERY_STEPS", "SAVE_EVERY_STEPS")):
+                    exec(line, namespace)
+            assert namespace["EVAL_EVERY_STEPS"] == expected
+            assert namespace["SAVE_EVERY_STEPS"] == expected
+
+        args_cell = code_cell_containing(notebook, args_marker)
+        assert "eval_steps=EVAL_EVERY_STEPS," in args_cell
+        assert "save_steps=SAVE_EVERY_STEPS," in args_cell
+        assert "hub_private_repo=True," in args_cell
+        assert "eval_steps=1," not in args_cell
+        assert "save_steps=1," not in args_cell
+
+    sft_args = code_cell_containing(generator.build_03_sft(), "training_args = SFTConfig(")
+    assert "learning_rate=LEARNING_RATE," in sft_args
+    sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
+    assert "LEARNING_RATE = 2e-5" in sft_config
+
+
+def test_notebook_07_persists_reports_across_colab_sessions():
+    """The gate pairs a candidate with a baseline measured in an earlier
+    runtime, so the reports must round-trip through the Hub."""
+    generator = load_generator()
+    notebook = generator.build_07_collect_and_evaluate()
+    config_cell = code_cell_containing(notebook, "GATE_REPORTS_REPO =")
+    assert "PULL_REPORTS_FROM_HUB = True" in config_cell
+    assert "repo_exists(GATE_REPORTS_REPO" in config_cell
+    assert "snapshot_download(" in config_cell
+    assert "local_dir=str(REPORT_DIR)" in config_cell
+    # The pull happens before any report is written in this session.
+    assert config_cell.index("snapshot_download(") < config_cell.index("evaluation_suite = evaluation_tasks(")
+
+    persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
+    assert "private=True" in persist_cell
+    assert "exist_ok=True" in persist_cell
+    assert "folder_path=str(REPORT_DIR)" in persist_cell
+    assert "repo_revision" in persist_cell
+    # The persist cell is the last code cell, after the collection cell,
+    # so it carries everything the session produced.
+    code_cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]
+    assert code_cells[-1] == persist_cell
+    collection_cell = code_cell_containing(notebook, "if RUN_COLLECTION:")
+    assert "upload_folder" not in collection_cell

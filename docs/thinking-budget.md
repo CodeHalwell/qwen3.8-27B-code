@@ -155,7 +155,8 @@ more, so near-identical continuations do not become noise.
 
 The collector writes these pairs next to the corpus
 (`data/collected/length_pairs.jsonl`, with a quality report). Notebook 04
-loads them through `PREFERENCE_LOCAL_JSONL` like the execution-derived pairs.
+loads them through `LENGTH_PAIRS_LOCAL_JSONL`, next to the execution-derived
+pairs it loads through `PREFERENCE_LOCAL_JSONL`, and caps their share.
 
 Two limits are recorded in every report. For turns after the first, the
 rejected turn was generated under its own prefix, whose earlier reasoning and
