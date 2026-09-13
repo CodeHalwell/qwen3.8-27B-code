@@ -58,15 +58,16 @@ three notebooks in order, each one a Run all with nothing to edit:
 |---|---|---|
 | 1 | 02 | Clones this repository, publishes the bootstrap corpus privately |
 | 2 | 03 | Trains the adapter on it for two epochs and pushes it privately |
-| 3 | 07 | Pulls earlier reports; measures a baseline only if none exists; gates the pushed adapter against it and pushes the reports |
+| 3 | 07 | Pulls earlier reports; measures a baseline only if none exists; gates the pushed adapter against it, pushes the reports and, on a pass, publishes the merged accepted checkpoint |
 
 Notebook 07 works this out from the Hub each time, so the first run measures
 the baseline and every later run gates the current adapter. Notebook 04 (DPO)
-starts from the merged checkpoint of an adapter the gate accepted; it fails
-early with that message until notebook 03 has published one with
-`SAVE_MERGED_BF16 = PUSH_MERGED_BF16 = True`. Notebook 03 uploads its run
-manifest to each repo only after the weights, and notebooks 04 and 07 key on
-that file, so a run interrupted mid-upload is never mistaken for a finished one. Notebook 05 stays off until the
+starts from the merged checkpoint of an adapter the gate accepted, which
+notebook 07 publishes itself when its gate passes, from the exact candidate it
+gated; until a gate has passed, 04 fails early saying so. Each publishing
+notebook uploads a run manifest to a repo only after the weights, and the
+decisions in 04 and 07 key on that file, so a run interrupted mid-upload is
+never mistaken for a finished one. Notebook 05 stays off until the
 pinned TRL grows the agentic trainer, and notebook 06's exports are opt-in.
 
 `DEMO_MODE = True` in notebooks 02 to 04 runs a two-step plumbing smoke on

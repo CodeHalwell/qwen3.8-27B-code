@@ -746,7 +746,7 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     save-and-push after every optimiser step."""
     generator = load_generator()
     for build, config_marker, args_marker in (
-        (generator.build_03_sft, "PUSH_MERGED_BF16 = False", "training_args = SFTConfig("),
+        (generator.build_03_sft, "LEARNING_RATE = 1e-4", "training_args = SFTConfig("),
         (generator.build_04_dpo, "LENGTH_PAIRS_LOCAL_JSONL", "dpo_args = DPOConfig("),
     ):
         notebook = build()
@@ -768,12 +768,12 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
 
     sft_args = code_cell_containing(generator.build_03_sft(), "training_args = SFTConfig(")
     assert "learning_rate=LEARNING_RATE," in sft_args
-    sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
     assert "LEARNING_RATE = 1e-4" in sft_config
 
     # The run inputs a checkpoint must be attributed to are in its manifest.
     for cell, keys in (
-        (sft_config, ("learning_rate", "eval_every_steps", "save_every_steps", "optimizer")),
+        (sft_config, ("learning_rate", "num_train_epochs", "eval_every_steps", "save_every_steps", "optimizer")),
         (
             code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
             (
@@ -857,12 +857,13 @@ def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
     # Where the publish follows an expensive job, an existing public target
     # is found at configuration time, not after the GPU or the teacher bill.
     for name, marker, guard in (
-        ("03", "PUSH_MERGED_BF16 = False", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("03", "LEARNING_RATE = 1e-4", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("04", "LENGTH_PAIRS_LOCAL_JSONL", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("05", "ROLLOUT_POLICY_PRECISION = ", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(QAT_OUTPUT_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(GGUF_OUTPUT_ID)"),
         ("07", "GATE_REPORTS_REPO =", 'require_private_repo(GATE_REPORTS_REPO, "dataset")'),
+        ("07", "GATE_REPORTS_REPO =", "require_private_repo(MERGED_MODEL_ID)"),
         ("08", "TEACHER_REPO = ", 'require_private_repo(TEACHER_REPO, "dataset")'),
     ):
         config_cell = code_cell_containing(notebooks[name], marker)
@@ -1077,19 +1078,24 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
 
-    sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
-    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 48"):
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    for line in (
+        "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
+    ):
         assert line in sft_config, line
-    # Completion markers: the manifest goes up after the weights, on both repos.
+    # Completion marker: the manifest goes up after the adapter.
     train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
     assert train_cell.index("trainer.push_to_hub(") < train_cell.index('path_in_repo="run_manifest.json"')
-    merge_cell = code_cell_containing(generator.build_03_sft(), "push_to_hub_merged(")
-    assert merge_cell.index("push_to_hub_merged(") < merge_cell.index('path_in_repo="run_manifest.json"')
+    # Notebook 03 no longer merges: a merge of a retrained adapter is not the gated one.
+    for cell in generator.build_03_sft().cells:
+        assert "push_to_hub_merged(" not in cell.source
     # Demo mode clamps rather than raising, so a smoke needs one flag.
-    assert "MAX_STEPS, PUSH_ADAPTER, PUSH_MERGED_BF16 = 2, False, False" in sft_config
+    assert "MAX_STEPS, PUSH_ADAPTER = 2, False" in sft_config
 
     dpo_config = code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL")
-    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 16"):
+    for line in (
+        "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
+    ):
         assert line in dpo_config, line
     assert 'PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")' in dpo_config
     assert 'file_exists(\n                        MERGED_SFT_MODEL_ID, "run_manifest.json"' in dpo_config.replace(
@@ -1118,6 +1124,12 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     # The decision comes after the pull and the provenance helper that inform it.
     assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
     assert gate_config.index("def report_provenance(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
+    # The accepted merge is published by the gate, from the candidate in memory.
+    assert "PUBLISH_ACCEPTED_MERGE = True" in gate_config
+    merge_cell = code_cell_containing(generator.build_07_collect_and_evaluate(), "push_to_hub_merged(")
+    assert 'if comparison["gate_passed"] and PUBLISH_ACCEPTED_MERGE:' in merge_cell
+    assert merge_cell.index("push_to_hub_merged(") < merge_cell.index('path_in_repo="run_manifest.json"')
+    assert '"adapter": candidate_model_ref' in merge_cell
 
     for name, build in (
         ("02", generator.build_02_data), ("03", generator.build_03_sft), ("04", generator.build_04_dpo),
