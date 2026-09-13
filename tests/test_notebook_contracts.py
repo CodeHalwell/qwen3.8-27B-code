@@ -301,6 +301,14 @@ def test_generated_notebooks_have_restart_and_schema_guards():
     # The masking gate must not be pinned to a phrase only the demo row has.
     assert 'assert "Implemented the bounded clamp" in joined_supervision' not in all_source
     assert "masking_problems(" in all_source
+    # Nor to the observation's own text: a path an observation printed and the
+    # assistant's next command names is masked correctly and reads as a leak.
+    assert "OBSERVATION_MATCH_FLOOR" not in all_source
+    sft_masking = code_cell_containing(generator.build_03_sft(), "def masking_problems(")
+    assert 'OBSERVATION_TAG = "<tool_response>"' in sft_masking
+    assert "if OBSERVATION_TAG in supervised:" in sft_masking
+    assert "tool observation leaked into the loss" in sft_masking
+    assert 'message["role"] == "tool"' not in sft_masking
     # A bare "in_proj" matches none of Qwen3.8's DeltaNet projections.
     assert '"gate_proj", "up_proj", "down_proj", "in_proj", "out_proj",' not in all_source
 

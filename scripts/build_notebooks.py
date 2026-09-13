@@ -1984,7 +1984,14 @@ def build_03_sft():
                 # Checking for one phrase from the demo fixture made this gate
                 # pass only in demo mode: with real data it failed before
                 # training could start. Derive the expectation from each row.
-                OBSERVATION_MATCH_FLOOR = 40  # short observations coincide with patch text
+                #
+                # The chat template wraps every observation in this tag, so the
+                # tag inside the loss is an observation inside the loss. Looking
+                # for the observation's own text instead refused real agentic
+                # rows: an observation prints a path, the assistant's next
+                # command names that path, and the path is then in the loss
+                # while the observation is masked exactly as it should be.
+                OBSERVATION_TAG = "<tool_response>"
 
                 def masking_problems(tokenized_split, source_split) -> list[str]:
                     if len(tokenized_split) != len(source_split):
@@ -2002,21 +2009,17 @@ def build_03_sft():
                             problems.append(f"row {index}: no supervised tokens remain")
                             continue
                         supervised = tokenizer.decode(supervised_ids, skip_special_tokens=False)
+                        if OBSERVATION_TAG in supervised:
+                            problems.append(f"row {index}: tool observation leaked into the loss")
                         # A right-truncated row legitimately loses its tail, so
                         # only assert completeness where nothing was cut.
                         complete = len(row["input_ids"]) < MAX_SEQ_LENGTH
+                        if not complete:
+                            continue
                         for message in source_row["messages"]:
                             content = (message.get("content") or "").strip()
-                            if not content:
-                                continue
-                            if message["role"] == "assistant" and complete and content not in supervised:
+                            if message["role"] == "assistant" and content and content not in supervised:
                                 problems.append(f"row {index}: assistant content is masked out of the loss")
-                            if (
-                                message["role"] == "tool"
-                                and len(content) >= OBSERVATION_MATCH_FLOOR
-                                and content in supervised
-                            ):
-                                problems.append(f"row {index}: tool observation leaked into the loss")
                     return problems
 
                 masking_failures = (
