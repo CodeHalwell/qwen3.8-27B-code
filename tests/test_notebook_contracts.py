@@ -755,12 +755,12 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     save-and-push after every optimiser step."""
     generator = load_generator()
     for build, config_marker, args_marker in (
-        (generator.build_03_sft, "LEARNING_RATE = 1e-4", "training_args = SFTConfig("),
+        (generator.build_03_sft, "LEARNING_RATE = 5e-5", "training_args = SFTConfig("),
         (generator.build_04_dpo, "LENGTH_PAIRS_LOCAL_JSONL", "dpo_args = DPOConfig("),
     ):
         notebook = build()
         config_cell = code_cell_containing(notebook, config_marker)
-        for demo_mode, expected in ((True, 1), (False, 10)):
+        for demo_mode, expected in ((True, 1), (False, 50 if build is generator.build_03_sft else 10)):
             namespace = {"DEMO_MODE": demo_mode}
             for line in config_cell.splitlines():
                 if line.startswith(("EVAL_EVERY_STEPS", "SAVE_EVERY_STEPS")):
@@ -777,8 +777,8 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
 
     sft_args = code_cell_containing(generator.build_03_sft(), "training_args = SFTConfig(")
     assert "learning_rate=LEARNING_RATE," in sft_args
-    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
-    assert "LEARNING_RATE = 1e-4" in sft_config
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
+    assert "LEARNING_RATE = 5e-5" in sft_config
 
     # The run inputs a checkpoint must be attributed to are in its manifest.
     for cell, keys in (
@@ -866,12 +866,12 @@ def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
     # Where the publish follows an expensive job, an existing public target
     # is found at configuration time, not after the GPU or the teacher bill.
     for name, marker, guard in (
-        ("03", "LEARNING_RATE = 1e-4", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("03", "LEARNING_RATE = 5e-5", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("04", "LENGTH_PAIRS_LOCAL_JSONL", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("05", "ROLLOUT_POLICY_PRECISION = ", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(QAT_OUTPUT_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(GGUF_OUTPUT_ID)"),
-        ("03", "LEARNING_RATE = 1e-4", "require_private_repo(MERGED_MODEL_ID)"),
+        ("03", "LEARNING_RATE = 5e-5", "require_private_repo(MERGED_MODEL_ID)"),
         ("07", "GATE_REPORTS_REPO =", 'require_private_repo(GATE_REPORTS_REPO, "dataset")'),
         ("08", "TEACHER_REPO = ", 'require_private_repo(TEACHER_REPO, "dataset")'),
     ):
@@ -1101,7 +1101,7 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
 
-    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
     for line in (
         "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "PUSH_MERGED_SFT = True",
         "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
@@ -1155,7 +1155,7 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert 'api.file_exists(adapter_id, "run_manifest.json", revision=revision)' in gate_config
     # Notebook 03 removes an earlier marker before its first push, so an
     # intermediate checkpoint never inherits one.
-    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
     # ...and only once training is certain to start: a dry run or an early
     # failure must leave a valid adapter's marker alone.
     assert "hub.delete_file(" not in sft_config
@@ -1219,7 +1219,7 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     assert "if public_report:" in publish_cell
     assert publish_cell.index("dataset_dict.push_to_hub(") < publish_cell.index('path_in_repo="public_sources.json"')
     # The windowed rows fit the training window with the rendered overhead.
-    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
     assert "MAX_SEQ_LENGTH = 8_192" in sft_config
 
 

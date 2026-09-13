@@ -1686,15 +1686,19 @@ def build_03_sft():
                 PUSH_ADAPTER = True
                 PUSH_MERGED_SFT = True
                 # docs/training-plan.md, Stage 1: 2e-5 is the main-run default
-                # and 5e-5, 1e-4 the sweep points. A rank-16 adapter barely moves
-                # at 2e-5 over a few dozen steps, so this bootstrap-scale run sits
-                # at the top of the band; drop back for a corpus of thousands of rows.
-                LEARNING_RATE = 1e-4
-                # Every step in demo mode so the smoke exercises save and eval;
-                # every ten in a real run, because a save of this adapter pushes
-                # to the Hub and an eval pass runs the held-out split.
-                EVAL_EVERY_STEPS = 1 if DEMO_MODE else 10
-                SAVE_EVERY_STEPS = 1 if DEMO_MODE else 10
+                # and 5e-5, 1e-4 the sweep points. 1e-4 was for the 204-row
+                # bootstrap, where a rank-16 adapter had a few dozen steps to
+                # move at all. The corpus notebook 02 now builds is thousands
+                # of rows and hundreds of steps per epoch, so this drops to the
+                # middle of the band.
+                LEARNING_RATE = 5e-5
+                # Every step in demo mode so the smoke exercises save and eval.
+                # In a real run each eval reads the whole held-out split and each
+                # save pushes the adapter to the Hub, so the cadence is set
+                # against the step count: every ten steps costs more in eval and
+                # upload than in training once a run is hundreds of steps long.
+                EVAL_EVERY_STEPS = 1 if DEMO_MODE else 50
+                SAVE_EVERY_STEPS = 1 if DEMO_MODE else 50
 
                 if DEMO_MODE:
                     # A smoke run: two local steps on the fixture, nothing published.
