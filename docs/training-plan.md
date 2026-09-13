@@ -53,7 +53,8 @@ and none of them is a hyperparameter:
    rows alone. The long-horizon band then stops being excluded from training
    by construction; the [long-horizon requirements](#long-horizon) below
    are what make that exclusion measurable in the meantime.
-3. **An external gate.** The held-out suite is eight families. It detects
+3. **An external gate.** The held-out suite is nine families across the
+   short, medium and long bands. It detects
    regression and protocol damage; it cannot support a claim about coding
    ability in general. Before any checkpoint is called an improvement, score
    a contamination-aware external slice (SWE-bench Verified through the
@@ -161,9 +162,11 @@ behaviour.
 
 The ladder is then a decision, not only a table. `evaluation.effort_ladder()`
 (notebook 07's `RUN_EFFORT_LADDER`, or `scripts/evaluate_agent.py ladder`)
-takes the three reports and recommends the rung that thinks least among
-those whose success matches the best rung within a frozen tolerance, ties
-going to the lower overrun rate. That rung becomes the deployment default
+takes the three reports, scored on the same tasks, attempts and seeds, and
+recommends the rung that thinks least among those whose success matches
+the best rung within a frozen tolerance, in aggregate and in every designed
+horizon band, ties going to the lower overrun rate. That rung becomes the
+deployment default
 and the frozen baseline the gate compares against, so every later claim of
 thinking less is measured from the cheapest setting the stock model already
 supports rather than from `xhigh`.

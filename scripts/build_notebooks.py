@@ -3245,10 +3245,13 @@ def build_07_collect_and_evaluate():
                     ladder = effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)
                     (REPORT_DIR / "effort_ladder.json").write_text(json.dumps(ladder, indent=2))
                     print(json.dumps(ladder, indent=2))
-                    print(
-                        f"Recommended deployment effort: {ladder['recommended']}. Set REASONING_EFFORT to it "
-                        f"and use ladder_{ladder['recommended']}.json as the frozen baseline for the gate."
-                    )
+                    if ladder["recommended"] is None:
+                        print(f"{ladder['note']}. Do not set REASONING_EFFORT from this ladder.")
+                    else:
+                        print(
+                            f"Recommended deployment effort: {ladder['recommended']}. Set REASONING_EFFORT to it "
+                            f"and use ladder_{ladder['recommended']}.json as the frozen baseline for the gate."
+                        )
                 else:
                     print("Effort ladder is off. Run it once on the stock model before choosing REASONING_EFFORT.")
                 """

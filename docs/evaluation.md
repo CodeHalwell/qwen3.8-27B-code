@@ -23,12 +23,14 @@ Report confidence intervals or per-task outcomes, not only a single aggregate.
 The scorecard, the paired comparison and the thresholds below are implemented
 in `qwen3_8_27b_code.evaluation` and driven by `scripts/evaluate_agent.py`;
 notebook 07 supplies a model-backed policy. The held-out suite is
-`qwen3_8_27b_code.tasks.evaluation_tasks()`: eight families whose bug classes,
+`qwen3_8_27b_code.tasks.evaluation_tasks()`: nine families whose bug classes,
 modules and family names are disjoint from the SFT fixtures, each carrying a
 verifier executed outside the workspace the model can read. Six are
-single-file fixes; two, from `qwen3_8_27b_code.long_horizon`, plant a defect
-in each of two modules so that a fix to either alone leaves the suite red,
-which is what puts the medium horizon band on the scorecard.
+single-file fixes (the short band). From `qwen3_8_27b_code.long_horizon`,
+two plant a defect in each of two coupled modules so that a fix to either
+alone leaves the suite red (the medium band), and one is a four-stage
+pipeline with a defect and a test file per stage, repaired a stage at a
+time (the long band, seventeen calls on the gold path).
 
 Three properties of that implementation matter for interpreting a result:
 
@@ -132,8 +134,10 @@ move with the policy: a candidate that solves a pipeline in fewer calls
 moves it down a band. `task_horizon_bands` and `success_by_task_horizon`
 come from the band each task was designed for (`AgentTask.horizon`: short
 for a single-file fix, medium for two coupled modules, long for a four-stage
-pipeline), so membership is identical on both sides of a comparison and the
-gate's `task_horizon_no_worse` check can compare the same tasks. Read the
+pipeline). The gate's `task_horizon_no_worse` check computes the bands from
+the paired tasks, so both sides are the same tasks by construction; two
+reports that scored different tasks, or label a shared task differently,
+fail the check rather than slip past it. Read the
 long band before the aggregate whenever a change is meant to reduce
 thinking: brevity hurts the harder tasks first (see
 [Thinking budget](thinking-budget.md)).

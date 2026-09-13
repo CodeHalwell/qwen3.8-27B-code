@@ -91,11 +91,15 @@ rung has its own cap (`MAX_NEW_TOKENS_BY_EFFORT` in notebook 07), set
 above that rung's p95 reasoning length; otherwise the `xhigh` rung reports
 overruns, not effort.
 
-`evaluation.effort_ladder()` turns the three reports into a decision: the
-recommended rung is the one that thinks least among those whose success is
-within a frozen tolerance of the best, ties going to the lower overrun
-rate. Notebook 07 runs it with `RUN_EFFORT_LADDER`, and from the command
-line:
+`evaluation.effort_ladder()` turns the three reports into a decision. A rung
+is eligible when its success is within a frozen tolerance of the best rung
+both in aggregate and in every designed horizon band, so a cheaper rung
+that trades the pipeline for an extra short task is never recommended; the
+recommended rung is the eligible one that thinks least, ties going to the
+lower overrun rate, and when no rung keeps every band the ladder says so
+and recommends nothing. The three reports must score the same tasks with
+the same attempts and seeds, or the ladder refuses to rank them. Notebook
+07 runs it with `RUN_EFFORT_LADDER`, and from the command line:
 
 ```bash
 uv run --group dev python scripts/evaluate_agent.py ladder \

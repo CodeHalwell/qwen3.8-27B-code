@@ -107,10 +107,13 @@ def run_ladder(arguments: argparse.Namespace) -> int:
         arguments.out.parent.mkdir(parents=True, exist_ok=True)
         arguments.out.write_text(json.dumps(ladder, indent=2) + "\n")
     print(json.dumps(ladder, indent=2))
+    if ladder["recommended"] is None:
+        print(f"\n{ladder['note']}.")
+        return 1
     print(
         f"\nRecommended deployment effort: {ladder['recommended']} "
-        f"(best success {ladder['best_success']:.4f}, tolerance {ladder['success_tolerance']:.4f}, "
-        f"measured in {ladder['unit']})."
+        f"(best success {ladder['best_success']:.4f} in aggregate and per band within "
+        f"{ladder['success_tolerance']:.4f}, measured in {ladder['unit']})."
     )
     return 0
 
