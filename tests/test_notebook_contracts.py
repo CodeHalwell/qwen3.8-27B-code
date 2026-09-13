@@ -912,7 +912,11 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "revision=MODEL_REVISION," in baseline_cell
     assert baseline_cell.index("baseline_report_path.unlink(missing_ok=True)") < baseline_cell.index("evaluate(")
     candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
-    assert "resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in candidate_cell
+    # The candidate commit is pinned in the configuration cell, before the
+    # evaluation, and the same commit is loaded and recorded.
+    assert "CANDIDATE_REVISION = resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in config_cell
+    assert "revision=CANDIDATE_REVISION," in candidate_cell
+    assert 'candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{CANDIDATE_REVISION}"' in candidate_cell
     # A candidate counts only when this cell wrote it: the file is removed
     # before the evaluation and the flag set after the write.
     assert candidate_cell.index("candidate_written = False") < candidate_cell.index("if RUN_CANDIDATE_EVAL:")
@@ -1114,7 +1118,13 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     # session measures; otherwise the candidate would be refused at the gate.
     assert "RUN_BASELINE_EVAL = bool(mismatches)" in gate_config
     assert "read_report(pulled_baseline).metadata, report_provenance(stock_model_ref)" in gate_config
-    assert 'ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=ACCEPTED_REVISION' in gate_config
+    assert 'ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=CANDIDATE_REVISION' in gate_config
+    # Notebook 03 removes an earlier marker before its first push, so an
+    # intermediate checkpoint never inherits one.
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    assert "hub.delete_file(" in sft_config
+    assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in sft_config
+    assert sft_config.index("require_private_repo(OUTPUT_ADAPTER_ID)") < sft_config.index("hub.delete_file(")
     assert "repo_exists(ACCEPTED_ADAPTER_ID)" not in gate_config
     # A baseline left by an earlier run in this runtime cannot shadow the pulled one.
     assert "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)" in gate_config

@@ -1542,6 +1542,17 @@ def build_03_sft():
                 # existing public repo is caught here, before that happens.
                 if PUSH_ADAPTER:
                     require_private_repo(OUTPUT_ADAPTER_ID)
+                    # An earlier run's completion marker must not survive into
+                    # this run's intermediate pushes, or notebook 07 would take
+                    # a half-trained adapter for a finished one.
+                    from huggingface_hub import HfApi
+
+                    hub = HfApi(token=hf_token)
+                    if hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
+                        hub.delete_file(
+                            "run_manifest.json", OUTPUT_ADAPTER_ID,
+                            commit_message="training started: completion marker removed",
+                        )
 
                 run_manifest = {
                     "stage": "sft",
@@ -3338,12 +3349,21 @@ def build_07_collect_and_evaluate():
                     # The gate prefers this session's file over the pulled copy,
                     # so one left by an earlier run in this runtime must go.
                     (REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)
+                # The candidate revision is pinned here, before the evaluation,
+                # so a push during it cannot change what the report and the
+                # merge name. Notebook 03 removes its run manifest when training
+                # starts and uploads it after the final adapter push, so a
+                # revision that carries it is a training run that finished.
+                api = HfApi(token=hf_token)
+                CANDIDATE_REVISION = None
+                if api.repo_exists(ACCEPTED_ADAPTER_ID):
+                    CANDIDATE_REVISION = resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)
                 if RUN_CANDIDATE_EVAL is None:
-                    # Notebook 03 uploads its run manifest after the final adapter
-                    # push, so this is true only for a training run that finished.
-                    RUN_CANDIDATE_EVAL = HfApi(token=hf_token).file_exists(
-                        ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=ACCEPTED_REVISION
+                    RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None and api.file_exists(
+                        ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=CANDIDATE_REVISION
                     )
+                if RUN_CANDIDATE_EVAL and CANDIDATE_REVISION is None:
+                    raise RuntimeError(f"{ACCEPTED_ADAPTER_ID} does not exist; nothing to gate.")
                 print(json.dumps({"run_baseline_eval": RUN_BASELINE_EVAL, "run_candidate_eval": RUN_CANDIDATE_EVAL}, indent=2))
 
                 # Six single-file families (short band) plus the three multi-file
@@ -3545,7 +3565,7 @@ def build_07_collect_and_evaluate():
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
-                        revision=ACCEPTED_REVISION,
+                        revision=CANDIDATE_REVISION,
                         max_seq_length=MAX_SEQUENCE_LENGTH,
                         load_in_4bit=False,
                         token=hf_token,
@@ -3560,7 +3580,7 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
-                    candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)}"
+                    candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{CANDIDATE_REVISION}"
                     candidate.metadata = report_provenance(candidate_model_ref)
                     write_report(candidate, candidate_report_path)
                     candidate_written = True
