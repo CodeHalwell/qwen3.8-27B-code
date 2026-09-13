@@ -779,9 +779,35 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "PULL_REPORTS_FROM_HUB = True" in config_cell
     assert "repo_exists(GATE_REPORTS_REPO" in config_cell
     assert "snapshot_download(" in config_cell
-    assert "local_dir=str(REPORT_DIR)" in config_cell
-    # The pull happens before any report is written in this session.
-    assert config_cell.index("snapshot_download(") < config_cell.index("evaluation_suite = evaluation_tasks(")
+    # Pulled copies never land where this session writes: a stale report
+    # must be chosen by name, not found by accident.
+    assert 'HUB_REPORT_DIR = RUN_ROOT / "gate_hub"' in config_cell
+    assert "local_dir=str(HUB_REPORT_DIR)" in config_cell
+    assert "local_dir=str(REPORT_DIR)" not in config_cell
+    assert 'GATE_BASELINE_FILE = "baseline.json"' in config_cell
+    assert "def report_provenance(" in config_cell
+    for key in ("model", "harness_revision", "reasoning_effort", "max_new_tokens", "episode_budget", "attempts_per_task"):
+        assert f'"{key}":' in config_cell
+
+    # Every report this notebook writes records how it was measured.
+    for marker, model_ref in (
+        ("RUN_BASELINE_EVAL:", "report_provenance(MODEL_ID)"),
+        ("RUN_EFFORT_LADDER:", "report_provenance(MODEL_ID, reasoning_effort=effort)"),
+        ("RUN_CANDIDATE_EVAL:", 'report_provenance(f"{ACCEPTED_ADAPTER_ID}@{ACCEPTED_REVISION}")'),
+    ):
+        cell = code_cell_containing(notebook, marker)
+        assert model_ref in cell
+        assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
+
+    # The gate pairs only this session's candidate with a named baseline,
+    # and refuses reports measured differently.
+    gate_cell = code_cell_containing(notebook, 'comparison["gate_passed"]')
+    assert "RUN_CANDIDATE_EVAL and candidate_report_path.exists()" in gate_cell
+    assert "HUB_REPORT_DIR / GATE_BASELINE_FILE" in gate_cell
+    assert "HUB_REPORT_DIR / \"candidate.json\"" not in gate_cell
+    assert "pairing_problems(" in gate_cell
+    assert "GATE NOT RUN" in gate_cell
+    assert 'comparison["provenance"]' in gate_cell
 
     persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
     assert "private=True" in persist_cell

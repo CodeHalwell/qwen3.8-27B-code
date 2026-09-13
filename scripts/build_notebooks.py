@@ -3031,6 +3031,7 @@ def build_07_collect_and_evaluate():
                     evaluate,
                     gate,
                     gate_passed,
+                    pairing_problems,
                     read_report,
                     write_report,
                 )
@@ -3101,11 +3102,17 @@ def build_07_collect_and_evaluate():
 
                 # Colab runtimes are per notebook and per session, so a baseline
                 # measured today is gone before the candidate exists. The reports
-                # live in a private dataset repo; the last cell pushes them and
-                # this pulls whatever is already there so the gate can pair a
-                # fresh candidate with an earlier baseline.
+                # live in a private dataset repo; the last cell pushes this
+                # session's REPORT_DIR and this pulls the earlier ones into a
+                # separate directory. Nothing pulled is ever mistaken for this
+                # session's work: the gate takes the baseline by name from
+                # either place and the candidate only from this session.
                 GATE_REPORTS_REPO = f"{HF_USERNAME}/qwen38-code-gate-reports"
                 PULL_REPORTS_FROM_HUB = True
+                HUB_REPORT_DIR = RUN_ROOT / "gate_hub"
+                # The frozen baseline the gate pairs with this session's candidate:
+                # baseline.json, or a ladder rung such as ladder_medium.json.
+                GATE_BASELINE_FILE = "baseline.json"
                 if PULL_REPORTS_FROM_HUB:
                     from huggingface_hub import HfApi, snapshot_download
 
@@ -3113,13 +3120,34 @@ def build_07_collect_and_evaluate():
                         snapshot_download(
                             GATE_REPORTS_REPO,
                             repo_type="dataset",
-                            local_dir=str(REPORT_DIR),
+                            local_dir=str(HUB_REPORT_DIR),
                             allow_patterns=["*.json", "*.jsonl"],
                             token=hf_token,
                         )
-                        print(f"pulled earlier reports: {sorted(p.name for p in REPORT_DIR.iterdir())}")
+                        print(f"pulled earlier reports: {sorted(p.name for p in HUB_REPORT_DIR.iterdir())}")
                     else:
                         print(f"no earlier reports at {GATE_REPORTS_REPO}; starting fresh.")
+
+                from datetime import datetime, timezone
+
+                def report_provenance(model_ref: str, reasoning_effort: str = REASONING_EFFORT) -> dict:
+                    # Recorded on every report this notebook writes. The gate
+                    # refuses to pair two reports whose settings differ, and
+                    # records a harness revision that does.
+                    return {
+                        "model": model_ref,
+                        "harness_revision": repo_revision,
+                        "reasoning_effort": reasoning_effort,
+                        "max_new_tokens": MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort],
+                        "max_sequence_length": MAX_SEQUENCE_LENGTH,
+                        "episode_budget": {
+                            "tool_calls": EPISODE_BUDGET.tool_calls,
+                            "wall_seconds": EPISODE_BUDGET.wall_seconds,
+                        },
+                        "attempts_per_task": EVAL_ATTEMPTS,
+                        "variants_per_family": EVAL_VARIANTS_PER_FAMILY,
+                        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
 
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
@@ -3244,6 +3272,7 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
+                    baseline.metadata = report_provenance(MODEL_ID)
                     write_report(baseline, baseline_report_path)
                     print(json.dumps(baseline.scorecard(), indent=2))
                     print(f"wrote {baseline_report_path}")
@@ -3279,6 +3308,7 @@ def build_07_collect_and_evaluate():
                             attempts_per_task=EVAL_ATTEMPTS,
                             budget=EPISODE_BUDGET,
                         )
+                        ladder_reports[effort].metadata = report_provenance(MODEL_ID, reasoning_effort=effort)
                         write_report(ladder_reports[effort], REPORT_DIR / f"ladder_{effort}.json")
                     ladder = effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)
                     (REPORT_DIR / "effort_ladder.json").write_text(json.dumps(ladder, indent=2))
@@ -3327,6 +3357,7 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
+                    candidate.metadata = report_provenance(f"{ACCEPTED_ADAPTER_ID}@{ACCEPTED_REVISION}")
                     write_report(candidate, candidate_report_path)
                     print(json.dumps(candidate.scorecard(), indent=2))
                 else:
@@ -3336,10 +3367,40 @@ def build_07_collect_and_evaluate():
             markdown("## Apply the gate"),
             code(
                 r"""
-                if baseline_report_path.exists() and candidate_report_path.exists():
-                    comparison = compare(
-                        read_report(baseline_report_path), read_report(candidate_report_path)
-                    )
+                # The candidate is always the one measured in this session. The
+                # baseline is GATE_BASELINE_FILE from this session if it wrote
+                # one, else the pulled copy. A pulled candidate is never used:
+                # a fresh baseline gated against a stale candidate would
+                # republish a verdict nobody asked for.
+                baseline_for_gate = next(
+                    (
+                        path
+                        for path in (REPORT_DIR / GATE_BASELINE_FILE, HUB_REPORT_DIR / GATE_BASELINE_FILE)
+                        if path.exists()
+                    ),
+                    None,
+                )
+                if not (RUN_CANDIDATE_EVAL and candidate_report_path.exists()):
+                    print("The gate needs a candidate measured in this session (RUN_CANDIDATE_EVAL).")
+                elif baseline_for_gate is None:
+                    print(f"No {GATE_BASELINE_FILE} in this session or on {GATE_REPORTS_REPO}; measure a baseline first.")
+                elif (blocking := pairing_problems(
+                    baseline_report := read_report(baseline_for_gate),
+                    candidate_report := read_report(candidate_report_path),
+                ))[0]:
+                    for problem in blocking[0]:
+                        print(f"  [REFUSED] {problem}")
+                    print("GATE NOT RUN: the two reports were not measured the same way.")
+                else:
+                    advisory = blocking[1]
+                    for note in advisory:
+                        print(f"  [NOTE] {note}")
+                    comparison = compare(baseline_report, candidate_report)
+                    comparison["provenance"] = {
+                        "baseline": {**baseline_report.metadata, "path": str(baseline_for_gate)},
+                        "candidate": candidate_report.metadata,
+                        "notes": advisory,
+                    }
                     checks = gate(comparison, max_reasoning_growth=MAX_REASONING_GROWTH)
                     comparison["gate"] = [
                         {"name": check.name, "passed": check.passed, "detail": check.detail}
@@ -3362,8 +3423,6 @@ def build_07_collect_and_evaluate():
                         f"{task_level['ties']} unchanged, of {task_level['tasks']} tasks."
                     )
                     print("GATE PASSED" if comparison["gate_passed"] else "GATE FAILED")
-                else:
-                    print("Both a baseline and a candidate report are required before the gate can run.")
                 """
             ),
             markdown(
@@ -3431,11 +3490,12 @@ def build_07_collect_and_evaluate():
                 """
                 ## Persist the reports
 
-                Everything this notebook wrote under `REPORT_DIR` — baseline,
+                Everything this session wrote under `REPORT_DIR` — baseline,
                 candidate, comparison, ladder rungs, any collected corpus and
                 its length pairs — goes to one private dataset repo, tagged
-                with the harness revision that produced it. The configuration
-                cell pulls the same repo back at the start of the next session.
+                with the harness revision that produced it. Pulled copies live
+                in `HUB_REPORT_DIR` and are not pushed back. The configuration
+                cell pulls the same repo at the start of the next session.
                 """
             ),
             code(

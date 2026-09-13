@@ -103,6 +103,10 @@ def _rate(numerator: int, denominator: int) -> float:
 class EvaluationReport:
     label: str
     records: list[AttemptRecord] = field(default_factory=list)
+    # How the numbers were measured: model reference, harness revision,
+    # effort, caps, budget and attempt count. ``pairing_problems`` reads it
+    # before two reports are gated against each other.
+    metadata: dict = field(default_factory=dict)
 
     @property
     def scored(self) -> list[AttemptRecord]:
@@ -225,11 +229,12 @@ class EvaluationReport:
                 for task_id, outcomes in self.task_outcomes().items()
             },
             "attempts": [record.as_dict() for record in self.records],
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> "EvaluationReport":
-        report = cls(label=payload["scorecard"]["label"])
+        report = cls(label=payload["scorecard"]["label"], metadata=dict(payload.get("metadata") or {}))
         for row in payload["attempts"]:
             fields = {
                 key: value for key, value in row.items()
@@ -299,6 +304,52 @@ class GateCheck:
     name: str
     passed: bool
     detail: str
+
+
+# Measurement settings two reports must share before the gate pairs them.
+PROVENANCE_STRICT_KEYS = (
+    "reasoning_effort",
+    "max_new_tokens",
+    "max_sequence_length",
+    "episode_budget",
+    "attempts_per_task",
+    "variants_per_family",
+)
+# Recorded on the comparison when they differ, but not fatal: ``compare``
+# already refuses a different task set, and a harness revision can change
+# without touching the suite.
+PROVENANCE_ADVISORY_KEYS = ("harness_revision",)
+
+
+def pairing_problems(
+    baseline: EvaluationReport, candidate: EvaluationReport
+) -> tuple[list[str], list[str]]:
+    """Why two reports must not be gated against each other.
+
+    Returns ``(blocking, advisory)``. Blocking: a report with no recorded
+    provenance, a measurement setting in ``PROVENANCE_STRICT_KEYS`` that
+    differs, or two reports of the same model reference, which is a
+    baseline paired with itself. Advisory: an ``PROVENANCE_ADVISORY_KEYS``
+    value that differs, worth recording next to the verdict.
+    """
+    blocking: list[str] = []
+    advisory: list[str] = []
+    for name, report in (("baseline", baseline), ("candidate", candidate)):
+        if not report.metadata:
+            blocking.append(f"{name} report {report.label!r} carries no provenance; re-measure it")
+    if blocking:
+        return blocking, advisory
+    for key in PROVENANCE_STRICT_KEYS:
+        before, after = baseline.metadata.get(key), candidate.metadata.get(key)
+        if before != after:
+            blocking.append(f"{key}: baseline {before!r}, candidate {after!r}")
+    if baseline.metadata.get("model") == candidate.metadata.get("model"):
+        blocking.append(f"both reports measure {baseline.metadata.get('model')!r}")
+    for key in PROVENANCE_ADVISORY_KEYS:
+        before, after = baseline.metadata.get(key), candidate.metadata.get(key)
+        if before != after:
+            advisory.append(f"{key}: baseline {before!r}, candidate {after!r}")
+    return blocking, advisory
 
 
 def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:

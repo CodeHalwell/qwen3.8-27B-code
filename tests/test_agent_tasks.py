@@ -667,6 +667,68 @@ def test_comparing_reports_with_no_shared_tasks_is_an_error():
         evaluation.compare(first, second)
 
 
+def _provenance(model: str, **overrides) -> dict:
+    return {
+        "model": model,
+        "harness_revision": "abc123",
+        "reasoning_effort": "medium",
+        "max_new_tokens": 4096,
+        "max_sequence_length": 32768,
+        "episode_budget": {"tool_calls": 30, "wall_seconds": 900.0},
+        "attempts_per_task": 1,
+        "variants_per_family": 1,
+        **overrides,
+    }
+
+
+def test_report_provenance_round_trips_through_the_report_file(tmp_path):
+    report = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="a")
+    report.metadata = _provenance("unsloth/Qwen3.8-27B")
+    payload = evaluation.write_report(report, tmp_path / "a.json")
+    assert payload["metadata"] == report.metadata
+    assert evaluation.read_report(tmp_path / "a.json").metadata == report.metadata
+    # A report written before provenance existed still loads, empty.
+    (tmp_path / "old.json").write_text(json.dumps({k: v for k, v in payload.items() if k != "metadata"}))
+    assert evaluation.read_report(tmp_path / "old.json").metadata == {}
+
+
+def test_gate_pairing_refuses_reports_measured_differently():
+    """A stale report pulled from storage must not be gated against a fresh
+    one unless both record the same measurement settings."""
+    baseline = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="baseline")
+    candidate = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="candidate")
+
+    blocking, advisory = evaluation.pairing_problems(baseline, candidate)
+    assert len(blocking) == 2 and all("no provenance" in problem for problem in blocking)
+
+    baseline.metadata = _provenance("unsloth/Qwen3.8-27B")
+    candidate.metadata = _provenance("me/adapter@deadbeef")
+    assert evaluation.pairing_problems(baseline, candidate) == ([], [])
+
+    # Same model on both sides is a baseline paired with itself.
+    candidate.metadata = _provenance("unsloth/Qwen3.8-27B")
+    blocking, _ = evaluation.pairing_problems(baseline, candidate)
+    assert blocking and "both reports measure" in blocking[0]
+
+    # A different effort, cap, budget or attempt count is a different experiment.
+    for key, value in (
+        ("reasoning_effort", "low"),
+        ("max_new_tokens", 2048),
+        ("episode_budget", {"tool_calls": 10, "wall_seconds": 900.0}),
+        ("attempts_per_task", 3),
+    ):
+        candidate.metadata = _provenance("me/adapter@deadbeef", **{key: value})
+        blocking, _ = evaluation.pairing_problems(baseline, candidate)
+        assert blocking == [f"{key}: baseline {baseline.metadata[key]!r}, candidate {value!r}"]
+
+    # A harness revision that moved is recorded, not fatal: compare() already
+    # refuses a different task set.
+    candidate.metadata = _provenance("me/adapter@deadbeef", harness_revision="def456")
+    blocking, advisory = evaluation.pairing_problems(baseline, candidate)
+    assert blocking == []
+    assert advisory == ["harness_revision: baseline 'abc123', candidate 'def456'"]
+
+
 # --------------------------------------------------------------------------
 # Policy loading
 
