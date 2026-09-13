@@ -390,6 +390,25 @@ def build_provenance(
     }
 
 
+def provenance_mismatches(
+    recorded: dict, expected: dict, keys: tuple[str, ...] = PROVENANCE_REQUIRED_KEYS
+) -> list[str]:
+    """How a recorded provenance differs from the one a session would write.
+
+    Lets a notebook decide whether a stored baseline can stand in for one
+    measured now, before it spends a candidate evaluation that the gate
+    would then refuse to pair. A key missing from the record counts as a
+    difference.
+    """
+    mismatches = []
+    for key in keys:
+        if key not in recorded:
+            mismatches.append(f"{key}: not recorded, expected {expected.get(key)!r}")
+        elif recorded[key] != expected.get(key):
+            mismatches.append(f"{key}: recorded {recorded[key]!r}, expected {expected.get(key)!r}")
+    return mismatches
+
+
 def pairing_problems(
     baseline: EvaluationReport, candidate: EvaluationReport
 ) -> tuple[list[str], list[str]]:

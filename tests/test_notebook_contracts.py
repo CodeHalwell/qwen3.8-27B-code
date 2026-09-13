@@ -1054,8 +1054,11 @@ def test_fixture_rows_are_refused_at_publish_and_at_training():
     assert "if DEMO_MODE:\n    PUSH_DATASET = False" in publish_cell
     assert "if fixture_rows:" in publish_cell
     assert publish_cell.index("if fixture_rows:") < publish_cell.index("require_private_repo(")
+    # Rows without an id are valid; the scan tolerates a missing column.
+    assert '"id" in split.column_names' in publish_cell
     load_cell = code_cell_containing(generator.build_03_sft(), "loaded = load_dataset(DATASET_ID")
     assert 'str(row_id).startswith("fixture/")' in load_cell
+    assert '"id" in loaded[split].column_names' in load_cell
     assert "Rerun notebook 02 with DEMO_MODE=False" in load_cell
     # The fixture rows really are marked that way.
     demo_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
@@ -1089,10 +1092,14 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert "PUSH_ARTIFACTS = True" in gate_config
     assert "RUN_BASELINE_EVAL = None" in gate_config
     assert "RUN_CANDIDATE_EVAL = None" in gate_config
-    assert "RUN_BASELINE_EVAL = not (HUB_REPORT_DIR / GATE_BASELINE_FILE).exists()" in gate_config
+    # A pulled baseline stands in only if it was measured the way this
+    # session measures; otherwise the candidate would be refused at the gate.
+    assert "RUN_BASELINE_EVAL = bool(mismatches)" in gate_config
+    assert "read_report(pulled_baseline).metadata, report_provenance(stock_model_ref)" in gate_config
     assert "RUN_CANDIDATE_EVAL = HfApi(token=hf_token).repo_exists(ACCEPTED_ADAPTER_ID)" in gate_config
-    # The decision comes after the pull that informs it.
-    assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = not")
+    # The decision comes after the pull and the provenance helper that inform it.
+    assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
+    assert gate_config.index("def report_provenance(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
 
     for name, build in (
         ("02", generator.build_02_data), ("03", generator.build_03_sft), ("04", generator.build_04_dpo),

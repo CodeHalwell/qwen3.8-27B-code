@@ -1441,7 +1441,9 @@ def build_02_data():
                     # memory. Flipping DEMO_MODE and rerunning only this cell
                     # would otherwise publish the fixture the loading cell built.
                     fixture_rows = sum(
-                        str(row_id).startswith("fixture/") for split in dataset_dict.values() for row_id in split["id"]
+                        str(row_id).startswith("fixture/")
+                        for split in dataset_dict.values()
+                        for row_id in (split["id"] if "id" in split.column_names else [])
                     )
                     if fixture_rows:
                         raise RuntimeError(
@@ -1731,7 +1733,9 @@ def build_03_sft():
                     if len(loaded["train"]) == 0 or len(loaded["validation"]) == 0:
                         raise ValueError("Both train and validation splits must contain at least one repository family.")
                     fixture_rows = sum(
-                        str(row_id).startswith("fixture/") for split in ("train", "validation") for row_id in loaded[split]["id"]
+                        str(row_id).startswith("fixture/")
+                        for split in ("train", "validation")
+                        for row_id in (loaded[split]["id"] if "id" in loaded[split].column_names else [])
                     )
                     if fixture_rows:
                         raise ValueError(
@@ -3185,6 +3189,7 @@ def build_07_collect_and_evaluate():
                     gate,
                     gate_passed,
                     pairing_problems,
+                    provenance_mismatches,
                     read_report,
                     write_report,
                 )
@@ -3322,7 +3327,18 @@ def build_07_collect_and_evaluate():
                 from huggingface_hub import HfApi
 
                 if RUN_BASELINE_EVAL is None:
-                    RUN_BASELINE_EVAL = not (HUB_REPORT_DIR / GATE_BASELINE_FILE).exists()
+                    pulled_baseline = HUB_REPORT_DIR / GATE_BASELINE_FILE
+                    RUN_BASELINE_EVAL = True
+                    if pulled_baseline.exists():
+                        # Reuse it only if it was measured the way this session
+                        # measures: otherwise the candidate would be evaluated
+                        # in full and then refused at the gate.
+                        mismatches = provenance_mismatches(
+                            read_report(pulled_baseline).metadata, report_provenance(stock_model_ref)
+                        )
+                        RUN_BASELINE_EVAL = bool(mismatches)
+                        for line in mismatches:
+                            print(f"pulled baseline differs, measuring a new one: {line}")
                 if RUN_CANDIDATE_EVAL is None:
                     RUN_CANDIDATE_EVAL = HfApi(token=hf_token).repo_exists(ACCEPTED_ADAPTER_ID)
                 print(json.dumps({"run_baseline_eval": RUN_BASELINE_EVAL, "run_candidate_eval": RUN_CANDIDATE_EVAL}, indent=2))
