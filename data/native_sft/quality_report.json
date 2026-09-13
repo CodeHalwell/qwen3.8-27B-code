@@ -1,7 +1,7 @@
 {
   "generator_version": "scripted-gold-v1",
   "rows": 204,
-  "corpus_sha256": "3c20ce7fb9ee43955f79078c8d46f212edf65344630bc5a6113adf19504edcc8",
+  "corpus_sha256": "2c99581fd97a4c0871f12c628119cd775893c6d26061cf5bc75b7ec65277498d",
   "families": {
     "bounds": 17,
     "config": 17,
@@ -51,11 +51,11 @@
     "rows": 204,
     "tokenizer": "unsloth/Qwen3.8-27B",
     "tokens": {
-      "p50": 1057,
-      "p90": 1485,
-      "p99": 1735,
-      "max": 1780,
-      "total": 233300
+      "p50": 1068,
+      "p90": 1496,
+      "p99": 1746,
+      "max": 1789,
+      "total": 235539
     },
     "max_length_checked": 4096
   }

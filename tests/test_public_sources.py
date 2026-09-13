@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 import pytest
 
-from qwen3_8_27b_code import public_sources as ps
+from qwen3_8_27b_code import harness, public_sources as ps
 from qwen3_8_27b_code.schema import TOOL_SCHEMA_JSON, TOOL_SCHEMA_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,24 @@ def test_open_swe_bash_becomes_the_native_shell_tool():
     assert row["verification"]["window"] == "whole"
 
 
+def test_open_swe_rows_end_before_the_unanswered_submit_command():
+    # Real trajectories end on a bash call to the submit command that no
+    # tool message answers; the row stops at the last observation.
+    row = _swe_row(turns=2)
+    row["messages"][-1] = {
+        "role": "assistant", "content": "Patch verified.", "reasoning_content": "done",
+        "tool_calls": [{"function": {"name": "bash", "arguments": json.dumps(
+            {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt"}
+        )}, "type": "function"}],
+    }
+    (converted,) = ps.convert_open_swe_row(row, budget_tokens=10_000)
+    assert [m["role"] for m in converted["messages"]] == ["developer", "user", "assistant", "tool", "assistant", "tool"]
+    assert "COMPLETE_TASK" not in json.dumps(converted["messages"])
+    # Any other unanswered call is a truncated trace, not an ending.
+    row["messages"][-1]["tool_calls"][0]["function"]["arguments"] = json.dumps({"command": "pytest"})
+    assert ps.convert_open_swe_row(row, budget_tokens=10_000) == []
+
+
 def test_open_swe_rows_that_did_not_resolve_or_use_other_tools_are_dropped():
     assert ps.convert_open_swe_row(_swe_row(resolved=0), budget_tokens=10_000) == []
     assert ps.convert_open_swe_row(_swe_row(tool="str_replace_editor"), budget_tokens=10_000) == []
@@ -60,34 +79,69 @@ def test_tool_observations_keep_exit_codes_and_are_trimmed():
     assert ps._tool_content("plain text") == "plain text"
 
 
-def test_long_trajectories_are_windowed_into_head_and_tail():
+def test_long_trajectories_are_cut_to_a_faithful_head_window():
     count = lambda text: len(text)  # noqa: E731 - one token per character keeps the arithmetic visible
     row = _swe_row(turns=6, output_chars=100)
     messages = ps.convert_open_swe_messages(row["messages"])
     whole = ps.window_trajectory(messages, budget_tokens=100_000, count=count)
     assert [kind for kind, _ in whole] == ["whole"]
     windows = ps.window_trajectory(messages, budget_tokens=420, count=count)
-    kinds = [kind for kind, _ in windows]
-    assert kinds == ["head", "tail"]
-    head, tail = (window for _, window in windows)
-    # Both keep the prefix; the head starts at the first turn, the tail ends at the last.
-    assert head[:2] == messages[:2] and tail[:2] == messages[:2]
-    assert head[2] is messages[2] and tail[-1] is messages[-1]
-    # Turns stay with their observations: no window starts or ends mid-pair.
-    for window in (head, tail):
-        pending = 0
-        for message in window[2:]:
-            if message["role"] == "assistant":
-                assert pending == 0
-                pending = len(message.get("tool_calls") or [])
-            else:
-                pending -= 1
-        assert pending == 0
-    # Two rows come out of one long trajectory, each within budget.
+    # One head window and never a tail: the last turns depend on edits the
+    # omitted middle made, so a tail would show tests passing for a patch
+    # the transcript never contains.
+    assert [kind for kind, _ in windows] == ["head"]
+    ((_, head),) = windows
+    assert head[:2] == messages[:2] and head[2] is messages[2]
+    assert head == messages[: len(head)]
+    assert len(head) < len(messages)
+    # Turns stay with their observations: the window does not end mid-pair.
+    pending = 0
+    for message in head[2:]:
+        if message["role"] == "assistant":
+            assert pending == 0
+            pending = len(message.get("tool_calls") or [])
+        else:
+            pending -= 1
+    assert pending == 0
     rows = ps.convert_open_swe_row(row, budget_tokens=420, count=count)
-    assert [r["verification"]["window"] for r in rows] == ["head", "tail"]
+    assert [r["verification"]["window"] for r in rows] == ["head"]
     assert all(ps.converted_tokens(r, count) <= 420 for r in rows)
     assert ps.window_trajectory(messages, budget_tokens=10, count=count) == []
+
+
+def test_converted_shell_observations_match_what_the_executor_returns(tmp_path):
+    """The rows teach the shape the harness produces, exit code included."""
+    executor = harness.RepoHarness(tmp_path)
+    observed = executor.execute("shell", {"command": "printf boom; exit 2"})
+    assert observed == ps._tool_content(json.dumps({"returncode": 2, "output": "boom"})) == "[exit code 2]\nboom"
+    assert executor.execute("shell", {"command": "printf fine"}) == "fine"
+    # Fifty megabytes of output: only the head and tail are ever held.
+    long = executor.execute("shell", {"command": "head -c 50000000 /dev/zero | tr '\\0' a"})
+    assert len(long) <= harness.SHELL_OUTPUT_LIMIT and harness.TRUNCATION_MARKER in long
+    assert long.startswith("a" * 100) and long.endswith("a" * 100)
+
+
+def test_shell_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "SHELL_TIMEOUT_SECONDS", 1)
+    executor = harness.RepoHarness(tmp_path)
+    started = time.monotonic()
+    # The background sleep holds the output pipe; if it survived the
+    # timeout, reading the pipe would wait for it, not for the 1 s limit.
+    observed = executor.execute("shell", {"command": "sleep 30 & sleep 30"})
+    assert observed == "[timed out after 1s]"
+    assert time.monotonic() - started < 10
+
+
+def test_sources_are_pinned_and_the_report_records_the_commit(monkeypatch):
+    assert all(len(spec["revision"]) == 40 for spec in ps.SOURCE_LOADERS.values())
+    monkeypatch.setattr(ps, "stream_source", lambda source, token=None: iter([_swe_row(), _swe_row(resolved=0)]))
+    rows, report = ps.collect_public_rows({ps.SOURCE_OPEN_SWE: 5, ps.SOURCE_OPEN_CODE_REASONING: 0}, budget_tokens=10_000)
+    assert len(rows) == 1 and report["converter"] == ps.CONVERTER_VERSION
+    entry = report["sources"][ps.SOURCE_OPEN_SWE]
+    assert entry["revision"] == ps.SOURCE_LOADERS[ps.SOURCE_OPEN_SWE]["revision"]
+    assert entry["rows"] == 1 and entry["unverified"] == 0 and entry["windows"] == {"whole": 1}
+    assert entry["scanned"] == 2
+    assert ps.SOURCE_OPEN_CODE_REASONING not in report["sources"]
 
 
 def test_open_code_instruct_keeps_only_fully_verified_answers():
@@ -105,6 +159,8 @@ def test_open_code_reasoning_moves_the_think_block_into_the_reasoning_field():
     (converted,) = ps.convert_open_code_reasoning_row(row)
     assert converted["messages"][1] == {"role": "assistant", "content": "```python\nprint(1)\n```", "reasoning_content": "use a stack"}
     assert converted["reasoning_effort"] == "xhigh" and converted["repo_family"] == "opencodereasoning:codeforces"
+    # Nothing ran these answers, and the row says so rather than claiming a pass.
+    assert converted["verification"] == {"all_required_tests_pass": None, "runner": "none"}
     # split_1 rows carry "-" and need an external lookup: skipped.
     assert ps.convert_open_code_reasoning_row(dict(row, input="-")) == []
     assert ps.split_think("no tags") == ("", "no tags")
@@ -114,6 +170,18 @@ def test_convert_rows_stops_at_the_limit_and_drops_rows_over_budget():
     rows = [_swe_row(turns=1), _swe_row(turns=1), _swe_row(turns=40, output_chars=2_000)]
     out = list(ps.convert_rows(ps.SOURCE_OPEN_SWE, rows, limit=2, budget_tokens=10_000))
     assert len(out) == 2
+    # A source that yields nothing is given up on after a bounded number
+    # of rows, not streamed to its end.
+    consumed = 0
+
+    def endless():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield _swe_row(resolved=0)
+
+    assert list(ps.convert_rows(ps.SOURCE_OPEN_SWE, endless(), limit=2, budget_tokens=10_000)) == []
+    assert consumed == 2 * ps.SCAN_ROWS_PER_NATIVE_ROW
     with pytest.raises(ValueError, match="No converter"):
         list(ps.convert_rows("nobody/nothing", rows, limit=1, budget_tokens=10))
 

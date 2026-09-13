@@ -157,7 +157,8 @@ class Verdict:
 
 
 class TaskWorkspace:
-    """A disposable checkout of one task, with its verifiers kept outside it."""
+    """A disposable checkout of one task, with its verifiers kept outside it
+    and off disk until they run."""
 
     def __init__(self, task: AgentTask, base: Path):
         self.task = task
@@ -169,8 +170,8 @@ class TaskWorkspace:
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-        for check in task.hidden_checks:
-            (self.hidden_dir / f"{check.name}.py").write_text(check.source)
+        # The hidden checks stay in memory until verify() runs them: with a
+        # shell tool in the checkout, a file beside it is one command away.
         # The scratch home keeps credential caches out of reach of task code.
         self.environment = filtered_environment(home=base / "task_home")
         self.harness = RepoHarness(self.root, environment=self.environment)
@@ -200,14 +201,19 @@ class TaskWorkspace:
         verdict = Verdict(tampered_paths=self.tampered_paths())
         verdict.visible_exit = self.run_visible_tests()
         for check in self.task.hidden_checks:
-            result = subprocess.run(
-                [sys.executable, str(self.hidden_dir / f"{check.name}.py")],
-                cwd=self.root,
-                env=self.environment,
-                text=True,
-                capture_output=True,
-                timeout=HIDDEN_CHECK_TIMEOUT,
-            )
+            script = self.hidden_dir / f"{check.name}.py"
+            script.write_text(check.source)
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(script)],
+                    cwd=self.root,
+                    env=self.environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=HIDDEN_CHECK_TIMEOUT,
+                )
+            finally:
+                script.unlink(missing_ok=True)
             verdict.hidden[check.name] = result.returncode == 0
             verdict.hidden_output[check.name] = (result.stdout + result.stderr)[-2000:]
         return verdict

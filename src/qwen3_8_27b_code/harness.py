@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 _SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
@@ -27,6 +29,30 @@ READ_LIMIT_BYTES = 20_000
 SEARCH_SCAN_LIMIT_BYTES = 5_000_000
 SEARCH_MATCH_LIMIT = 200
 TEST_OUTPUT_TAIL = 12_000
+# A shell observation keeps its head and tail inside this bound.
+SHELL_OUTPUT_LIMIT = 12_000
+SHELL_TIMEOUT_SECONDS = 120
+SHELL_READ_CHUNK = 65_536
+TRUNCATION_MARKER = "\n... [output trimmed] ...\n"
+
+
+def trim_output(text: str, limit: int) -> str:
+    """Keep the head and tail of ``text`` inside ``limit`` characters."""
+    if len(text) <= limit:
+        return text
+    keep = (limit - len(TRUNCATION_MARKER)) // 2
+    return text[:keep] + TRUNCATION_MARKER + text[-keep:]
+
+
+def format_command_observation(returncode: int | None, output: str, limit: int = SHELL_OUTPUT_LIMIT) -> str:
+    """The ``shell`` observation: a non-zero exit code first, then the output.
+
+    Training rows converted from third-party shell transcripts go through
+    the same function, so what the model learns to expect is what this
+    executor returns.
+    """
+    prefix = "" if returncode in (None, 0) else f"[exit code {returncode}]\n"
+    return trim_output(prefix + output, limit)
 
 
 def default_test_command() -> list[str]:
@@ -102,7 +128,7 @@ class RepoHarness:
                 return "unknown test profile"
             return self._run_tests()
         if name == "shell":
-            return "shell is disabled by the harness allow-list; use the semantic tools"
+            return self._shell(arguments["command"])
         return f"unknown tool: {name}"
 
     def _search(self, query: str) -> str:
@@ -159,3 +185,46 @@ class RepoHarness:
             timeout=120,
         )
         return f"exit={result.returncode}\n{(result.stdout + result.stderr)[-TEST_OUTPUT_TAIL:]}"
+
+    def _shell(self, command: str) -> str:
+        # The same scrubbed environment, working directory, time limit and
+        # bounded observation as run_tests. run_tests already executes
+        # whatever the repository and the model's patches contain, so a
+        # command here adds no exposure a test file could not. The command
+        # runs in its own process group so that a timeout kills whatever
+        # it started, not only bash, and only the head and tail of its
+        # output are ever held, so a command that prints without end
+        # costs bounded memory rather than the runtime.
+        process = subprocess.Popen(
+            ["bash", "-c", command],
+            cwd=self.root,
+            env=self.environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        timed_out = threading.Event()
+
+        def kill_group() -> None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            timed_out.set()
+
+        timer = threading.Timer(SHELL_TIMEOUT_SECONDS, kill_group)
+        timer.start()
+        head, tail, total = bytearray(), bytearray(), 0
+        try:
+            while chunk := process.stdout.read1(SHELL_READ_CHUNK):
+                total += len(chunk)
+                head += chunk[: max(0, SHELL_OUTPUT_LIMIT - len(head))]
+                tail += chunk
+                del tail[:-SHELL_OUTPUT_LIMIT]
+        finally:
+            timer.cancel()
+            process.wait()
+        if timed_out.is_set():
+            return f"[timed out after {SHELL_TIMEOUT_SECONDS}s]"
+        output = bytes(head if total <= SHELL_OUTPUT_LIMIT else head + tail)
+        return format_command_observation(process.returncode, output.decode("utf-8", errors="replace"))

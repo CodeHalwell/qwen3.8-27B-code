@@ -527,6 +527,7 @@ def run_lora_discovery(cell: str) -> dict:
         "MODEL_ID": "unsloth/Qwen3.8-27B",
         "MERGED_SFT_MODEL_ID": "user/merged",
         "MERGED_SFT_REVISION": "main",
+        "MERGED_SFT_COMMIT": None,
         "SMOKE_MODEL_ID": "unsloth/Qwen3.8-27B",
         "DEMO_MODE": False,
         "MAX_SEQ_LENGTH": 4096,
@@ -641,6 +642,14 @@ def test_notebook_02_accepts_the_documented_non_agentic_lane():
         {"role": "tool", "name": "read_file", "content": "x = 1"},
     ])
     assert validate_row(mislabelled)
+
+    # An answer nothing executed is admitted only when it says so, and only
+    # to the non-agentic lane; a claimed failure or a bare omission is not.
+    unverified = dict(reasoning_row, verification={"all_required_tests_pass": None, "runner": "none"})
+    assert validate_row(unverified) == []
+    assert validate_row(dict(unverified, verification={"all_required_tests_pass": None}))
+    assert validate_row(dict(unverified, verification={"all_required_tests_pass": False, "runner": "none"}))
+    assert validate_row(dict(mislabelled, lane="agentic", verification={"all_required_tests_pass": None, "runner": "none"}))
 
 
 def test_notebook_07_imports_the_shared_loop_instead_of_restating_it():
@@ -1122,10 +1131,16 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert dpo_train.index("trainer.push_to_hub(") < dpo_train.index('path_in_repo="run_manifest.json"')
     assert 'file_exists(\n                        MERGED_SFT_MODEL_ID, "run_manifest.json"' in dpo_config.replace(
         "\n    ", "\n                    "
-    ) or '"run_manifest.json", revision=MERGED_SFT_REVISION' in dpo_config
+    ) or '"run_manifest.json", revision=MERGED_SFT_COMMIT' in dpo_config
+    # The commit is resolved once and used for the marker check, the load
+    # and the manifest, so all three name the same weights.
+    assert dpo_config.index("MERGED_SFT_COMMIT = api.repo_info(") < dpo_config.index(
+        'file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_COMMIT)'
+    )
+    assert '"model_commit": MERGED_SFT_COMMIT' in dpo_config
     # The smoke loads the stock model, so it needs nothing published.
     dpo_load = code_cell_containing(generator.build_04_dpo(), "model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID")
-    assert "revision=None if DEMO_MODE else MERGED_SFT_REVISION" in dpo_load
+    assert "revision=MERGED_SFT_COMMIT," in dpo_load
 
     gate_config = code_cell_containing(generator.build_07_collect_and_evaluate(), "GATE_REPORTS_REPO =")
     assert "EVAL_ATTEMPTS = 2" in gate_config
@@ -1194,6 +1209,26 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     # One Dataset from plain rows, so Arrow infers one schema across sources.
     assert "raw_dataset = Dataset.from_list(rows)" in load_cell
     assert "concatenate_datasets" not in load_cell
+    # The pinned source commits and counts travel with the published corpus,
+    # and the report is this run's: the loading cell resets it first.
+    assert load_cell.index("public_report = None") < load_cell.index("if DEMO_MODE:")
+    publish_cell = code_cell_containing(generator.build_02_data(), "dataset_dict.push_to_hub(")
+    assert 'path_in_repo="public_sources.json"' in publish_cell
+    assert "if public_report:" in publish_cell
+    assert publish_cell.index("dataset_dict.push_to_hub(") < publish_cell.index('path_in_repo="public_sources.json"')
     # The windowed rows fit the training window with the rendered overhead.
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
     assert "MAX_SEQ_LENGTH = 8_192" in sft_config
+
+
+def test_notebook_01_writes_the_hidden_verifier_only_when_it_runs():
+    generator = load_generator()
+    notebook = generator.build_01_baseline()
+    task_cell = code_cell_containing(notebook, "def make_demo_task")
+    assert "hidden.write_text(" not in task_cell
+    assert "hidden_test_source=hidden_source" in task_cell
+    episode_cell = code_cell_containing(notebook, "task.hidden_test_command,")
+    assert episode_cell.index("hidden_path.write_text(task.hidden_test_source)") < episode_cell.index(
+        "task.hidden_test_command,"
+    )
+    assert "hidden_path.unlink(missing_ok=True)" in episode_cell

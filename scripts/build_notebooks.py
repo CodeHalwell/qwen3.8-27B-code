@@ -329,7 +329,7 @@ TOOLS_CELL = r'''
 # Bumped from v1 when the `shell` description stopped carrying pilot status
 # text. Tool descriptions are model inputs and part of the fingerprint, so a
 # wording change is a schema change.
-TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v3"
 
 TOOLS = [
     {
@@ -401,7 +401,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a command from the harness allow-list.",
+            "description": "Run one bash command in the repository; output is bounded and a non-zero exit code is reported.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -827,6 +827,9 @@ def build_01_baseline():
                     request: str
                     visible_test_command: list[str]
                     hidden_test_command: list[str]
+                    # Written to the command's path only when it runs, after
+                    # the episode: a shell command cannot read it meanwhile.
+                    hidden_test_source: str | None = None
 
                 def make_demo_task() -> PilotTask:
                     repo = Path("/content/qwen38_demo_repo")
@@ -844,7 +847,7 @@ def build_01_baseline():
                         "    assert clamp(5, 0, 10) == 5\n"
                     )
                     hidden = Path("/content/qwen38_hidden_test.py")
-                    hidden.write_text(
+                    hidden_source = (
                         "from pathlib import Path\n"
                         "ns = {}\n"
                         "exec((Path.cwd() / 'src' / 'clamp.py').read_text(), ns)\n"
@@ -866,6 +869,7 @@ def build_01_baseline():
                         request="Fix clamp so values inside the range are unchanged and out-of-range values use the nearest bound. Run the unit tests.",
                         visible_test_command=[sys.executable, "-m", "pytest", "-q"],
                         hidden_test_command=[sys.executable, str(hidden)],
+                        hidden_test_source=hidden_source,
                     )
 
                 def load_tasks() -> list[PilotTask]:
@@ -945,7 +949,56 @@ def build_01_baseline():
                         )
                         return f"exit={result.returncode}\n{(result.stdout + result.stderr)[-12000:]}"
                     if name == "shell":
-                        return "shell is disabled by the harness allow-list; use the semantic tools"
+                        # The same scrubbed environment, working directory,
+                        # time limit and bounded observation as run_tests;
+                        # the package twin is RepoHarness._shell. Its own
+                        # process group, so a timeout kills whatever the
+                        # command started, not only bash; and only the head
+                        # and tail of the output are held, so a command that
+                        # prints without end costs bounded memory.
+                        import os
+                        import signal
+                        import threading
+
+                        process = subprocess.Popen(
+                            ["bash", "-c", arguments["command"]],
+                            cwd=root,
+                            env=TASK_ENV,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                        timed_out = threading.Event()
+
+                        def kill_group():
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                return
+                            timed_out.set()
+
+                        timer = threading.Timer(120, kill_group)
+                        timer.start()
+                        limit = 12_000
+                        head, tail, total = bytearray(), bytearray(), 0
+                        try:
+                            while chunk := process.stdout.read1(65_536):
+                                total += len(chunk)
+                                head += chunk[: max(0, limit - len(head))]
+                                tail += chunk
+                                del tail[:-limit]
+                        finally:
+                            timer.cancel()
+                            process.wait()
+                        if timed_out.is_set():
+                            return "[timed out after 120s]"
+                        output = bytes(head if total <= limit else head + tail).decode("utf-8", errors="replace")
+                        observation = ("" if process.returncode == 0 else f"[exit code {process.returncode}]\n") + output
+                        marker = "\n... [output trimmed] ...\n"
+                        if len(observation) > limit:
+                            keep = (limit - len(marker)) // 2
+                            observation = observation[:keep] + marker + observation[-keep:]
+                        return observation
                     return f"unknown tool: {name}"
                 """
             ),
@@ -1049,14 +1102,23 @@ def build_01_baseline():
                     else:
                         termination = "tool_budget"
 
-                    hidden = subprocess.run(
-                        task.hidden_test_command,
-                        cwd=task.repo_path,
-                        env=TASK_ENV,
-                        text=True,
-                        capture_output=True,
-                        timeout=120,
-                    )
+                    # The verifier reaches disk only now, once the episode is
+                    # over: while the model held the shell, it was not there.
+                    hidden_path = Path(task.hidden_test_command[-1])
+                    if task.hidden_test_source is not None:
+                        hidden_path.write_text(task.hidden_test_source)
+                    try:
+                        hidden = subprocess.run(
+                            task.hidden_test_command,
+                            cwd=task.repo_path,
+                            env=TASK_ENV,
+                            text=True,
+                            capture_output=True,
+                            timeout=120,
+                        )
+                    finally:
+                        if task.hidden_test_source is not None:
+                            hidden_path.unlink(missing_ok=True)
                     elapsed = time.monotonic() - start
                     return {
                         "trajectory_id": str(uuid.uuid4()),
@@ -1197,13 +1259,15 @@ def build_02_data():
                     collect_public_rows,
                 )
 
-                # Public sources, streamed from the Hub and converted to the
-                # native schema (docs/data-strategy.md, public seed sources):
-                # resolved Open-SWE-Traces trajectories windowed to the budget
-                # with bash mapped onto the shell tool, OpenCodeInstruct answers
-                # whose unit tests all passed, and OpenCodeReasoning with the
-                # think block moved into the reasoning field. The value is the
-                # number of native rows each source contributes; 0 skips it.
+                # Public sources, streamed from the Hub at pinned commits and
+                # converted to the native schema (docs/data-strategy.md, public
+                # seed sources): resolved Open-SWE-Traces trajectories cut to
+                # the budget with bash mapped onto the shell tool,
+                # OpenCodeInstruct answers whose unit tests all passed, and
+                # OpenCodeReasoning answers, which nothing executed: they are
+                # the corpus's one unverified slice, labelled as such. The
+                # value is the number of native rows each source contributes;
+                # 0 skips it.
                 PUBLIC_SOURCES = {
                     SOURCE_OPEN_SWE: 800,
                     SOURCE_OPEN_CODE_INSTRUCT: 1_500,
@@ -1279,6 +1343,9 @@ def build_02_data():
                 def count_tokens(text):
                     return len(tokenizer(text=text, add_special_tokens=False)["input_ids"])
 
+                # Reset on every run of this cell, so a rerun with the public
+                # sources off cannot publish the report of an earlier run.
+                public_report = None
                 if DEMO_MODE:
                     raw_dataset = Dataset.from_list(demo_rows)
                 else:
@@ -1373,7 +1440,16 @@ def build_02_data():
                         errors.append("agentic trajectory has no tool call")
                     elif lane == "non_agentic" and saw_tool_call:
                         errors.append("non-agentic row supervises a tool call; label it agentic")
-                    if not row.get("verification", {}).get("all_required_tests_pass", False):
+                    # Verified means the row says so. The one exception is
+                    # an answer nothing executed (runner "none"), admitted to
+                    # the non-agentic lane with that stated; never to the
+                    # agentic lane, whose observations vouch for outcomes.
+                    verification = row.get("verification") or {}
+                    verified = verification.get("all_required_tests_pass")
+                    unverified_answer = (
+                        lane == "non_agentic" and verified is None and verification.get("runner") == "none"
+                    )
+                    if verified is not True and not unverified_answer:
                         errors.append("trajectory is not execution-verified")
                     return errors
 
@@ -1494,6 +1570,20 @@ def build_02_data():
                     require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
+                    if public_report:
+                        # Which public commits and how many rows of each went
+                        # in, kept beside the corpus so it can be rebuilt.
+                        from huggingface_hub import HfApi
+
+                        report_path = RUN_ROOT / "public_sources.json"
+                        report_path.write_text(json.dumps(public_report, indent=2))
+                        HfApi(token=hf_token).upload_file(
+                            path_or_fileobj=str(report_path),
+                            path_in_repo="public_sources.json",
+                            repo_id=OUTPUT_DATASET_ID,
+                            repo_type="dataset",
+                            commit_message="public source commits and row counts",
+                        )
                 else:
                     print("Demo mode: the fixture stays local." if DEMO_MODE else "PUSH_DATASET is off; nothing published.")
                 """
@@ -1994,7 +2084,12 @@ def build_03_sft():
                     if PUSH_MERGED_SFT:
                         # The merged weights notebook 04 starts from. The marker
                         # goes up after the weights, and the history is squashed
-                        # so the repo holds one copy, not one per run.
+                        # so the repo holds one copy (about 55 GB), not one per
+                        # run. That discards the parent of any DPO adapter
+                        # trained on the previous merge, which is why this run
+                        # removed that adapter's completion marker when training
+                        # started: nothing downstream treats it as current, and
+                        # its manifest keeps the commit it was trained on.
                         from huggingface_hub import HfApi
 
                         hub = HfApi(token=hf_token)
@@ -2114,18 +2209,28 @@ def build_04_dpo():
                 LEARNING_RATE = 5e-6
                 DPO_BETA = 0.1
 
+                # The commit the merged checkpoint resolves to, pinned here so
+                # the marker check, the load and the manifest all name the same
+                # weights even if notebook 03 republishes meanwhile. Notebook 03
+                # keeps one merge on the Hub, so a later SFT run replaces this
+                # parent and, at the same time, removes this adapter's
+                # completion marker.
+                MERGED_SFT_COMMIT = None
                 if RUN_TRAINING and not DEMO_MODE:
                     from huggingface_hub import HfApi
 
+                    api = HfApi(token=hf_token)
+                    if not api.repo_exists(MERGED_SFT_MODEL_ID):
+                        raise RuntimeError(
+                            f"{MERGED_SFT_MODEL_ID} does not exist. Notebook 03 publishes it at the end of "
+                            "training; run notebook 03 to completion first."
+                        )
+                    MERGED_SFT_COMMIT = api.repo_info(MERGED_SFT_MODEL_ID, revision=MERGED_SFT_REVISION).sha
                     # The run manifest is uploaded last, after the weights, so it
                     # proves the merge finished; a repo alone does not.
-                    api = HfApi(token=hf_token)
-                    if not (
-                        api.repo_exists(MERGED_SFT_MODEL_ID)
-                        and api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION)
-                    ):
+                    if not api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_COMMIT):
                         raise RuntimeError(
-                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. Notebook 03 "
+                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_COMMIT[:12]} has no completed merge. Notebook 03 "
                             "publishes it at the end of training; run notebook 03 to completion first."
                         )
                 # The trainer creates the Hub repo when it is built, so an
@@ -2138,6 +2243,7 @@ def build_04_dpo():
                     "objective": "agentic-coding",
                     "model_id": MERGED_SFT_MODEL_ID,
                     "model_revision": MERGED_SFT_REVISION,
+                    "model_commit": MERGED_SFT_COMMIT,
                     "sft_adapter_id": SFT_ADAPTER_ID,
                     "sft_adapter_revision": SFT_ADAPTER_REVISION,
                     # Filled in by the loading cell from what is actually read:
@@ -2176,7 +2282,7 @@ def build_04_dpo():
                 # accepted SFT policy, which is what this stage should move from.
                 model, tokenizer = FastModel.from_pretrained(
                     model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID,
-                    revision=None if DEMO_MODE else MERGED_SFT_REVISION,
+                    revision=MERGED_SFT_COMMIT,  # None in demo mode; the pinned commit otherwise
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,

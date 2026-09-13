@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v3"
 
 TOOLS = [
     {
@@ -82,7 +82,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a command from the harness allow-list.",
+            "description": "Run one bash command in the repository; output is bounded and a non-zero exit code is reported.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
