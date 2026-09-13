@@ -1395,6 +1395,8 @@ def build_02_data():
             markdown("## Freeze repository-family splits and publish privately"),
             code(
                 r"""
+                import hashlib
+
                 repo_families = sorted(set(prepared["repo_family"]))
                 if len(repo_families) < 2:
                     raise ValueError(

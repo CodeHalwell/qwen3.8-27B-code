@@ -946,3 +946,100 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert code_cells[-1] == persist_cell
     collection_cell = code_cell_containing(notebook, "if RUN_COLLECTION:")
     assert "upload_folder" not in collection_cell
+
+
+NOTEBOOK_GLOBALS = {"display", "get_ipython"}  # injected by the Colab kernel
+
+
+def _cell_symbols(index: int, source: str) -> tuple[set[str], set[str], set[str]]:
+    """Names a cell binds at module scope, reads at module scope, and reads
+    from inside nested scopes (function and lambda bodies, class bodies)."""
+    import symtable
+
+    python = "\n".join(
+        "pass  # magic" if line.lstrip().startswith(("!", "%")) else line for line in source.splitlines()
+    )
+    table = symtable.symtable(python, f"cell {index}", "exec")
+    binds = {s.get_name() for s in table.get_symbols() if s.is_assigned() or s.is_imported()}
+    top_reads = {
+        s.get_name() for s in table.get_symbols()
+        if s.is_referenced() and not (s.is_assigned() or s.is_imported())
+    }
+    nested_reads: set[str] = set()
+
+    def walk(scope, deferred: bool) -> None:
+        # A class body runs when its cell does; a function or lambda body
+        # runs when called, and so does anything nested inside one.
+        deferred = deferred or scope.get_type() != "class"
+        for symbol in scope.get_symbols():
+            if symbol.is_global() and symbol.is_referenced():
+                (nested_reads if deferred else top_reads).add(symbol.get_name())
+        for child in scope.get_children():
+            walk(child, deferred)
+
+    for child in table.get_children():
+        walk(child, False)
+    return binds, top_reads, nested_reads
+
+
+def undefined_notebook_names(cells: list[str]) -> list[str]:
+    """Names a notebook reads that it never binds in time.
+
+    Each cell is compiled on its own with ``symtable``. A name read at a
+    cell's module scope must be bound by that cell or an earlier one, since
+    the cell runs when it is reached. A name read inside a function, lambda
+    or class body resolves when that body runs, which may be after a later
+    cell binds it, so it must be bound somewhere in the notebook. Order
+    inside one cell is not modelled, and a function called before a later
+    cell binds its global is not caught.
+    """
+    import builtins
+
+    parsed = [_cell_symbols(index, source) for index, source in enumerate(cells)]
+    bound_anywhere = set(dir(builtins)) | NOTEBOOK_GLOBALS
+    for binds, _, _ in parsed:
+        bound_anywhere |= binds
+    bound_so_far = set(dir(builtins)) | NOTEBOOK_GLOBALS
+    problems: list[str] = []
+    for index, (binds, top_reads, nested_reads) in enumerate(parsed):
+        bound_so_far |= binds
+        missing = (top_reads - bound_so_far) | (nested_reads - bound_anywhere)
+        problems.extend(f"cell {index}: {name}" for name in sorted(missing))
+    return problems
+
+
+def test_undefined_name_checker_models_cell_boundaries():
+    # Module-scope use before the import: the whole-file view passes it,
+    # the notebook raises at cell 0.
+    assert undefined_notebook_names(["digest = hashlib.sha256(b'x')", "import hashlib"]) == ["cell 0: hashlib"]
+    assert undefined_notebook_names(["import hashlib", "digest = hashlib.sha256(b'x')"]) == []
+    assert undefined_notebook_names(["!pip install x\nimport json", "print(json.dumps(rows))"]) == ["cell 1: rows"]
+    # A function body may read a name a later cell binds; one nothing binds is a bug.
+    assert undefined_notebook_names(["def render():\n    return tokenizer.name", "tokenizer = object()"]) == []
+    assert undefined_notebook_names(["def g():\n    return helper()", "x = 1"]) == ["cell 0: helper"]
+    # A class body runs with its cell; a method body does not.
+    assert undefined_notebook_names(["class C:\n    digest = hashlib.sha256(b'x')", "import hashlib"]) == [
+        "cell 0: hashlib"
+    ]
+    assert undefined_notebook_names(["class C:\n    def run(self):\n        return tokenizer", "tokenizer = 1"]) == []
+
+
+def test_every_notebook_cell_uses_only_names_defined_earlier():
+    """A cell that uses a module it never imports raises NameError on Colab,
+    while the contract tests above, which hand cells a ready namespace,
+    still pass. Check every notebook cell against what came before it."""
+    generator = load_generator()
+    builders = {
+        "00": generator.build_00_preflight,
+        "01": generator.build_01_baseline,
+        "02": generator.build_02_data,
+        "03": generator.build_03_sft,
+        "04": generator.build_04_dpo,
+        "05": generator.build_05_grpo,
+        "06": generator.build_06_qat_export,
+        "07": generator.build_07_collect_and_evaluate,
+        "08": generator.build_08_distil,
+    }
+    for name, build in builders.items():
+        cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
+        assert undefined_notebook_names(cells) == [], f"notebook {name}"
