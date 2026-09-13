@@ -1207,7 +1207,9 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     assert "collect_public_rows(" in load_cell
     assert "count=count_tokens, token=hf_token" in load_cell
     # One Dataset from plain rows, so Arrow infers one schema across sources.
-    assert "raw_dataset = Dataset.from_list(rows)" in load_cell
+    # Every row carries every column before the table is built, or the
+    # first row (a bootstrap row, no lane) would decide the columns.
+    assert "raw_dataset = Dataset.from_list(unify_columns(rows))" in load_cell
     assert "concatenate_datasets" not in load_cell
     # The pinned source commits and counts travel with the published corpus,
     # and the report is this run's: the loading cell resets it first.
