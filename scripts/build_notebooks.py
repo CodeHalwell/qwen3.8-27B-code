@@ -1515,6 +1515,12 @@ def build_03_sft():
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 DATASET_REVISION = "main"  # the dataset notebook 02 pushed; pin a commit to repeat a run exactly
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
+                # Notebook 04 starts from the merged SFT weights, so its KL
+                # reference is the SFT policy rather than the base, and a DPO
+                # adapter trained on them is loadable elsewhere only if they are
+                # on the Hub. Published at the end of training, about 55 GB, with
+                # the repo history squashed so only the latest merge is stored.
+                MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-merged"
                 MAX_SEQ_LENGTH = 4_096       # the longest bootstrap row renders to 1,780 tokens; 8_192 after this run
                 # Two passes over whatever the dataset holds; the trainer counts
                 # the updates. A positive MAX_STEPS would override the epochs.
@@ -1524,6 +1530,7 @@ def build_03_sft():
                 DEMO_MODE = False
                 RUN_TRAINING = True
                 PUSH_ADAPTER = True
+                PUSH_MERGED_SFT = True
                 # docs/training-plan.md, Stage 1: 2e-5 is the main-run default
                 # and 5e-5, 1e-4 the sweep points. A rank-16 adapter barely moves
                 # at 2e-5 over a few dozen steps, so this bootstrap-scale run sits
@@ -1537,11 +1544,13 @@ def build_03_sft():
 
                 if DEMO_MODE:
                     # A smoke run: two local steps on the fixture, nothing published.
-                    MAX_STEPS, PUSH_ADAPTER = 2, False
+                    MAX_STEPS, PUSH_ADAPTER, PUSH_MERGED_SFT = 2, False, False
                 # The trainer creates the Hub repo when it is built, so an
                 # existing public repo is caught here, before that happens.
                 if PUSH_ADAPTER:
                     require_private_repo(OUTPUT_ADAPTER_ID)
+                if PUSH_MERGED_SFT:
+                    require_private_repo(MERGED_MODEL_ID)
 
                 run_manifest = {
                     "stage": "sft",
@@ -1550,6 +1559,7 @@ def build_03_sft():
                     "model_id": MODEL_ID,
                     "dataset_id": DATASET_ID,
                     "dataset_revision": DATASET_REVISION,
+                    "merged_model_id": MERGED_MODEL_ID,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "num_train_epochs": NUM_TRAIN_EPOCHS,
                     "max_steps": MAX_STEPS,
@@ -1927,6 +1937,28 @@ def build_03_sft():
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
                         )
+                    if PUSH_MERGED_SFT:
+                        # The merged weights notebook 04 starts from. The marker
+                        # goes up after the weights, and the history is squashed
+                        # so the repo holds one copy, not one per run.
+                        from huggingface_hub import HfApi
+
+                        hub = HfApi(token=hf_token)
+                        hub.create_repo(MERGED_MODEL_ID, repo_type="model", private=True, exist_ok=True)
+                        if hub.file_exists(MERGED_MODEL_ID, "run_manifest.json"):
+                            hub.delete_file(
+                                "run_manifest.json", MERGED_MODEL_ID,
+                                commit_message="merge started: completion marker removed",
+                            )
+                        model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
+                        hub.upload_file(
+                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_in_repo="run_manifest.json",
+                            repo_id=MERGED_MODEL_ID,
+                            commit_message="run manifest: merge completed",
+                        )
+                        hub.super_squash_history(MERGED_MODEL_ID, commit_message="keep only the latest merge")
+                        print(f"Published the merged SFT checkpoint to {MERGED_MODEL_ID}.")
                     print(result.metrics)
                     print({
                         "peak_reserved_gib": round(peak_reserved_gib, 3),
@@ -1962,10 +1994,9 @@ def build_04_dpo():
                 better under the same harness and hidden verifier. This stage is
                 intentionally smaller than SFT and cannot repair a broken tool schema.
 
-                **Input:** the *merged* accepted SFT checkpoint, not the adapter.
-                Notebook 07 publishes that merge itself when its gate passes, from
-                the exact candidate it gated. The model-loading cell explains why
-                the distinction decides what the KL reference is.
+                **Input:** the *merged* SFT checkpoint notebook 03 publishes at
+                the end of training, not the adapter. The model-loading cell
+                explains why the distinction decides what the KL reference is.
                 """
             ),
             markdown("## Install and authenticate"),
@@ -1984,7 +2015,7 @@ def build_04_dpo():
                 # DPO starts from the *merged* accepted SFT weights, not the SFT
                 # adapter; see the model-loading cell for why the distinction
                 # decides what the KL reference actually is.
-                MERGED_SFT_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
+                MERGED_SFT_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-merged"
                 MERGED_SFT_REVISION = "main"  # pin a commit to repeat a run exactly
                 # Demo mode loads the stock model instead, so the two-step smoke
                 # needs nothing published; the KL reference is then the base.
@@ -2040,10 +2071,8 @@ def build_04_dpo():
                         and api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION)
                     ):
                         raise RuntimeError(
-                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. DPO starts "
-                            "from the merged checkpoint of an adapter the gate accepted, and notebook 07 "
-                            "publishes that merge itself when its gate passes. Run notebook 07 on the "
-                            "adapter notebook 03 pushed, then rerun this notebook once it has passed."
+                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. Notebook 03 "
+                            "publishes it at the end of training; run notebook 03 to completion first."
                         )
                 # The trainer creates the Hub repo when it is built, so an
                 # existing public repo is caught here, before that happens.
@@ -2412,6 +2441,17 @@ def build_04_dpo():
                             row.get("reasoning_effort") or "medium" for row in raw
                         ).items())),
                     }, indent=2))
+                    if PUSH_ADAPTER:
+                        # As in notebook 03: an earlier run's completion marker must
+                        # not survive into this run's intermediate pushes.
+                        from huggingface_hub import HfApi
+
+                        hub = HfApi(token=hf_token)
+                        if hub.repo_exists(OUTPUT_ADAPTER_ID) and hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
+                            hub.delete_file(
+                                "run_manifest.json", OUTPUT_ADAPTER_ID,
+                                commit_message="training started: completion marker removed",
+                            )
                     result = trainer.train()
                     run_manifest["tool_schema_version"] = TOOL_SCHEMA_VERSION
                     run_manifest["preference_sources"] = PREFERENCE_SOURCES
@@ -2421,6 +2461,14 @@ def build_04_dpo():
                     trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="DPO adapter from verifier-backed preferences")
+                        # Completion marker, after the final push: notebook 07 gates
+                        # this adapter only once it is there.
+                        hub.upload_file(
+                            path_or_fileobj=str(RUN_ROOT / "dpo" / "run_manifest.json"),
+                            path_in_repo="run_manifest.json",
+                            repo_id=OUTPUT_ADAPTER_ID,
+                            commit_message="run manifest: training completed",
+                        )
                     print(result.metrics)
                 else:
                     print("DPO dry run configured. Inspect rendered pairs before setting RUN_TRAINING=True.")
@@ -2918,7 +2966,7 @@ def build_06_qat_export():
 
                 ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 ACCEPTED_REVISION = "main"  # pin a commit to repeat an export exactly
-                MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
+                MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-merged"  # published by notebook 03
                 QAT_OUTPUT_ID = f"{HF_USERNAME}/qwen38-27b-code-qat-int4"
                 GGUF_OUTPUT_ID = f"{HF_USERNAME}/qwen38-27b-code-gguf"
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
@@ -3220,12 +3268,12 @@ def build_07_collect_and_evaluate():
                 # for a run that produces artifacts.
                 MODEL_REVISION = "main"
                 ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
-                ACCEPTED_REVISION = "main"  # the adapter notebook 03 pushed; pin a commit to repeat a gate exactly
-                # When the gate passes, the candidate in memory (the adapter at
-                # the commit just gated, nothing retrained) is merged and
-                # published here. It is what notebooks 04 and 06 start from.
-                MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
-                PUBLISH_ACCEPTED_MERGE = True
+                ACCEPTED_REVISION = "main"  # pin a commit to repeat a gate exactly
+                # Gate the latest stage that finished: notebook 04's adapter when
+                # it has pushed one, else notebook 03's. False gates
+                # ACCEPTED_ADAPTER_ID as configured.
+                DPO_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
+                GATE_LATEST_STAGE = True
                 # Every think block after the request stays in context for the rest
                 # of the episode, so a thirty-call episode carries thirty turns of
                 # reasoning: this is where thinking and horizon meet, and why the
@@ -3329,8 +3377,6 @@ def build_07_collect_and_evaluate():
                 # is found now, before any GPU time is spent.
                 if PUSH_ARTIFACTS:
                     require_private_repo(GATE_REPORTS_REPO, "dataset")
-                if PUBLISH_ACCEPTED_MERGE:
-                    require_private_repo(MERGED_MODEL_ID)
 
                 # What this session does follows from what already exists: a
                 # baseline is measured once and reused; a candidate is gated as
@@ -3361,14 +3407,18 @@ def build_07_collect_and_evaluate():
                 # revision that carries it is a training run that finished.
                 api = HfApi(token=hf_token)
                 CANDIDATE_REVISION = None
-                if api.repo_exists(ACCEPTED_ADAPTER_ID):
-                    CANDIDATE_REVISION = resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)
+                candidate_ids = (DPO_ADAPTER_ID, ACCEPTED_ADAPTER_ID) if GATE_LATEST_STAGE else (ACCEPTED_ADAPTER_ID,)
+                for adapter_id in candidate_ids:
+                    if not api.repo_exists(adapter_id):
+                        continue
+                    revision = resolved_revision(adapter_id, ACCEPTED_REVISION)
+                    if api.file_exists(adapter_id, "run_manifest.json", revision=revision):
+                        ACCEPTED_ADAPTER_ID, CANDIDATE_REVISION = adapter_id, revision
+                        break
                 if RUN_CANDIDATE_EVAL is None:
-                    RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None and api.file_exists(
-                        ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=CANDIDATE_REVISION
-                    )
+                    RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None
                 if RUN_CANDIDATE_EVAL and CANDIDATE_REVISION is None:
-                    raise RuntimeError(f"{ACCEPTED_ADAPTER_ID} does not exist; nothing to gate.")
+                    raise RuntimeError("No finished adapter to gate; run notebook 03 to completion first.")
                 print(json.dumps({"run_baseline_eval": RUN_BASELINE_EVAL, "run_candidate_eval": RUN_CANDIDATE_EVAL}, indent=2))
 
                 # Six single-file families (short band) plus the three multi-file
@@ -3660,32 +3710,15 @@ def build_07_collect_and_evaluate():
                     )
                     print("GATE PASSED" if comparison["gate_passed"] else "GATE FAILED")
 
-                    if comparison["gate_passed"] and PUBLISH_ACCEPTED_MERGE:
-                        # Merge the model in memory: the adapter at the commit the
-                        # gate just accepted, bound to that revision by construction.
-                        from huggingface_hub import HfApi
-
-                        require_private_repo(MERGED_MODEL_ID)
-                        api = HfApi(token=hf_token)
-                        api.create_repo(MERGED_MODEL_ID, repo_type="model", private=True, exist_ok=True)
-                        model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
-                        merge_manifest = REPORT_DIR / "merge_manifest.json"
-                        merge_manifest.write_text(json.dumps({
-                            "stage": "merge",
+                    if comparison["gate_passed"]:
+                        # The acceptance record, pushed with the reports: which
+                        # adapter, at which commit, passed against which baseline.
+                        (REPORT_DIR / "accepted.json").write_text(json.dumps({
                             "adapter": candidate_model_ref,
-                            "baseline": str(baseline_for_gate.name),
-                            "gate_passed": True,
+                            "baseline": baseline_for_gate.name,
                             "harness_revision": repo_revision,
                             "provenance": candidate_report.metadata,
                         }, indent=2))
-                        # Uploaded after the weights: the completion marker notebook 04 keys on.
-                        api.upload_file(
-                            path_or_fileobj=str(merge_manifest),
-                            path_in_repo="run_manifest.json",
-                            repo_id=MERGED_MODEL_ID,
-                            commit_message=f"accepted merge of {candidate_model_ref}",
-                        )
-                        print(f"Published the accepted merge to {MERGED_MODEL_ID}.")
                 """
             ),
             markdown(

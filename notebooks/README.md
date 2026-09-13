@@ -51,24 +51,23 @@ candidate measured in the current session with the baseline named by
    runtime restart; run all again and the pinned install marker makes the
    install cell a cheap no-op.
 
-The notebooks ship configured for the real run, not a demo. The SFT loop is
+The notebooks ship configured for the real run, not a demo. Training is
 three notebooks in order, each one a Run all with nothing to edit:
 
 | Step | Notebook | What it does as shipped |
 |---|---|---|
 | 1 | 02 | Clones this repository, publishes the bootstrap corpus privately |
-| 2 | 03 | Trains the adapter on it for two epochs and pushes it privately |
-| 3 | 07 | Pulls earlier reports; measures a baseline only if none exists; gates the pushed adapter against it, pushes the reports and, on a pass, publishes the merged accepted checkpoint |
+| 2 | 03 | Trains the adapter for two epochs, pushes it, then publishes the merged SFT checkpoint (about 55 GB; one copy kept) |
+| 3 | 04 | Trains the DPO adapter on the merged SFT checkpoint for two epochs and pushes it |
 
-Notebook 07 works this out from the Hub each time, so the first run measures
-the baseline and every later run gates the current adapter. Notebook 04 (DPO)
-starts from the merged checkpoint of an adapter the gate accepted, which
-notebook 07 publishes itself when its gate passes, from the exact candidate it
-gated; until a gate has passed, 04 fails early saying so. Each publishing
-notebook uploads a run manifest to a repo only after the weights, and the
-decisions in 04 and 07 key on that file, so a run interrupted mid-upload is
-never mistaken for a finished one. Notebook 05 stays off until the
-pinned TRL grows the agentic trainer, and notebook 06's exports are opt-in.
+Notebook 07 is for when you want to know whether it worked, at any point:
+it pulls earlier reports, measures a baseline only if none exists, gates the
+latest finished adapter (04's if it has pushed one, else 03's) against it,
+and pushes the reports with an acceptance record when the gate passes. Each
+publishing notebook uploads a run manifest to a repo only after the weights,
+and the decisions in 04 and 07 key on that file, so a run interrupted
+mid-upload is never mistaken for a finished one. Notebook 05 stays off until
+the pinned TRL grows the agentic trainer, and notebook 06's exports are opt-in.
 
 `DEMO_MODE = True` in notebooks 02 to 04 runs a two-step plumbing smoke on
 synthetic rows and publishes nothing. Every revision defaults to `main`; pin a
