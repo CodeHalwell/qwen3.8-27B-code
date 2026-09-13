@@ -2002,7 +2002,10 @@ def build_04_dpo():
                     "model_revision": MERGED_SFT_REVISION,
                     "sft_adapter_id": SFT_ADAPTER_ID,
                     "sft_adapter_revision": SFT_ADAPTER_REVISION,
-                    "preference_dataset_id": PREFERENCE_DATASET_ID,
+                    # Filled in by the loading cell from what is actually read:
+                    # a local file with its digest, or the Hub dataset at the
+                    # commit its revision resolved to.
+                    "preference_sources": None,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
                     "learning_rate": LEARNING_RATE,
@@ -2177,21 +2180,45 @@ def build_04_dpo():
 
                 USE_DEMO_DATA = DEMO_MODE
                 PREFERENCE_MIXTURE = None  # recorded in the run manifest for a real run
+                PREFERENCE_SOURCES = []    # what was actually read, recorded in the run manifest
+
+                def local_source(path: str, rows: list) -> dict:
+                    return {
+                        "kind": "local",
+                        "path": path,
+                        "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                        "rows": len(rows),
+                    }
+
                 if USE_DEMO_DATA:
                     raw = demo_preferences
                     print("Using synthetic plumbing preferences; this is not a capability run.")
                 else:
                     if PREFERENCE_LOCAL_JSONL:
                         rows = read_jsonl(PREFERENCE_LOCAL_JSONL)
+                        PREFERENCE_SOURCES.append(local_source(PREFERENCE_LOCAL_JSONL, rows))
                     else:
+                        from huggingface_hub import HfApi
+
                         rows = load_dataset(
                             PREFERENCE_DATASET_ID,
                             split="train",
                             revision=PREFERENCE_DATASET_REVISION,
                             token=hf_token,
                         ).to_list()
+                        PREFERENCE_SOURCES.append({
+                            "kind": "hub",
+                            "dataset_id": PREFERENCE_DATASET_ID,
+                            "revision": PREFERENCE_DATASET_REVISION,
+                            "resolved_revision": HfApi(token=hf_token).dataset_info(
+                                PREFERENCE_DATASET_ID, revision=PREFERENCE_DATASET_REVISION
+                            ).sha,
+                            "rows": len(rows),
+                        })
                     if LENGTH_PAIRS_LOCAL_JSONL:
-                        rows += read_jsonl(LENGTH_PAIRS_LOCAL_JSONL)
+                        length_rows = read_jsonl(LENGTH_PAIRS_LOCAL_JSONL)
+                        PREFERENCE_SOURCES.append(local_source(LENGTH_PAIRS_LOCAL_JSONL, length_rows))
+                        rows += length_rows
                     # One Dataset from plain rows: Arrow unions the struct keys of
                     # the different pair sources, and the render below strips
                     # the nulls that union inserts.
@@ -2330,6 +2357,7 @@ def build_04_dpo():
                     }, indent=2))
                     result = trainer.train()
                     run_manifest["tool_schema_version"] = TOOL_SCHEMA_VERSION
+                    run_manifest["preference_sources"] = PREFERENCE_SOURCES
                     run_manifest["preference_mixture"] = PREFERENCE_MIXTURE
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     (RUN_ROOT / "dpo" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
@@ -3133,6 +3161,10 @@ def build_07_collect_and_evaluate():
                 from unsloth import FastModel
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
+                # A Hub id is mutable; the baseline is loaded at this revision and
+                # recorded at the commit it resolves to. Pin an immutable commit
+                # for a run that produces artifacts.
+                MODEL_REVISION = "main"
                 ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 ACCEPTED_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
                 # Every think block after the request stays in context for the rest
@@ -3207,6 +3239,16 @@ def build_07_collect_and_evaluate():
                         print(f"pulled earlier reports: {sorted(p.name for p in HUB_REPORT_DIR.iterdir())}")
                     else:
                         print(f"no earlier reports at {GATE_REPORTS_REPO}; starting fresh.")
+
+                from huggingface_hub import HfApi
+
+                def resolved_revision(repo_id: str, revision: str) -> str:
+                    # The commit a branch or tag points at now, so the record
+                    # names the checkpoint that was measured, not a moving ref.
+                    return HfApi(token=hf_token).model_info(repo_id, revision=revision).sha
+
+                stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"
+                print(json.dumps({"stock_model": stock_model_ref}, indent=2))
 
                 # Recorded on every report this notebook writes, with the same
                 # writer the CLI uses. The gate refuses to pair two reports
@@ -3336,6 +3378,7 @@ def build_07_collect_and_evaluate():
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
                         model_name=MODEL_ID,
+                        revision=MODEL_REVISION,
                         max_seq_length=MAX_SEQUENCE_LENGTH,
                         load_in_4bit=False,
                         full_finetuning=False,
@@ -3351,7 +3394,7 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
-                    baseline.metadata = report_provenance(MODEL_ID)
+                    baseline.metadata = report_provenance(stock_model_ref)
                     write_report(baseline, baseline_report_path)
                     print(json.dumps(baseline.scorecard(), indent=2))
                     print(f"wrote {baseline_report_path}")
@@ -3387,7 +3430,7 @@ def build_07_collect_and_evaluate():
                             attempts_per_task=EVAL_ATTEMPTS,
                             budget=EPISODE_BUDGET,
                         )
-                        ladder_reports[effort].metadata = report_provenance(MODEL_ID, reasoning_effort=effort)
+                        ladder_reports[effort].metadata = report_provenance(stock_model_ref, reasoning_effort=effort)
                         write_report(ladder_reports[effort], REPORT_DIR / f"ladder_{effort}.json")
                     ladder = effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)
                     (REPORT_DIR / "effort_ladder.json").write_text(json.dumps(ladder, indent=2))
@@ -3436,7 +3479,8 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
-                    candidate.metadata = report_provenance(f"{ACCEPTED_ADAPTER_ID}@{ACCEPTED_REVISION}")
+                    candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)}"
+                    candidate.metadata = report_provenance(candidate_model_ref)
                     write_report(candidate, candidate_report_path)
                     print(json.dumps(candidate.scorecard(), indent=2))
                 else:

@@ -672,6 +672,7 @@ def _provenance(model: str, **overrides) -> dict:
     return {
         "model": model,
         "harness_revision": "abc123",
+        "harness_fingerprint": "fp-1",
         "reasoning_effort": "medium",
         "max_new_tokens": 4096,
         "max_sequence_length": 32768,
@@ -708,6 +709,28 @@ def test_build_provenance_records_every_key_the_pairing_check_requires():
     assert set(evaluation.PROVENANCE_REQUIRED_KEYS) <= set(provenance)
     assert provenance["episode_budget"] == {"tool_calls": 30, "wall_seconds": 900.0}
     assert provenance["measured_at"] == "2026-09-13T00:00:00+00:00"
+    # The fingerprint of the running harness is taken unless one is given.
+    assert provenance["harness_fingerprint"] == evaluation.compute_harness_fingerprint()
+
+
+def test_harness_fingerprint_moves_only_with_the_harness_code(tmp_path):
+    """A repository revision moves with every commit; the fingerprint moves
+    only when a module of the measuring package changes."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.py").write_text("x = 1\n")
+    (package / "b.py").write_text("y = 2\n")
+    (package / "notes.md").write_text("docs\n")
+    first = evaluation.compute_harness_fingerprint(package)
+    assert first == evaluation.compute_harness_fingerprint(package)
+    (package / "notes.md").write_text("docs changed\n")
+    assert evaluation.compute_harness_fingerprint(package) == first
+    (package / "b.py").write_text("y = 3\n")
+    assert evaluation.compute_harness_fingerprint(package) != first
+    assert len(first) == 16
+    assert evaluation.compute_harness_fingerprint() == evaluation.compute_harness_fingerprint(
+        ROOT / "src" / "qwen3_8_27b_code"
+    )
 
 
 def test_cli_compare_refuses_reports_without_matching_provenance(tmp_path, capsys):
@@ -771,6 +794,7 @@ def test_gate_pairing_refuses_reports_measured_differently():
 
     # A different effort, cap, budget or attempt count is a different experiment.
     for key, value in (
+        ("harness_fingerprint", "fp-2"),
         ("reasoning_effort", "low"),
         ("max_new_tokens", 2048),
         ("episode_budget", {"tool_calls": 10, "wall_seconds": 900.0}),

@@ -20,6 +20,7 @@ quality" is something the gate can check rather than a hope.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 
 from collections import Counter
 from dataclasses import dataclass, field
@@ -309,7 +310,12 @@ class GateCheck:
 
 
 # Measurement settings two reports must share before the gate pairs them.
+# The harness fingerprint is among them: a change to the verifier, the
+# episode loop, the scoring or the task construction changes what a
+# report measures even when no task id changes, so two reports taken
+# under different harness code are different experiments.
 PROVENANCE_STRICT_KEYS = (
+    "harness_fingerprint",
     "reasoning_effort",
     "max_new_tokens",
     "max_sequence_length",
@@ -317,14 +323,29 @@ PROVENANCE_STRICT_KEYS = (
     "attempts_per_task",
     "variants_per_family",
 )
-# Recorded on the comparison when they differ, but not fatal. A harness
-# change that touched the suite is caught elsewhere: ``compare`` refuses
-# reports with no shared task and the horizon gate fails any task present
-# in only one report. A harness change that did not touch the suite is
-# what this records.
+# Recorded on the comparison when it differs, but not fatal on its own: a
+# repository revision moves with every docs or notebook commit, and the
+# fingerprint above already blocks the ones that changed the harness.
 PROVENANCE_ADVISORY_KEYS = ("harness_revision",)
 # Every key a report must carry before it can be paired at all.
 PROVENANCE_REQUIRED_KEYS = ("model",) + PROVENANCE_STRICT_KEYS
+
+
+def compute_harness_fingerprint(package_dir: Path | None = None) -> str:
+    """A digest of the measuring code: every module of this package.
+
+    Name and content of each ``.py`` file, in a fixed order, so the value
+    moves only when the harness itself changes, not with docs, notebooks
+    or unrelated commits.
+    """
+    package_dir = Path(package_dir) if package_dir is not None else Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package_dir.glob("*.py")):
+        digest.update(path.name.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
 
 
 def build_provenance(
@@ -337,19 +358,23 @@ def build_provenance(
     episode_budget: EpisodeBudget | dict,
     attempts_per_task: int,
     variants_per_family: int,
+    harness_fingerprint: str | None = None,
     measured_at: str | None = None,
 ) -> dict:
     """The provenance every scored report records.
 
     One writer for the notebook and the CLI, so the keys ``pairing_problems``
-    requires cannot drift between them. ``model`` is whatever was measured:
-    a Hub id, an adapter id with its revision, or a scripted policy name.
+    requires cannot drift between them. ``model`` is whatever was measured,
+    pinned: a Hub id or adapter id with its resolved revision, or a scripted
+    policy name. The harness fingerprint is taken from the code that is
+    running unless given.
     """
     if isinstance(episode_budget, EpisodeBudget):
         episode_budget = {"tool_calls": episode_budget.tool_calls, "wall_seconds": episode_budget.wall_seconds}
     return {
         "model": model,
         "harness_revision": harness_revision,
+        "harness_fingerprint": harness_fingerprint or compute_harness_fingerprint(),
         "reasoning_effort": reasoning_effort,
         "max_new_tokens": max_new_tokens,
         "max_sequence_length": max_sequence_length,

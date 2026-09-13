@@ -774,7 +774,10 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
         (sft_config, ("learning_rate", "eval_every_steps", "save_every_steps", "optimizer")),
         (
             code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
-            ("learning_rate", "beta", "eval_every_steps", "save_every_steps", "optimizer", "max_length_pair_share"),
+            (
+                "learning_rate", "beta", "eval_every_steps", "save_every_steps", "optimizer",
+                "max_length_pair_share", "preference_sources",
+            ),
         ),
     ):
         manifest = cell[cell.index("run_manifest = {"):]
@@ -785,6 +788,13 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     assert "beta=DPO_BETA," in dpo_args
     dpo_train = code_cell_containing(generator.build_04_dpo(), "preference_mixture.json")
     assert '"dpo" / "run_manifest.json"' in dpo_train
+    # The manifest names the rows actually read, not the configured Hub id.
+    assert 'run_manifest["preference_sources"] = PREFERENCE_SOURCES' in dpo_train
+    dpo_load = code_cell_containing(generator.build_04_dpo(), "demo_preferences = Dataset.from_list")
+    assert "PREFERENCE_SOURCES.append(local_source(PREFERENCE_LOCAL_JSONL, rows))" in dpo_load
+    assert "PREFERENCE_SOURCES.append(local_source(LENGTH_PAIRS_LOCAL_JSONL, length_rows))" in dpo_load
+    assert '"resolved_revision": HfApi(token=hf_token).dataset_info(' in dpo_load
+    assert '"sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()' in dpo_load
 
 
 PUBLISH_MARKERS = (
@@ -881,14 +891,23 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert '"measured_at"' not in config_cell
 
     # Every report this notebook writes records how it was measured.
+    # The model reference is pinned: a Hub id resolved to the commit that was
+    # loaded, never the moving branch name.
+    assert 'MODEL_REVISION = "main"' in config_cell
+    assert "def resolved_revision(" in config_cell
+    assert 'stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"' in config_cell
     for marker, model_ref in (
-        ("RUN_BASELINE_EVAL:", "report_provenance(MODEL_ID)"),
-        ("RUN_EFFORT_LADDER:", "report_provenance(MODEL_ID, reasoning_effort=effort)"),
-        ("RUN_CANDIDATE_EVAL:", 'report_provenance(f"{ACCEPTED_ADAPTER_ID}@{ACCEPTED_REVISION}")'),
+        ("RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
+        ("RUN_EFFORT_LADDER:", "report_provenance(stock_model_ref, reasoning_effort=effort)"),
+        ("RUN_CANDIDATE_EVAL:", "report_provenance(candidate_model_ref)"),
     ):
         cell = code_cell_containing(notebook, marker)
         assert model_ref in cell
         assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
+    baseline_cell = code_cell_containing(notebook, "RUN_BASELINE_EVAL:")
+    assert "revision=MODEL_REVISION," in baseline_cell
+    candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
+    assert "resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in candidate_cell
 
     # The gate pairs only this session's candidate with a named baseline,
     # and refuses reports measured differently.
