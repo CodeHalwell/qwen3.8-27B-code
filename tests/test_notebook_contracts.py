@@ -526,7 +526,9 @@ def run_lora_discovery(cell: str) -> dict:
         "assert_model_fully_resident": lambda *_, **__: None,
         "MODEL_ID": "unsloth/Qwen3.8-27B",
         "MERGED_SFT_MODEL_ID": "user/merged",
-        "MERGED_SFT_REVISION": "REPLACE_WITH_ACCEPTED_COMMIT",
+        "MERGED_SFT_REVISION": "main",
+        "SMOKE_MODEL_ID": "unsloth/Qwen3.8-27B",
+        "DEMO_MODE": False,
         "MAX_SEQ_LENGTH": 4096,
         "hf_token": "token",
     }
@@ -744,7 +746,7 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     save-and-push after every optimiser step."""
     generator = load_generator()
     for build, config_marker, args_marker in (
-        (generator.build_03_sft, "PUSH_MERGED_BF16 = False", "training_args = SFTConfig("),
+        (generator.build_03_sft, "LEARNING_RATE = 1e-4", "training_args = SFTConfig("),
         (generator.build_04_dpo, "LENGTH_PAIRS_LOCAL_JSONL", "dpo_args = DPOConfig("),
     ):
         notebook = build()
@@ -766,12 +768,12 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
 
     sft_args = code_cell_containing(generator.build_03_sft(), "training_args = SFTConfig(")
     assert "learning_rate=LEARNING_RATE," in sft_args
-    sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
-    assert "LEARNING_RATE = 2e-5" in sft_config
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    assert "LEARNING_RATE = 1e-4" in sft_config
 
     # The run inputs a checkpoint must be attributed to are in its manifest.
     for cell, keys in (
-        (sft_config, ("learning_rate", "eval_every_steps", "save_every_steps", "optimizer")),
+        (sft_config, ("learning_rate", "num_train_epochs", "eval_every_steps", "save_every_steps", "optimizer")),
         (
             code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
             (
@@ -855,12 +857,13 @@ def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
     # Where the publish follows an expensive job, an existing public target
     # is found at configuration time, not after the GPU or the teacher bill.
     for name, marker, guard in (
-        ("03", "PUSH_MERGED_BF16 = False", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("03", "LEARNING_RATE = 1e-4", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("04", "LENGTH_PAIRS_LOCAL_JSONL", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("05", "ROLLOUT_POLICY_PRECISION = ", "require_private_repo(OUTPUT_ADAPTER_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(QAT_OUTPUT_ID)"),
         ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(GGUF_OUTPUT_ID)"),
         ("07", "GATE_REPORTS_REPO =", 'require_private_repo(GATE_REPORTS_REPO, "dataset")'),
+        ("07", "GATE_REPORTS_REPO =", "require_private_repo(MERGED_MODEL_ID)"),
         ("08", "TEACHER_REPO = ", 'require_private_repo(TEACHER_REPO, "dataset")'),
     ):
         config_cell = code_cell_containing(notebooks[name], marker)
@@ -897,7 +900,7 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "def resolved_revision(" in config_cell
     assert 'stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"' in config_cell
     for marker, model_ref in (
-        ("RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
+        ("if RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
         ("RUN_EFFORT_LADDER:", "report_provenance(stock_model_ref, reasoning_effort=effort)"),
         ("RUN_CANDIDATE_EVAL:", "report_provenance(candidate_model_ref)"),
     ):
@@ -905,11 +908,15 @@ def test_notebook_07_persists_reports_across_colab_sessions():
         assert model_ref in cell
         assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
     assert "seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS]," in config_cell
-    baseline_cell = code_cell_containing(notebook, "RUN_BASELINE_EVAL:")
+    baseline_cell = code_cell_containing(notebook, "if RUN_BASELINE_EVAL:")
     assert "revision=MODEL_REVISION," in baseline_cell
     assert baseline_cell.index("baseline_report_path.unlink(missing_ok=True)") < baseline_cell.index("evaluate(")
     candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
-    assert "resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in candidate_cell
+    # The candidate commit is pinned in the configuration cell, before the
+    # evaluation, and the same commit is loaded and recorded.
+    assert "CANDIDATE_REVISION = resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in config_cell
+    assert "revision=CANDIDATE_REVISION," in candidate_cell
+    assert 'candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{CANDIDATE_REVISION}"' in candidate_cell
     # A candidate counts only when this cell wrote it: the file is removed
     # before the evaluation and the flag set after the write.
     assert candidate_cell.index("candidate_written = False") < candidate_cell.index("if RUN_CANDIDATE_EVAL:")
@@ -932,6 +939,12 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "comparison_path.unlink(missing_ok=True)" in gate_cell
     assert gate_cell.index("comparison_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
     assert "comparison_path.write_text(" in gate_cell
+    # A baseline measured this session outranks the pulled copy it replaced,
+    # whatever name GATE_BASELINE_FILE selects.
+    assert "baseline_candidates.append(baseline_report_path)" in gate_cell
+    assert gate_cell.index("baseline_candidates.append(baseline_report_path)") < gate_cell.index(
+        "baseline_candidates.append(HUB_REPORT_DIR / GATE_BASELINE_FILE)"
+    )
 
     persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
     assert "private=True" in persist_cell
@@ -1043,3 +1056,106 @@ def test_every_notebook_cell_uses_only_names_defined_earlier():
     for name, build in builders.items():
         cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
         assert undefined_notebook_names(cells) == [], f"notebook {name}"
+
+
+def test_fixture_rows_are_refused_at_publish_and_at_training():
+    """Flipping DEMO_MODE and rerunning only the publish cell once pushed
+    the two-row fixture as the corpus. The guards read the rows, not the flag."""
+    generator = load_generator()
+    publish_cell = code_cell_containing(generator.build_02_data(), "PUSH_DATASET = True")
+    assert 'str(row_id).startswith("fixture/")' in publish_cell
+    assert "if DEMO_MODE:\n    PUSH_DATASET = False" in publish_cell
+    assert "if fixture_rows:" in publish_cell
+    assert publish_cell.index("if fixture_rows:") < publish_cell.index("require_private_repo(")
+    # Rows without an id are valid; the scan tolerates a missing column.
+    assert '"id" in split.column_names' in publish_cell
+    load_cell = code_cell_containing(generator.build_03_sft(), "loaded = load_dataset(DATASET_ID")
+    assert 'str(row_id).startswith("fixture/")' in load_cell
+    assert '"id" in loaded[split].column_names' in load_cell
+    assert "Rerun notebook 02 with DEMO_MODE=False" in load_cell
+    # The fixture rows really are marked that way.
+    demo_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
+    assert demo_cell.count('"id": "fixture/') >= 2
+
+
+def test_notebooks_run_the_real_pipeline_as_shipped():
+    """Open, Run all: no demo default, no publish flag to flip, no placeholder
+    to fill in. Notebook 07 decides from the Hub what a session needs."""
+    generator = load_generator()
+    data_config = code_cell_containing(generator.build_02_data(), "SOURCE_LOCAL_JSONL")
+    assert "DEMO_MODE = False" in data_config
+    assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
+    assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
+    assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
+
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    for line in (
+        "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
+    ):
+        assert line in sft_config, line
+    # Completion marker: the manifest goes up after the adapter.
+    train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
+    assert train_cell.index("trainer.push_to_hub(") < train_cell.index('path_in_repo="run_manifest.json"')
+    # Notebook 03 no longer merges: a merge of a retrained adapter is not the gated one.
+    for cell in generator.build_03_sft().cells:
+        assert "push_to_hub_merged(" not in cell.source
+    # Demo mode clamps rather than raising, so a smoke needs one flag.
+    assert "MAX_STEPS, PUSH_ADAPTER = 2, False" in sft_config
+
+    dpo_config = code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL")
+    for line in (
+        "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
+    ):
+        assert line in dpo_config, line
+    assert 'PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")' in dpo_config
+    assert 'file_exists(\n                        MERGED_SFT_MODEL_ID, "run_manifest.json"' in dpo_config.replace(
+        "\n    ", "\n                    "
+    ) or '"run_manifest.json", revision=MERGED_SFT_REVISION' in dpo_config
+    # The smoke loads the stock model, so it needs nothing published.
+    dpo_load = code_cell_containing(generator.build_04_dpo(), "model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID")
+    assert "revision=None if DEMO_MODE else MERGED_SFT_REVISION" in dpo_load
+
+    gate_config = code_cell_containing(generator.build_07_collect_and_evaluate(), "GATE_REPORTS_REPO =")
+    assert "EVAL_ATTEMPTS = 2" in gate_config
+    assert "PUSH_ARTIFACTS = True" in gate_config
+    assert "RUN_BASELINE_EVAL = None" in gate_config
+    assert "RUN_CANDIDATE_EVAL = None" in gate_config
+    # A pulled baseline stands in only if it was measured the way this
+    # session measures; otherwise the candidate would be refused at the gate.
+    assert "RUN_BASELINE_EVAL = bool(mismatches)" in gate_config
+    assert "read_report(pulled_baseline).metadata, report_provenance(stock_model_ref)" in gate_config
+    assert 'ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=CANDIDATE_REVISION' in gate_config
+    # Notebook 03 removes an earlier marker before its first push, so an
+    # intermediate checkpoint never inherits one.
+    sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
+    # ...and only once training is certain to start: a dry run or an early
+    # failure must leave a valid adapter's marker alone.
+    assert "hub.delete_file(" not in sft_config
+    train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
+    assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in train_cell
+    assert train_cell.index("if RUN_TRAINING:") < train_cell.index("hub.delete_file(") < train_cell.index("trainer.train(")
+    # Existence only guards resolving the commit; the decision itself keys on
+    # the completion marker at that commit.
+    assert "RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None and api.file_exists(" in gate_config
+    # A baseline left by an earlier run in this runtime cannot shadow the pulled one.
+    assert "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)" in gate_config
+    assert gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)") < gate_config.index(
+        "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)"
+    )
+    # The decision comes after the pull and the provenance helper that inform it.
+    assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
+    assert gate_config.index("def report_provenance(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
+    # The accepted merge is published by the gate, from the candidate in memory.
+    assert "PUBLISH_ACCEPTED_MERGE = True" in gate_config
+    merge_cell = code_cell_containing(generator.build_07_collect_and_evaluate(), "push_to_hub_merged(")
+    assert 'if comparison["gate_passed"] and PUBLISH_ACCEPTED_MERGE:' in merge_cell
+    assert merge_cell.index("push_to_hub_merged(") < merge_cell.index('path_in_repo="run_manifest.json"')
+    assert '"adapter": candidate_model_ref' in merge_cell
+
+    for name, build in (
+        ("02", generator.build_02_data), ("03", generator.build_03_sft), ("04", generator.build_04_dpo),
+        ("05", generator.build_05_grpo), ("06", generator.build_06_qat_export),
+        ("07", generator.build_07_collect_and_evaluate),
+    ):
+        for cell in build().cells:
+            assert "REPLACE_WITH_" not in cell.source, name

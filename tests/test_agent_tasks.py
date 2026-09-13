@@ -772,6 +772,19 @@ def test_cli_compare_refuses_reports_without_matching_provenance(tmp_path, capsy
     assert written["provenance"]["candidate"]["model"] == "gold-v2"
 
 
+def test_provenance_mismatches_name_every_setting_that_differs_or_is_missing():
+    expected = _provenance("unsloth/Qwen3.8-27B", measured_at="later")
+    # The timestamp is not a setting.
+    assert evaluation.provenance_mismatches(_provenance("unsloth/Qwen3.8-27B", measured_at="earlier"), expected) == []
+    recorded = _provenance("unsloth/Qwen3.8-27B", attempts_per_task=2, seeds=[3407, 9176])
+    del recorded["harness_fingerprint"]
+    assert evaluation.provenance_mismatches(recorded, expected) == [
+        "harness_fingerprint: not recorded, expected 'fp-1'",
+        "attempts_per_task: recorded 2, expected 1",
+        "seeds: recorded [3407, 9176], expected [3407]",
+    ]
+
+
 def test_gate_pairing_refuses_reports_measured_differently():
     """A stale report pulled from storage must not be gated against a fresh
     one unless both record the same measurement settings."""
