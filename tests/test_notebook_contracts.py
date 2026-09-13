@@ -17,6 +17,7 @@ import tempfile
 from types import SimpleNamespace
 from urllib.parse import unquote
 
+import pytest
 from datasets import Dataset
 import numpy as np
 
@@ -946,3 +947,40 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert code_cells[-1] == persist_cell
     collection_cell = code_cell_containing(notebook, "if RUN_COLLECTION:")
     assert "upload_folder" not in collection_cell
+
+
+def test_every_notebook_cell_uses_only_names_defined_earlier(tmp_path):
+    """A cell that uses a module it never imports raises NameError on Colab,
+    while the contract tests above, which hand cells a ready namespace,
+    still pass. Concatenate each notebook's code cells in order and let ruff
+    report any name that nothing before it defined."""
+    ruff = shutil.which("ruff") or str(Path(sys.executable).parent / "ruff")
+    if not Path(ruff).exists():
+        pytest.skip("ruff is not installed")
+    generator = load_generator()
+    builders = {
+        "00": generator.build_00_preflight,
+        "01": generator.build_01_baseline,
+        "02": generator.build_02_data,
+        "03": generator.build_03_sft,
+        "04": generator.build_04_dpo,
+        "05": generator.build_05_grpo,
+        "06": generator.build_06_qat_export,
+        "07": generator.build_07_collect_and_evaluate,
+        "08": generator.build_08_distil,
+    }
+    for name, build in builders.items():
+        lines = []
+        for index, cell in enumerate(build().cells):
+            if cell.cell_type != "code":
+                continue
+            lines.append(f"# ---- cell {index}")
+            for line in cell.source.splitlines():
+                # Shell and magic lines are not Python; keep the line count.
+                lines.append("pass  # magic" if line.lstrip().startswith(("!", "%")) else line)
+        (tmp_path / f"notebook_{name}.py").write_text("\n".join(lines) + "\n")
+    result = subprocess.run(
+        [ruff, "check", "--select", "F821", "--no-cache", "--output-format", "concise", str(tmp_path)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
