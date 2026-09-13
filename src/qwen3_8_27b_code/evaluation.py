@@ -122,15 +122,19 @@ class EvaluationReport:
             horizons.setdefault(record.task_id, record.task_horizon)
         return dict(sorted(horizons.items()))
 
-    def attempt_signature(self) -> tuple[tuple[str, int], ...]:
-        """Every (task, seed) the report attempted, scored or not.
+    def attempt_signature(self, scored_only: bool = True) -> tuple[tuple[str, int], ...]:
+        """The (task, seed) samples a report's numbers are computed from.
 
-        Two reports with the same signature scored the same experiment;
-        the ladder requires that before it compares rungs, because success
-        computed from different attempt counts or seeds would let sampling
-        variation pick the effort.
+        Only scored attempts count by default: an attempt lost to the
+        harness is excluded from every rate, so two reports that attempted
+        the same samples but scored different ones are not the same
+        experiment, and the ladder refuses to rank them. Success computed
+        from different samples would let sampling variation, or a lost
+        attempt, pick the effort. ``scored_only=False`` gives what was
+        attempted, for reporting.
         """
-        return tuple(sorted((record.task_id, record.seed) for record in self.records))
+        records = self.scored if scored_only else self.records
+        return tuple(sorted((record.task_id, record.seed) for record in records))
 
     def scorecard(self) -> dict:
         scored = self.scored
@@ -554,7 +558,8 @@ def effort_ladder(reports: dict[str, EvaluationReport], success_tolerance: float
     """Tabulate the effort ladder of docs/thinking-budget.md and pick a deployment effort.
 
     ``reports`` maps an effort label to the held-out report scored at that
-    effort with the same policy on the same tasks, attempts and seeds. A
+    effort with the same policy on the same tasks, attempts and seeds, none
+    of them lost to the harness. A
     rung is eligible when its episode success is within ``success_tolerance``
     of the best rung both in aggregate and in every designed horizon band,
     so a cheaper rung that trades the pipeline tasks for an extra short one
@@ -572,9 +577,15 @@ def effort_ladder(reports: dict[str, EvaluationReport], success_tolerance: float
         raise ValueError(f"unknown reasoning effort(s) {unknown}; the template accepts {EFFORT_ORDER}")
     signatures = {effort: report.attempt_signature() for effort, report in reports.items()}
     if len(set(signatures.values())) != 1:
+        lost = {
+            effort: len(report.records) - len(report.scored)
+            for effort, report in reports.items()
+            if len(report.records) != len(report.scored)
+        }
         raise ValueError(
             "every rung of the ladder must score the same tasks with the same attempts and seeds; "
             "success from unequal samples would let sampling variation pick the effort"
+            + (f" (attempts lost to infrastructure failures, re-run them: {lost})" if lost else "")
         )
 
     rungs = {}
@@ -585,6 +596,7 @@ def effort_ladder(reports: dict[str, EvaluationReport], success_tolerance: float
         rungs[effort] = {
             "label": card["label"],
             "scored_attempts": card["scored_attempts"],
+            "infrastructure_failures": card["infrastructure_failures"],
             "episode_success": card["episode_success"],
             "reasoning_tokens_reported": card["reasoning_tokens_reported"],
             "reasoning_tokens_per_turn": card["reasoning_tokens_per_turn"],

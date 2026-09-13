@@ -98,7 +98,8 @@ that trades the pipeline for an extra short task is never recommended; the
 recommended rung is the eligible one that thinks least, ties going to the
 lower overrun rate, and when no rung keeps every band the ladder says so
 and recommends nothing. The three reports must score the same tasks with
-the same attempts and seeds, or the ladder refuses to rank them. Notebook
+the same attempts and seeds, none of them lost to the harness, or the
+ladder refuses to rank them. Notebook
 07 runs it with `RUN_EFFORT_LADDER`, and from the command line:
 
 ```bash

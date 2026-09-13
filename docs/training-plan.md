@@ -162,7 +162,8 @@ behaviour.
 
 The ladder is then a decision, not only a table. `evaluation.effort_ladder()`
 (notebook 07's `RUN_EFFORT_LADDER`, or `scripts/evaluate_agent.py ladder`)
-takes the three reports, scored on the same tasks, attempts and seeds, and
+takes the three reports, scored on the same tasks, attempts and seeds with
+none lost to the harness, and
 recommends the rung that thinks least among those whose success matches
 the best rung within a frozen tolerance, in aggregate and in every designed
 horizon band, ties going to the lower overrun rate. That rung becomes the

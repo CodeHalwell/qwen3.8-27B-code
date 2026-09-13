@@ -534,6 +534,22 @@ def test_effort_ladder_picks_the_cheapest_rung_that_keeps_the_best_success():
             "medium": evaluation.evaluate(suite, scaled(3), label="other-seed", seeds=(1,)),
         })
 
+    # An attempt lost to the harness is excluded from every rate, so equal
+    # attempted samples are not equal scored samples: the rung is refused
+    # rather than ranked on an inflated success.
+    def broken_once(task, seed):
+        if task.task_id == suite[0].task_id:
+            def policy(messages):
+                raise RuntimeError("model server went away")
+            return policy
+        return scaled(3)(task, seed)
+
+    lost_one = evaluation.evaluate(suite, broken_once, label="lost-one")
+    assert lost_one.attempt_signature(scored_only=False) == reports["medium"].attempt_signature(scored_only=False)
+    assert lost_one.attempt_signature() != reports["medium"].attempt_signature()
+    with pytest.raises(ValueError, match="infrastructure failures"):
+        evaluation.effort_ladder({"low": reports["medium"], "medium": lost_one})
+
 
 def test_effort_ladder_never_recommends_a_rung_that_loses_a_band():
     """Equal or tolerable aggregate success does not excuse losing the pipeline."""
