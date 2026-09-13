@@ -115,3 +115,5 @@ These documents were last reviewed on **2026-08-17**. The model, template and
 hardware facts in [Model and hardware](model-and-hardware.md) and the
 [training plan](training-plan.md) were rechecked against the Hub and against
 Unsloth's own Qwen3.8-27B Kaggle notebook on **2026-09-12**.
+The first G4 preflight ran on **2026-09-13**; its measurements are in
+[Model and hardware](model-and-hardware.md#measured-on-the-g4).

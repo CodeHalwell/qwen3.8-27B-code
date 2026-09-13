@@ -100,6 +100,11 @@ head's own `q_proj`/`o_proj` are adapted unless they are explicitly frozen.
 Exclude the vision tower, the `mtp.` prefix and `lm_head`, and fail the run if
 discovery returns anything other than the reviewed set.
 
+The first G4 preflight (notebook 00, 2026-09-13) listed exactly these
+suffixes plus `lm_head` on the loaded weights, and 333 vision-associated
+parameters, so notebook 03's discovery accepts the checkpoint as reviewed
+and the freeze has something to freeze.
+
 ## Native conversation behaviour
 
 Qwen3.8-27B supports hybrid thinking, developer messages, tool calling,
@@ -231,6 +236,23 @@ allocated and reserved VRAM for every smoke run. The measured 4-bit figure
 from the [Kaggle lane](#second-lane-kaggle-t4-x2), 18.80 GiB of weights,
 replaces the generic QLoRA estimate for the fallback path.
 
+### Measured on the G4
+
+Notebook 00's first run on the G4 (2026-09-13), BF16 load through
+`FastModel` at a 4,096-token window plus one 256-token generation:
+
+| Measurement | Value |
+| --- | ---: |
+| Peak reserved VRAM, load and generation | 51.41 GiB |
+| Card total as PyTorch reports it | about 89.4 GiB |
+| Headroom left for adapter state, activations and logits | about 38 GiB |
+
+That headroom covers BF16 LoRA at 4K outright and at 8K with the chunked
+loss, so the QLoRA fallback is not needed for the planned runs. The peak
+sits a little under the 51.8 GiB of safetensors because the loader does
+not place the multi-token-prediction layer. Training peaks are still to be
+measured by notebook 03's smoke run.
+
 ### Logit memory
 
 The vocabulary, not the depth, sets the largest transient allocation in a
@@ -318,3 +340,10 @@ Before the first expensive run, capture:
    tokens per second at 4K, so that throughput and memory are attributable.
 
 Failure of any preflight blocks a full SFT run.
+
+The first G4 run (2026-09-13) passed items 1 to 5: the checkpoint loaded
+in BF16, the developer message folded into the system block with the six
+tools rendered verbatim, and the stock model answered the probe at
+`medium` with a one-sentence think block followed by a well-formed native
+XML `read_file` call that stopped on `<|im_end|>`. Items 6 to 9 are
+notebook 03's smoke run.

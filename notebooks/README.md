@@ -32,6 +32,13 @@ and a gate that has drifted from the collector it grades is worse than no gate.
 The one thing notebook 07 defines locally is the GPU-specific policy — messages
 in, one generated turn out.
 
+Its reports outlive the runtime. Colab runtimes are per notebook and per
+session, so the baseline measured in one sitting is gone before the candidate
+exists; with `PUSH_ARTIFACTS = True` the last cell pushes everything under
+`REPORT_DIR` to a private dataset repo (`{HF_USERNAME}/qwen38-code-gate-reports`)
+and the configuration cell pulls it back at the start of the next session, so
+the gate can pair a fresh candidate with an earlier baseline.
+
 ## Colab setup
 
 1. Select the **G4** GPU runtime.
