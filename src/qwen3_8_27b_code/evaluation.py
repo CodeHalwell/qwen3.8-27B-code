@@ -470,7 +470,10 @@ def task_horizon_check(comparison: dict) -> GateCheck:
     both sides are the same tasks by construction; a report that scored
     tasks the other did not (a narrower suite, or a band lost entirely to
     infrastructure failures) fails the check rather than slipping past it,
-    and so do two reports that label a shared task with different bands.
+    and so do two reports that label a shared task with different bands or
+    scored it a different number of times: an attempt lost to the harness
+    leaves the success rate intact and the coverage hollow, and the check
+    refuses to compare hollow coverage rather than silently accepting it.
     """
     name = "task_horizon_no_worse"
     unmatched = list(comparison.get("only_in_baseline", [])) + list(comparison.get("only_in_candidate", []))
@@ -490,6 +493,17 @@ def task_horizon_check(comparison: dict) -> GateCheck:
     disagreements = sorted(task_id for task_id in paired if before_labels[task_id] != after_labels[task_id])
     if disagreements:
         return GateCheck(name, False, f"horizon labels disagree between the reports for {disagreements}")
+    uneven = sorted(
+        task_id for task_id, entry in paired.items()
+        if entry["baseline_attempts"] != entry["candidate_attempts"]
+    )
+    if uneven:
+        return GateCheck(
+            name,
+            False,
+            "scored attempt counts differ per task, so a band could be hollowed out by "
+            f"infrastructure failures on one side: {uneven}",
+        )
 
     def band_rate(side: str) -> dict[str, float]:
         successes: Counter = Counter()

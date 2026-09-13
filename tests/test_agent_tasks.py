@@ -607,6 +607,27 @@ def test_horizon_gate_refuses_reports_that_scored_different_tasks():
     assert check.passed is False
     assert "only in baseline" in check.detail
 
+    # An attempt lost to the harness on one side leaves that task's success
+    # rate intact and its coverage hollow; uneven attempt counts fail too.
+    trio = [task for task in SMOKE_TASKS if task.horizon == "short"][:2] + [
+        task for task in SMOKE_TASKS if task.horizon == "long"
+    ]
+
+    def flaky_on_long(task, seed):
+        if task.horizon == "long" and seed == 9176:
+            def policy(messages):
+                raise RuntimeError("model server went away")
+            return policy
+        return policies.gold(task, seed)
+
+    steady = evaluation.evaluate(trio, policies.gold, label="steady", attempts_per_task=2)
+    flaky = evaluation.evaluate(trio, flaky_on_long, label="flaky", attempts_per_task=2)
+    comparison = evaluation.compare(steady, flaky)
+    assert comparison["deltas"]["episode_success"] == 0.0
+    check = {check.name: check for check in evaluation.gate(comparison)}["task_horizon_no_worse"]
+    assert check.passed is False
+    assert "attempt counts differ" in check.detail
+
     # Reports that predate the label are reported as unmeasured, not failed;
     # reports that label a shared task differently are a changed suite.
     unlabelled = evaluation.EvaluationReport.from_dict({

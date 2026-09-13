@@ -3087,8 +3087,9 @@ def build_07_collect_and_evaluate():
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
 
-                # Six single-file families plus the two multi-file families from
-                # long_horizon, which put the medium band on the scorecard.
+                # Six single-file families (short band) plus the three multi-file
+                # families from long_horizon: two coupled-module (medium band) and
+                # one four-stage pipeline (long band).
                 evaluation_suite = evaluation_tasks(variants_per_family=EVAL_VARIANTS_PER_FAMILY)
                 print(json.dumps({
                     "held_out_tasks": len(evaluation_suite),

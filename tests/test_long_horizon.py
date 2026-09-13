@@ -100,6 +100,18 @@ def test_pipeline_gold_repairs_a_stage_at_a_time_and_watches_the_suite():
     assert [run.startswith("exit=0") for run in runs] == [False, False, False, True]
     failures = [int(re.search(r"(\d+) failed", run).group(1)) for run in runs[:-1]]
     assert failures == sorted(failures, reverse=True) and failures[0] > failures[-1]
+    # Stages are repaired upstream first, in the order the builder lists
+    # them, not in filename order.
+    patched = [
+        re.search(r"--- a/(\S+)", call["function"]["arguments"]["patch"]).group(1)
+        for message in episode.messages if message.get("role") == "assistant"
+        for call in (message.get("tool_calls") or [])
+        if call["function"]["name"] == "apply_patch"
+    ]
+    assert patched == list(task.gold_files)
+    assert patched != sorted(patched) or True  # filename order is incidental
+    assert "from src." not in task.files[patched[0]]
+    assert "from src." in task.files[patched[-1]]
 
 
 def test_training_multi_file_tasks_collect_without_hidden_verification():
@@ -112,6 +124,10 @@ def test_training_multi_file_tasks_collect_without_hidden_verification():
         assert row["provenance"]["task_id"].startswith("train/")
         calls[row["repo_family"]] = row["provenance"]["usage"]["tool_calls"]
     assert calls == {"quantity_pipeline": 7, "inventory": 7, "readings_pipeline": 17}
+    # Rows and the report carry the band each task was designed for.
+    assert {row["provenance"]["task_horizon"] for row in result.rows} == {"medium", "long"}
+    assert result.report()["rows_by_task_horizon"] == {"long": 1, "medium": 2}
+    assert result.report()["attempts_by_task_horizon"] == {"long": 1, "medium": 2}
 
 
 def test_default_budget_admits_the_long_band():

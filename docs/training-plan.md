@@ -217,11 +217,13 @@ Starting configuration:
 | Loss | Assistant tokens only | Includes assistant tool calls |
 | Tracking | Trackio plus machine-readable run manifest | Required for comparable experiments |
 
-The exact loader (`FastLanguageModel` versus the current multimodal loader) and
-target module names are preflight results, not constants to copy from an older
-notebook. Unsloth's Qwen3.8 notebook uses `FastModel`; if `FastLanguageModel`
-refuses the checkpoint in preflight, that is the one-line switch to make in
-the generator, and the contract test that counts load cells changes with it.
+The target module names are preflight results, not constants to copy from an
+older notebook. The loader is `FastModel`, as in Unsloth's Qwen3.8 notebook:
+the suite calls it everywhere, the contract tests count its load cells, and
+`text_tokenizer_of` reaches the text tokenizer behind the processor it
+returns. That choice has not yet run on the G4; if the pinned stack refuses
+the checkpoint through it, notebook 00 is where it shows, and the fix is
+made in the generator, never in one notebook.
 
 Evaluate frequently enough to catch protocol and coding regression, but do not
 run the full repository suite every few steps. Use a small sentinel set during

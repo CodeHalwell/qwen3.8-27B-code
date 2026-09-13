@@ -202,6 +202,7 @@ def test_collector_cli_writes_attempts_and_self_play_outcome_pairs(tmp_path):
     assert len(attempts) == 15 and all(attempt.policy == "gold" for attempt in attempts)
     assert {attempt.reasoning_effort for attempt in attempts} == {"medium"}
     assert max(attempt.episode.tool_calls for attempt in attempts) == 17
+    assert {attempt.task_horizon for attempt in attempts} == {"short", "medium", "long"}
     assert json.loads((out / "outcome.json").read_text())["rows"] == 0
     assert json.loads((out / "report.json").read_text())["policy"] == "gold"
 

@@ -57,6 +57,9 @@ class Attempt:
     # so the instruction the reasoning was written under is the one it is
     # trained under; never relabel it.
     reasoning_effort: str = "medium"
+    # The band the task was designed for (AgentTask.horizon), so attempts
+    # and rows keep it and a corpus report can say how much is long-horizon.
+    task_horizon: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -78,6 +81,7 @@ class Attempt:
             "seed": self.seed,
             "policy": self.policy,
             "reasoning_effort": self.reasoning_effort,
+            "task_horizon": self.task_horizon,
             "termination": self.episode.termination,
             "succeeded": self.verdict.succeeded,
             "rejection": self.rejection,
@@ -97,6 +101,7 @@ class Attempt:
             "seed": self.seed,
             "policy": self.policy,
             "reasoning_effort": self.reasoning_effort,
+            "task_horizon": self.task_horizon,
             "rejection": self.rejection,
             "episode": {
                 "messages": self.episode.messages,
@@ -136,6 +141,7 @@ class Attempt:
             rejection=payload.get("rejection"),
             policy=payload.get("policy", ""),
             reasoning_effort=payload.get("reasoning_effort", "medium"),
+            task_horizon=payload.get("task_horizon", ""),
         )
 
 
@@ -205,6 +211,7 @@ def build_row(
         },
         "provenance": {
             "task_id": task.task_id,
+            "task_horizon": task.horizon,
             "seed": attempt.seed,
             "policy": attempt.policy,
             "collector_version": COLLECTOR_VERSION,
@@ -295,6 +302,14 @@ class CollectionResult:
                 1 for row in self.rows if row["verification"]["hidden_verified"]
             ),
             "task_success_rate": success_rate,
+            # By the band each task was designed for (docs/evaluation.md), so
+            # the corpus says how much of it is long-horizon.
+            "rows_by_task_horizon": dict(sorted(Counter(
+                row["provenance"].get("task_horizon") or "unlabelled" for row in self.rows
+            ).items())),
+            "attempts_by_task_horizon": dict(sorted(Counter(
+                attempt.task_horizon or "unlabelled" for attempt in scored
+            ).items())),
             # docs/data-strategy.md difficulty ladder: only the learnable band
             # is useful for the preference and RL curriculum.
             "difficulty_bands": dict(sorted(Counter(
@@ -373,6 +388,7 @@ def collect(
                 rejection=rejection_reason(episode, verdict),
                 policy=policy_label,
                 reasoning_effort=reasoning_effort,
+                task_horizon=task.horizon,
             )
             result.attempts.append(attempt)
             if attempt.accepted:
