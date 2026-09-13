@@ -109,7 +109,6 @@ def test_pipeline_gold_repairs_a_stage_at_a_time_and_watches_the_suite():
         if call["function"]["name"] == "apply_patch"
     ]
     assert patched == list(task.gold_files)
-    assert patched != sorted(patched) or True  # filename order is incidental
     assert "from src." not in task.files[patched[0]]
     assert "from src." in task.files[patched[-1]]
 
