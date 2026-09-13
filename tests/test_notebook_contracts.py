@@ -17,7 +17,6 @@ import tempfile
 from types import SimpleNamespace
 from urllib.parse import unquote
 
-import pytest
 from datasets import Dataset
 import numpy as np
 
@@ -949,14 +948,78 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "upload_folder" not in collection_cell
 
 
-def test_every_notebook_cell_uses_only_names_defined_earlier(tmp_path):
+NOTEBOOK_GLOBALS = {"display", "get_ipython"}  # injected by the Colab kernel
+
+
+def _cell_symbols(index: int, source: str) -> tuple[set[str], set[str], set[str]]:
+    """Names a cell binds at module scope, reads at module scope, and reads
+    from inside nested scopes (function and lambda bodies, class bodies)."""
+    import symtable
+
+    python = "\n".join(
+        "pass  # magic" if line.lstrip().startswith(("!", "%")) else line for line in source.splitlines()
+    )
+    table = symtable.symtable(python, f"cell {index}", "exec")
+    binds = {s.get_name() for s in table.get_symbols() if s.is_assigned() or s.is_imported()}
+    top_reads = {
+        s.get_name() for s in table.get_symbols()
+        if s.is_referenced() and not (s.is_assigned() or s.is_imported())
+    }
+    nested_reads: set[str] = set()
+
+    def walk(scope) -> None:
+        for symbol in scope.get_symbols():
+            if symbol.is_global() and symbol.is_referenced():
+                nested_reads.add(symbol.get_name())
+        for child in scope.get_children():
+            walk(child)
+
+    for child in table.get_children():
+        walk(child)
+    return binds, top_reads, nested_reads
+
+
+def undefined_notebook_names(cells: list[str]) -> list[str]:
+    """Names a notebook reads that it never binds in time.
+
+    Each cell is compiled on its own with ``symtable``. A name read at a
+    cell's module scope must be bound by that cell or an earlier one, since
+    the cell runs when it is reached. A name read inside a function, lambda
+    or class body resolves when that body runs, which may be after a later
+    cell binds it, so it must be bound somewhere in the notebook. Order
+    inside one cell is not modelled, and a function called before a later
+    cell binds its global is not caught.
+    """
+    import builtins
+
+    parsed = [_cell_symbols(index, source) for index, source in enumerate(cells)]
+    bound_anywhere = set(dir(builtins)) | NOTEBOOK_GLOBALS
+    for binds, _, _ in parsed:
+        bound_anywhere |= binds
+    bound_so_far = set(dir(builtins)) | NOTEBOOK_GLOBALS
+    problems: list[str] = []
+    for index, (binds, top_reads, nested_reads) in enumerate(parsed):
+        bound_so_far |= binds
+        missing = (top_reads - bound_so_far) | (nested_reads - bound_anywhere)
+        problems.extend(f"cell {index}: {name}" for name in sorted(missing))
+    return problems
+
+
+def test_undefined_name_checker_models_cell_boundaries():
+    # Module-scope use before the import: the whole-file view passes it,
+    # the notebook raises at cell 0.
+    assert undefined_notebook_names(["digest = hashlib.sha256(b'x')", "import hashlib"]) == ["cell 0: hashlib"]
+    assert undefined_notebook_names(["import hashlib", "digest = hashlib.sha256(b'x')"]) == []
+    assert undefined_notebook_names(["!pip install x\nimport json", "print(json.dumps(rows))"]) == ["cell 1: rows"]
+    # A function body may read a name a later cell binds; one nothing binds is a bug.
+    assert undefined_notebook_names(["def render():\n    return tokenizer.name", "tokenizer = object()"]) == []
+    assert undefined_notebook_names(["def g():\n    return helper()", "x = 1"]) == ["cell 0: helper"]
+
+
+def test_every_notebook_cell_uses_only_names_defined_earlier():
     """A cell that uses a module it never imports raises NameError on Colab,
     while the contract tests above, which hand cells a ready namespace,
-    still pass. Concatenate each notebook's code cells in order and let ruff
-    report any name that nothing before it defined."""
-    ruff = shutil.which("ruff") or str(Path(sys.executable).parent / "ruff")
-    if not Path(ruff).exists():
-        pytest.skip("ruff is not installed")
+    still pass. Check every notebook cell against what came before it."""
     generator = load_generator()
     builders = {
         "00": generator.build_00_preflight,
@@ -970,17 +1033,5 @@ def test_every_notebook_cell_uses_only_names_defined_earlier(tmp_path):
         "08": generator.build_08_distil,
     }
     for name, build in builders.items():
-        lines = []
-        for index, cell in enumerate(build().cells):
-            if cell.cell_type != "code":
-                continue
-            lines.append(f"# ---- cell {index}")
-            for line in cell.source.splitlines():
-                # Shell and magic lines are not Python; keep the line count.
-                lines.append("pass  # magic" if line.lstrip().startswith(("!", "%")) else line)
-        (tmp_path / f"notebook_{name}.py").write_text("\n".join(lines) + "\n")
-    result = subprocess.run(
-        [ruff, "check", "--select", "F821", "--no-cache", "--output-format", "concise", str(tmp_path)],
-        capture_output=True, text=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+        cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
+        assert undefined_notebook_names(cells) == [], f"notebook {name}"
