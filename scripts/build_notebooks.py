@@ -3133,11 +3133,12 @@ def build_07_collect_and_evaluate():
                 from qwen3_8_27b_code.collection import collect, write_corpus
                 from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
                 from qwen3_8_27b_code.evaluation import (
+                    DEFAULT_SEEDS,
+                    build_provenance,
                     compare,
                     effort_ladder,
                     evaluate,
                     gate,
-                    build_provenance,
                     gate_passed,
                     pairing_problems,
                     read_report,
@@ -3262,6 +3263,7 @@ def build_07_collect_and_evaluate():
                         max_sequence_length=MAX_SEQUENCE_LENGTH,
                         episode_budget=EPISODE_BUDGET,
                         attempts_per_task=EVAL_ATTEMPTS,
+                        seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS],
                         variants_per_family=EVAL_VARIANTS_PER_FAMILY,
                     )
 
@@ -3375,6 +3377,9 @@ def build_07_collect_and_evaluate():
                 baseline_report_path = REPORT_DIR / "baseline.json"
 
                 if RUN_BASELINE_EVAL:
+                    # A baseline from an earlier run of this cell must not
+                    # survive an evaluation that fails before it writes.
+                    baseline_report_path.unlink(missing_ok=True)
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
                         model_name=MODEL_ID,
@@ -3458,8 +3463,13 @@ def build_07_collect_and_evaluate():
             code(
                 r"""
                 candidate_report_path = REPORT_DIR / "candidate.json"
+                # Set only when this cell writes the report; the gate reads it
+                # rather than inferring from the flag and a file that may be
+                # left over from an earlier run in the same runtime.
+                candidate_written = False
 
                 if RUN_CANDIDATE_EVAL:
+                    candidate_report_path.unlink(missing_ok=True)
                     release_stale_gpu_state()
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
@@ -3482,6 +3492,7 @@ def build_07_collect_and_evaluate():
                     candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)}"
                     candidate.metadata = report_provenance(candidate_model_ref)
                     write_report(candidate, candidate_report_path)
+                    candidate_written = True
                     print(json.dumps(candidate.scorecard(), indent=2))
                 else:
                     print("Candidate evaluation is off. Turn it on once an adapter revision is accepted.")
@@ -3508,7 +3519,7 @@ def build_07_collect_and_evaluate():
                     ),
                     None,
                 )
-                if not (RUN_CANDIDATE_EVAL and candidate_report_path.exists()):
+                if not (RUN_CANDIDATE_EVAL and globals().get("candidate_written") and candidate_report_path.exists()):
                     print("The gate needs a candidate measured in this session (RUN_CANDIDATE_EVAL).")
                 elif baseline_for_gate is None:
                     print(f"No {GATE_BASELINE_FILE} in this session or on {GATE_REPORTS_REPO}; measure a baseline first.")
@@ -3639,6 +3650,10 @@ def build_07_collect_and_evaluate():
                         repo_type="dataset",
                         folder_path=str(REPORT_DIR),
                         allow_patterns=["*.json", "*.jsonl"],
+                        # An earlier verdict on the Hub must not outlive a gate
+                        # that was skipped or refused here: the remote file is
+                        # deleted unless this session's copy replaces it.
+                        delete_patterns=["comparison.json"],
                         commit_message=f"gate reports from {repo_revision[:12]}",
                     )
                     print(f"pushed {sorted(p.name for p in REPORT_DIR.iterdir())} to {GATE_REPORTS_REPO}")

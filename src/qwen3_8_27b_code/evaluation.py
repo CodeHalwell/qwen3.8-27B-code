@@ -321,6 +321,7 @@ PROVENANCE_STRICT_KEYS = (
     "max_sequence_length",
     "episode_budget",
     "attempts_per_task",
+    "seeds",
     "variants_per_family",
 )
 # Recorded on the comparison when it differs, but not fatal on its own: a
@@ -357,6 +358,7 @@ def build_provenance(
     max_sequence_length: int | None,
     episode_budget: EpisodeBudget | dict,
     attempts_per_task: int,
+    seeds: tuple[int, ...] | list[int],
     variants_per_family: int,
     harness_fingerprint: str | None = None,
     measured_at: str | None = None,
@@ -380,6 +382,9 @@ def build_provenance(
         "max_sequence_length": max_sequence_length,
         "episode_budget": dict(episode_budget),
         "attempts_per_task": attempts_per_task,
+        # The samples themselves, not just their count: two runs of the same
+        # attempt count on different seeds are different samples.
+        "seeds": list(seeds),
         "variants_per_family": variants_per_family,
         "measured_at": measured_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }

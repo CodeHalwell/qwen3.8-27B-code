@@ -12,7 +12,9 @@ policy is supplied from a notebook or a serving process.
 
 from __future__ import annotations
 
+import functools
 import importlib
+import inspect
 from typing import Callable
 
 from .episodes import Policy, answer_text, scripted_policy, tool_call_text
@@ -180,6 +182,45 @@ BUILTIN_POLICIES: dict[str, PolicyFactory] = {
     "looping": looping,
     "failing": failing,
 }
+
+
+# Generation settings a model-backed factory may declare as keyword
+# parameters. The CLI binds them and records exactly what it bound; a
+# factory that does not declare one cannot have it claimed on its behalf.
+POLICY_SETTING_DEFAULTS: dict[str, object] = {
+    "reasoning_effort": "medium",
+    "max_new_tokens": None,
+    "max_sequence_length": None,
+}
+
+
+def bind_policy_settings(
+    factory: PolicyFactory, settings: dict, label: str = ""
+) -> tuple[PolicyFactory, dict]:
+    """Bind generation settings to a factory and report what was bound.
+
+    A setting the factory declares (by name, or through ``**kwargs``) is
+    passed on every call, using its default when the request is ``None``,
+    and recorded at that value. A setting the factory does not declare is
+    recorded as ``None``; requesting one explicitly raises, so a report can
+    never carry a setting the policy did not run with.
+    """
+    parameters = inspect.signature(factory).parameters
+    accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    bound: dict = {}
+    recorded: dict = {}
+    for key, default in POLICY_SETTING_DEFAULTS.items():
+        requested = settings.get(key)
+        if key in parameters or accepts_any:
+            value = default if requested is None else requested
+            bound[key] = value
+            recorded[key] = value
+        elif requested is not None:
+            name = label or getattr(factory, "__name__", repr(factory))
+            raise ValueError(f"policy {name} takes no {key}; it cannot be recorded as a measured setting")
+        else:
+            recorded[key] = None
+    return (functools.partial(factory, **bound) if bound else factory), recorded
 
 
 def load_policy_factory(specification: str) -> PolicyFactory:

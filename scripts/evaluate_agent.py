@@ -6,6 +6,11 @@ Run a policy and write its report:
     uv run --group dev python scripts/evaluate_agent.py run \
         --policy gold --label candidate --out reports/candidate.json
 
+A model-backed policy factory may declare ``reasoning_effort``,
+``max_new_tokens`` and ``max_sequence_length`` as keyword parameters; the
+matching flags are bound to it and recorded in the report's provenance at the
+bound value. A scripted policy declares none, and the flags are refused for it.
+
 Compare a candidate against a frozen baseline and apply the gate:
 
     uv run --group dev python scripts/evaluate_agent.py compare \
@@ -49,7 +54,7 @@ from qwen3_8_27b_code.evaluation import (  # noqa: E402
     read_report,
     write_report,
 )
-from qwen3_8_27b_code.policies import load_policy_factory  # noqa: E402
+from qwen3_8_27b_code.policies import bind_policy_settings, load_policy_factory  # noqa: E402
 from qwen3_8_27b_code.tasks import EVALUATION_VARIANTS_PER_FAMILY, evaluation_tasks  # noqa: E402
 
 
@@ -67,9 +72,21 @@ def harness_revision() -> str:
 def run(arguments: argparse.Namespace) -> int:
     tasks = evaluation_tasks(variants_per_family=arguments.variants_per_family)
     budget = EpisodeBudget(tool_calls=arguments.tool_calls, wall_seconds=arguments.wall_seconds)
+    # The settings are bound to the policy and recorded at the bound value,
+    # so the report cannot claim a cap or effort the policy did not run with.
+    policy_factory, settings = bind_policy_settings(
+        load_policy_factory(arguments.policy),
+        {
+            "reasoning_effort": arguments.reasoning_effort,
+            "max_new_tokens": arguments.max_new_tokens,
+            "max_sequence_length": arguments.max_sequence_length,
+        },
+        label=arguments.policy,
+    )
+    seeds = tuple(arguments.seeds[: arguments.attempts])
     report = evaluate(
         tasks,
-        load_policy_factory(arguments.policy),
+        policy_factory,
         label=arguments.label,
         attempts_per_task=arguments.attempts,
         seeds=tuple(arguments.seeds),
@@ -80,11 +97,12 @@ def run(arguments: argparse.Namespace) -> int:
     report.metadata = build_provenance(
         model=arguments.model or arguments.policy,
         harness_revision=harness_revision(),
-        reasoning_effort=arguments.reasoning_effort,
-        max_new_tokens=arguments.max_new_tokens,
-        max_sequence_length=arguments.max_sequence_length,
+        reasoning_effort=settings["reasoning_effort"],
+        max_new_tokens=settings["max_new_tokens"],
+        max_sequence_length=settings["max_sequence_length"],
         episode_budget=budget,
         attempts_per_task=arguments.attempts,
+        seeds=seeds,
         variants_per_family=arguments.variants_per_family,
     )
     write_report(report, arguments.out)
@@ -94,6 +112,10 @@ def run(arguments: argparse.Namespace) -> int:
 
 
 def run_compare(arguments: argparse.Namespace) -> int:
+    # An earlier verdict at --out must not outlive a comparison that is
+    # refused or fails below.
+    if arguments.out:
+        arguments.out.unlink(missing_ok=True)
     baseline = read_report(arguments.baseline)
     candidate = read_report(arguments.candidate)
     blocking, advisory = pairing_problems(baseline, candidate)
@@ -180,9 +202,12 @@ def main() -> int:
         help="what the policy measures, recorded as provenance (a Hub id, adapter@revision, ...); "
         "defaults to the --policy reference",
     )
-    runner.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="medium")
-    runner.add_argument("--max-new-tokens", type=int, default=None, help="generation cap the policy ran with")
-    runner.add_argument("--max-sequence-length", type=int, default=None, help="context window the policy ran with")
+    # Bound to the policy when its factory declares the keyword (see
+    # bind_policy_settings); refused for one that does not, so the report
+    # records only settings the policy ran with.
+    runner.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default=None)
+    runner.add_argument("--max-new-tokens", type=int, default=None, help="generation cap to bind to the policy")
+    runner.add_argument("--max-sequence-length", type=int, default=None, help="context window to bind to the policy")
     runner.add_argument("--out", type=Path, default=ROOT / "reports" / "evaluation.json")
     runner.set_defaults(handler=run)
 

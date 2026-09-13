@@ -904,15 +904,24 @@ def test_notebook_07_persists_reports_across_colab_sessions():
         cell = code_cell_containing(notebook, marker)
         assert model_ref in cell
         assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
+    assert "seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS]," in config_cell
     baseline_cell = code_cell_containing(notebook, "RUN_BASELINE_EVAL:")
     assert "revision=MODEL_REVISION," in baseline_cell
+    assert baseline_cell.index("baseline_report_path.unlink(missing_ok=True)") < baseline_cell.index("evaluate(")
     candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
     assert "resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in candidate_cell
+    # A candidate counts only when this cell wrote it: the file is removed
+    # before the evaluation and the flag set after the write.
+    assert candidate_cell.index("candidate_written = False") < candidate_cell.index("if RUN_CANDIDATE_EVAL:")
+    assert candidate_cell.index("candidate_report_path.unlink(missing_ok=True)") < candidate_cell.index("evaluate(")
+    assert candidate_cell.index("write_report(candidate, candidate_report_path)") < candidate_cell.index(
+        "candidate_written = True"
+    )
 
     # The gate pairs only this session's candidate with a named baseline,
     # and refuses reports measured differently.
     gate_cell = code_cell_containing(notebook, 'comparison["gate_passed"]')
-    assert "RUN_CANDIDATE_EVAL and candidate_report_path.exists()" in gate_cell
+    assert 'RUN_CANDIDATE_EVAL and globals().get("candidate_written") and candidate_report_path.exists()' in gate_cell
     assert "HUB_REPORT_DIR / GATE_BASELINE_FILE" in gate_cell
     assert "HUB_REPORT_DIR / \"candidate.json\"" not in gate_cell
     assert "pairing_problems(" in gate_cell
@@ -929,6 +938,8 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "exist_ok=True" in persist_cell
     assert "folder_path=str(REPORT_DIR)" in persist_cell
     assert "repo_revision" in persist_cell
+    # A remote verdict is deleted unless this session's copy replaces it.
+    assert 'delete_patterns=["comparison.json"]' in persist_cell
     # The persist cell is the last code cell, after the collection cell,
     # so it carries everything the session produced.
     code_cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]

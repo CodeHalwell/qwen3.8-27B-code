@@ -674,6 +674,7 @@ def _provenance(model: str, **overrides) -> dict:
         "harness_revision": "abc123",
         "harness_fingerprint": "fp-1",
         "reasoning_effort": "medium",
+        "seeds": [3407],
         "max_new_tokens": 4096,
         "max_sequence_length": 32768,
         "episode_budget": {"tool_calls": 30, "wall_seconds": 900.0},
@@ -703,10 +704,12 @@ def test_build_provenance_records_every_key_the_pairing_check_requires():
         max_sequence_length=None,
         episode_budget=EpisodeBudget(tool_calls=30, wall_seconds=900.0),
         attempts_per_task=1,
+        seeds=(3407,),
         variants_per_family=1,
         measured_at="2026-09-13T00:00:00+00:00",
     )
     assert set(evaluation.PROVENANCE_REQUIRED_KEYS) <= set(provenance)
+    assert provenance["seeds"] == [3407]
     assert provenance["episode_budget"] == {"tool_calls": 30, "wall_seconds": 900.0}
     assert provenance["measured_at"] == "2026-09-13T00:00:00+00:00"
     # The fingerprint of the running harness is taken unless one is given.
@@ -753,6 +756,8 @@ def test_cli_compare_refuses_reports_without_matching_provenance(tmp_path, capsy
         )
         return cli.run_compare(arguments)
 
+    # A verdict left at --out by an earlier run does not survive a refusal.
+    (tmp_path / "comparison.json").write_text('{"gate_passed": true}')
     assert compare(report("bare-a", None), report("bare-b", None)) == 2
     assert "GATE NOT RUN" in capsys.readouterr().out
     assert not (tmp_path / "comparison.json").exists()
@@ -795,6 +800,7 @@ def test_gate_pairing_refuses_reports_measured_differently():
     # A different effort, cap, budget or attempt count is a different experiment.
     for key, value in (
         ("harness_fingerprint", "fp-2"),
+        ("seeds", [9176]),
         ("reasoning_effort", "low"),
         ("max_new_tokens", 2048),
         ("episode_budget", {"tool_calls": 10, "wall_seconds": 900.0}),
@@ -814,6 +820,33 @@ def test_gate_pairing_refuses_reports_measured_differently():
 
 # --------------------------------------------------------------------------
 # Policy loading
+
+
+def test_policy_settings_are_bound_and_recorded_only_when_the_factory_takes_them():
+    """A report may record a cap or effort only if the policy ran with it."""
+    seen = {}
+
+    def model_backed(task, seed, *, reasoning_effort, max_new_tokens=None, max_sequence_length=None):
+        seen.update(effort=reasoning_effort, cap=max_new_tokens, window=max_sequence_length)
+        return policies.gold(task, seed)
+
+    bound, recorded = policies.bind_policy_settings(
+        model_backed, {"reasoning_effort": "low", "max_new_tokens": 2048, "max_sequence_length": None}
+    )
+    assert recorded == {"reasoning_effort": "low", "max_new_tokens": 2048, "max_sequence_length": None}
+    bound(SMOKE_TASKS[0], 3407)
+    assert seen == {"effort": "low", "cap": 2048, "window": None}
+
+    # Nothing requested: the factory's own defaults are bound and recorded.
+    _, recorded = policies.bind_policy_settings(model_backed, {})
+    assert recorded == {"reasoning_effort": "medium", "max_new_tokens": None, "max_sequence_length": None}
+
+    # A scripted policy declares none: recorded as None, refused if requested.
+    unchanged, recorded = policies.bind_policy_settings(policies.gold, {"reasoning_effort": None})
+    assert unchanged is policies.gold
+    assert recorded == {"reasoning_effort": None, "max_new_tokens": None, "max_sequence_length": None}
+    with pytest.raises(ValueError, match="takes no max_new_tokens"):
+        policies.bind_policy_settings(policies.gold, {"max_new_tokens": 2048}, label="gold")
 
 
 def test_policy_factories_resolve_by_name_and_by_dotted_path():
