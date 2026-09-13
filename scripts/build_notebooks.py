@@ -1542,17 +1542,6 @@ def build_03_sft():
                 # existing public repo is caught here, before that happens.
                 if PUSH_ADAPTER:
                     require_private_repo(OUTPUT_ADAPTER_ID)
-                    # An earlier run's completion marker must not survive into
-                    # this run's intermediate pushes, or notebook 07 would take
-                    # a half-trained adapter for a finished one.
-                    from huggingface_hub import HfApi
-
-                    hub = HfApi(token=hf_token)
-                    if hub.repo_exists(OUTPUT_ADAPTER_ID) and hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
-                        hub.delete_file(
-                            "run_manifest.json", OUTPUT_ADAPTER_ID,
-                            commit_message="training started: completion marker removed",
-                        )
 
                 run_manifest = {
                     "stage": "sft",
@@ -1903,6 +1892,20 @@ def build_03_sft():
                     resume_from = latest_checkpoint(RUN_ROOT / "sft")
                     torch.cuda.reset_peak_memory_stats()
                     start_reserved_gib = torch.cuda.memory_reserved() / 1024**3
+                    if PUSH_ADAPTER:
+                        # An earlier run's completion marker must not survive into
+                        # this run's intermediate pushes, or notebook 07 would take
+                        # a half-trained adapter for a finished one. Removed here,
+                        # once training is certain to start, so a dry run or a
+                        # failure before this point leaves a valid adapter alone.
+                        from huggingface_hub import HfApi
+
+                        hub = HfApi(token=hf_token)
+                        if hub.repo_exists(OUTPUT_ADAPTER_ID) and hub.file_exists(OUTPUT_ADAPTER_ID, "run_manifest.json"):
+                            hub.delete_file(
+                                "run_manifest.json", OUTPUT_ADAPTER_ID,
+                                commit_message="training started: completion marker removed",
+                            )
                     result = trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)
                     peak_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
@@ -3604,14 +3607,15 @@ def build_07_collect_and_evaluate():
                 # must not survive a gate that is skipped or refused now, or the
                 # persist cell would push it as if it were this run's.
                 comparison_path.unlink(missing_ok=True)
-                baseline_for_gate = next(
-                    (
-                        path
-                        for path in (REPORT_DIR / GATE_BASELINE_FILE, HUB_REPORT_DIR / GATE_BASELINE_FILE)
-                        if path.exists()
-                    ),
-                    None,
-                )
+                # The baseline is, in order: the named file this session wrote (a
+                # ladder rung), the baseline this session measured, then the pulled
+                # copy of the named file. A fresh measurement always outranks the
+                # pulled copy it was measured to replace.
+                baseline_candidates = [REPORT_DIR / GATE_BASELINE_FILE]
+                if RUN_BASELINE_EVAL:
+                    baseline_candidates.append(baseline_report_path)
+                baseline_candidates.append(HUB_REPORT_DIR / GATE_BASELINE_FILE)
+                baseline_for_gate = next((path for path in baseline_candidates if path.exists()), None)
                 if not (RUN_CANDIDATE_EVAL and globals().get("candidate_written") and candidate_report_path.exists()):
                     print("The gate needs a candidate measured in this session (RUN_CANDIDATE_EVAL).")
                 elif baseline_for_gate is None:

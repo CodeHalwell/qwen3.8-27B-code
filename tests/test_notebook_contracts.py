@@ -939,6 +939,12 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "comparison_path.unlink(missing_ok=True)" in gate_cell
     assert gate_cell.index("comparison_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
     assert "comparison_path.write_text(" in gate_cell
+    # A baseline measured this session outranks the pulled copy it replaced,
+    # whatever name GATE_BASELINE_FILE selects.
+    assert "baseline_candidates.append(baseline_report_path)" in gate_cell
+    assert gate_cell.index("baseline_candidates.append(baseline_report_path)") < gate_cell.index(
+        "baseline_candidates.append(HUB_REPORT_DIR / GATE_BASELINE_FILE)"
+    )
 
     persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
     assert "private=True" in persist_cell
@@ -1122,9 +1128,12 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     # Notebook 03 removes an earlier marker before its first push, so an
     # intermediate checkpoint never inherits one.
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
-    assert "hub.delete_file(" in sft_config
-    assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in sft_config
-    assert sft_config.index("require_private_repo(OUTPUT_ADAPTER_ID)") < sft_config.index("hub.delete_file(")
+    # ...and only once training is certain to start: a dry run or an early
+    # failure must leave a valid adapter's marker alone.
+    assert "hub.delete_file(" not in sft_config
+    train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
+    assert '"run_manifest.json", OUTPUT_ADAPTER_ID,' in train_cell
+    assert train_cell.index("if RUN_TRAINING:") < train_cell.index("hub.delete_file(") < train_cell.index("trainer.train(")
     # Existence only guards resolving the commit; the decision itself keys on
     # the completion marker at that commit.
     assert "RUN_CANDIDATE_EVAL = CANDIDATE_REVISION is not None and api.file_exists(" in gate_config
