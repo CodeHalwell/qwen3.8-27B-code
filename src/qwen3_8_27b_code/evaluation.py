@@ -19,6 +19,9 @@ quality" is something the gate can check rather than a hope.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+
 from collections import Counter
 from dataclasses import dataclass, field
 import json
@@ -103,6 +106,10 @@ def _rate(numerator: int, denominator: int) -> float:
 class EvaluationReport:
     label: str
     records: list[AttemptRecord] = field(default_factory=list)
+    # How the numbers were measured: model reference, harness revision,
+    # effort, caps, budget and attempt count. ``pairing_problems`` reads it
+    # before two reports are gated against each other.
+    metadata: dict = field(default_factory=dict)
 
     @property
     def scored(self) -> list[AttemptRecord]:
@@ -225,11 +232,12 @@ class EvaluationReport:
                 for task_id, outcomes in self.task_outcomes().items()
             },
             "attempts": [record.as_dict() for record in self.records],
+            "metadata": dict(self.metadata),
         }
 
     @classmethod
     def from_dict(cls, payload: dict) -> "EvaluationReport":
-        report = cls(label=payload["scorecard"]["label"])
+        report = cls(label=payload["scorecard"]["label"], metadata=dict(payload.get("metadata") or {}))
         for row in payload["attempts"]:
             fields = {
                 key: value for key, value in row.items()
@@ -299,6 +307,123 @@ class GateCheck:
     name: str
     passed: bool
     detail: str
+
+
+# Measurement settings two reports must share before the gate pairs them.
+# The harness fingerprint is among them: a change to the verifier, the
+# episode loop, the scoring or the task construction changes what a
+# report measures even when no task id changes, so two reports taken
+# under different harness code are different experiments.
+PROVENANCE_STRICT_KEYS = (
+    "harness_fingerprint",
+    "reasoning_effort",
+    "max_new_tokens",
+    "max_sequence_length",
+    "episode_budget",
+    "attempts_per_task",
+    "seeds",
+    "variants_per_family",
+)
+# Recorded on the comparison when it differs, but not fatal on its own: a
+# repository revision moves with every docs or notebook commit, and the
+# fingerprint above already blocks the ones that changed the harness.
+PROVENANCE_ADVISORY_KEYS = ("harness_revision",)
+# Every key a report must carry before it can be paired at all.
+PROVENANCE_REQUIRED_KEYS = ("model",) + PROVENANCE_STRICT_KEYS
+
+
+def compute_harness_fingerprint(package_dir: Path | None = None) -> str:
+    """A digest of the measuring code: every module of this package.
+
+    Name and content of each ``.py`` file, in a fixed order, so the value
+    moves only when the harness itself changes, not with docs, notebooks
+    or unrelated commits.
+    """
+    package_dir = Path(package_dir) if package_dir is not None else Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package_dir.glob("*.py")):
+        digest.update(path.name.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def build_provenance(
+    *,
+    model: str,
+    harness_revision: str,
+    reasoning_effort: str,
+    max_new_tokens: int | None,
+    max_sequence_length: int | None,
+    episode_budget: EpisodeBudget | dict,
+    attempts_per_task: int,
+    seeds: tuple[int, ...] | list[int],
+    variants_per_family: int,
+    harness_fingerprint: str | None = None,
+    measured_at: str | None = None,
+) -> dict:
+    """The provenance every scored report records.
+
+    One writer for the notebook and the CLI, so the keys ``pairing_problems``
+    requires cannot drift between them. ``model`` is whatever was measured,
+    pinned: a Hub id or adapter id with its resolved revision, or a scripted
+    policy name. The harness fingerprint is taken from the code that is
+    running unless given.
+    """
+    if isinstance(episode_budget, EpisodeBudget):
+        episode_budget = {"tool_calls": episode_budget.tool_calls, "wall_seconds": episode_budget.wall_seconds}
+    return {
+        "model": model,
+        "harness_revision": harness_revision,
+        "harness_fingerprint": harness_fingerprint or compute_harness_fingerprint(),
+        "reasoning_effort": reasoning_effort,
+        "max_new_tokens": max_new_tokens,
+        "max_sequence_length": max_sequence_length,
+        "episode_budget": dict(episode_budget),
+        "attempts_per_task": attempts_per_task,
+        # The samples themselves, not just their count: two runs of the same
+        # attempt count on different seeds are different samples.
+        "seeds": list(seeds),
+        "variants_per_family": variants_per_family,
+        "measured_at": measured_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def pairing_problems(
+    baseline: EvaluationReport, candidate: EvaluationReport
+) -> tuple[list[str], list[str]]:
+    """Why two reports must not be gated against each other.
+
+    Returns ``(blocking, advisory)``. Blocking: a report missing any of
+    ``PROVENANCE_REQUIRED_KEYS`` (a partial record is no evidence), a
+    measurement setting in ``PROVENANCE_STRICT_KEYS`` that differs, or two
+    reports of the same model reference, which is a baseline paired with
+    itself. Advisory: a ``PROVENANCE_ADVISORY_KEYS`` value that differs,
+    worth recording next to the verdict.
+    """
+    blocking: list[str] = []
+    advisory: list[str] = []
+    for name, report in (("baseline", baseline), ("candidate", candidate)):
+        if not report.metadata:
+            blocking.append(f"{name} report {report.label!r} carries no provenance; re-measure it")
+            continue
+        missing = [key for key in PROVENANCE_REQUIRED_KEYS if key not in report.metadata]
+        if missing:
+            blocking.append(f"{name} report {report.label!r} lacks provenance keys {missing}; re-measure it")
+    if blocking:
+        return blocking, advisory
+    for key in PROVENANCE_STRICT_KEYS:
+        before, after = baseline.metadata[key], candidate.metadata[key]
+        if before != after:
+            blocking.append(f"{key}: baseline {before!r}, candidate {after!r}")
+    if baseline.metadata["model"] == candidate.metadata["model"]:
+        blocking.append(f"both reports measure {baseline.metadata['model']!r}")
+    for key in PROVENANCE_ADVISORY_KEYS:
+        before, after = baseline.metadata.get(key), candidate.metadata.get(key)
+        if before != after:
+            advisory.append(f"{key}: baseline {before!r}, candidate {after!r}")
+    return blocking, advisory
 
 
 def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:

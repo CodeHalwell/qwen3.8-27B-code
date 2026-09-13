@@ -8,6 +8,7 @@ exercised on CPU.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -667,8 +668,185 @@ def test_comparing_reports_with_no_shared_tasks_is_an_error():
         evaluation.compare(first, second)
 
 
+def _provenance(model: str, **overrides) -> dict:
+    return {
+        "model": model,
+        "harness_revision": "abc123",
+        "harness_fingerprint": "fp-1",
+        "reasoning_effort": "medium",
+        "seeds": [3407],
+        "max_new_tokens": 4096,
+        "max_sequence_length": 32768,
+        "episode_budget": {"tool_calls": 30, "wall_seconds": 900.0},
+        "attempts_per_task": 1,
+        "variants_per_family": 1,
+        **overrides,
+    }
+
+
+def test_report_provenance_round_trips_through_the_report_file(tmp_path):
+    report = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="a")
+    report.metadata = _provenance("unsloth/Qwen3.8-27B")
+    payload = evaluation.write_report(report, tmp_path / "a.json")
+    assert payload["metadata"] == report.metadata
+    assert evaluation.read_report(tmp_path / "a.json").metadata == report.metadata
+    # A report written before provenance existed still loads, empty.
+    (tmp_path / "old.json").write_text(json.dumps({k: v for k, v in payload.items() if k != "metadata"}))
+    assert evaluation.read_report(tmp_path / "old.json").metadata == {}
+
+
+def test_build_provenance_records_every_key_the_pairing_check_requires():
+    provenance = evaluation.build_provenance(
+        model="gold",
+        harness_revision="abc123",
+        reasoning_effort="medium",
+        max_new_tokens=None,
+        max_sequence_length=None,
+        episode_budget=EpisodeBudget(tool_calls=30, wall_seconds=900.0),
+        attempts_per_task=1,
+        seeds=(3407,),
+        variants_per_family=1,
+        measured_at="2026-09-13T00:00:00+00:00",
+    )
+    assert set(evaluation.PROVENANCE_REQUIRED_KEYS) <= set(provenance)
+    assert provenance["seeds"] == [3407]
+    assert provenance["episode_budget"] == {"tool_calls": 30, "wall_seconds": 900.0}
+    assert provenance["measured_at"] == "2026-09-13T00:00:00+00:00"
+    # The fingerprint of the running harness is taken unless one is given.
+    assert provenance["harness_fingerprint"] == evaluation.compute_harness_fingerprint()
+
+
+def test_harness_fingerprint_moves_only_with_the_harness_code(tmp_path):
+    """A repository revision moves with every commit; the fingerprint moves
+    only when a module of the measuring package changes."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.py").write_text("x = 1\n")
+    (package / "b.py").write_text("y = 2\n")
+    (package / "notes.md").write_text("docs\n")
+    first = evaluation.compute_harness_fingerprint(package)
+    assert first == evaluation.compute_harness_fingerprint(package)
+    (package / "notes.md").write_text("docs changed\n")
+    assert evaluation.compute_harness_fingerprint(package) == first
+    (package / "b.py").write_text("y = 3\n")
+    assert evaluation.compute_harness_fingerprint(package) != first
+    assert len(first) == 16
+    assert evaluation.compute_harness_fingerprint() == evaluation.compute_harness_fingerprint(
+        ROOT / "src" / "qwen3_8_27b_code"
+    )
+
+
+def test_cli_compare_refuses_reports_without_matching_provenance(tmp_path, capsys):
+    """The CLI gate applies the same pairing check as notebook 07."""
+    spec = importlib.util.spec_from_file_location("evaluate_agent", ROOT / "scripts" / "evaluate_agent.py")
+    assert spec and spec.loader
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    def report(label: str, model: str | None) -> Path:
+        scored = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label=label)
+        if model is not None:
+            scored.metadata = _provenance(model)
+        return Path(evaluation.write_report(scored, tmp_path / f"{label}.json") and tmp_path / f"{label}.json")
+
+    def compare(baseline: Path, candidate: Path) -> int:
+        arguments = argparse.Namespace(
+            baseline=baseline, candidate=candidate, minimum_success_delta=0.0,
+            max_reasoning_growth=0.1, ignore_thinking_budget=False, out=tmp_path / "comparison.json",
+        )
+        return cli.run_compare(arguments)
+
+    # A verdict left at --out by an earlier run does not survive a refusal.
+    (tmp_path / "comparison.json").write_text('{"gate_passed": true}')
+    assert compare(report("bare-a", None), report("bare-b", None)) == 2
+    assert "GATE NOT RUN" in capsys.readouterr().out
+    assert not (tmp_path / "comparison.json").exists()
+
+    assert compare(report("same-a", "gold"), report("same-b", "gold")) == 2
+    assert "both reports measure 'gold'" in capsys.readouterr().out
+
+    status = compare(report("base", "gold"), report("cand", "gold-v2"))
+    assert status in (0, 1)
+    written = json.loads((tmp_path / "comparison.json").read_text())
+    assert written["provenance"]["baseline"]["model"] == "gold"
+    assert written["provenance"]["candidate"]["model"] == "gold-v2"
+
+
+def test_gate_pairing_refuses_reports_measured_differently():
+    """A stale report pulled from storage must not be gated against a fresh
+    one unless both record the same measurement settings."""
+    baseline = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="baseline")
+    candidate = evaluation.evaluate(SMOKE_TASKS[:1], policies.gold, label="candidate")
+
+    blocking, advisory = evaluation.pairing_problems(baseline, candidate)
+    assert len(blocking) == 2 and all("no provenance" in problem for problem in blocking)
+
+    baseline.metadata = _provenance("unsloth/Qwen3.8-27B")
+    candidate.metadata = _provenance("me/adapter@deadbeef")
+    assert evaluation.pairing_problems(baseline, candidate) == ([], [])
+
+    # A partial record is no evidence: a missing setting cannot "match".
+    partial = _provenance("me/adapter@deadbeef")
+    del partial["max_new_tokens"], partial["model"]
+    candidate.metadata = partial
+    blocking, _ = evaluation.pairing_problems(baseline, candidate)
+    assert blocking == ["candidate report 'candidate' lacks provenance keys ['model', 'max_new_tokens']; re-measure it"]
+
+    # Same model on both sides is a baseline paired with itself.
+    candidate.metadata = _provenance("unsloth/Qwen3.8-27B")
+    blocking, _ = evaluation.pairing_problems(baseline, candidate)
+    assert blocking and "both reports measure" in blocking[0]
+
+    # A different effort, cap, budget or attempt count is a different experiment.
+    for key, value in (
+        ("harness_fingerprint", "fp-2"),
+        ("seeds", [9176]),
+        ("reasoning_effort", "low"),
+        ("max_new_tokens", 2048),
+        ("episode_budget", {"tool_calls": 10, "wall_seconds": 900.0}),
+        ("attempts_per_task", 3),
+    ):
+        candidate.metadata = _provenance("me/adapter@deadbeef", **{key: value})
+        blocking, _ = evaluation.pairing_problems(baseline, candidate)
+        assert blocking == [f"{key}: baseline {baseline.metadata[key]!r}, candidate {value!r}"]
+
+    # A harness revision that moved is recorded, not fatal: compare() already
+    # refuses a different task set.
+    candidate.metadata = _provenance("me/adapter@deadbeef", harness_revision="def456")
+    blocking, advisory = evaluation.pairing_problems(baseline, candidate)
+    assert blocking == []
+    assert advisory == ["harness_revision: baseline 'abc123', candidate 'def456'"]
+
+
 # --------------------------------------------------------------------------
 # Policy loading
+
+
+def test_policy_settings_are_bound_and_recorded_only_when_the_factory_takes_them():
+    """A report may record a cap or effort only if the policy ran with it."""
+    seen = {}
+
+    def model_backed(task, seed, *, reasoning_effort, max_new_tokens=None, max_sequence_length=None):
+        seen.update(effort=reasoning_effort, cap=max_new_tokens, window=max_sequence_length)
+        return policies.gold(task, seed)
+
+    bound, recorded = policies.bind_policy_settings(
+        model_backed, {"reasoning_effort": "low", "max_new_tokens": 2048, "max_sequence_length": None}
+    )
+    assert recorded == {"reasoning_effort": "low", "max_new_tokens": 2048, "max_sequence_length": None}
+    bound(SMOKE_TASKS[0], 3407)
+    assert seen == {"effort": "low", "cap": 2048, "window": None}
+
+    # Nothing requested: the factory's own defaults are bound and recorded.
+    _, recorded = policies.bind_policy_settings(model_backed, {})
+    assert recorded == {"reasoning_effort": "medium", "max_new_tokens": None, "max_sequence_length": None}
+
+    # A scripted policy declares none: recorded as None, refused if requested.
+    unchanged, recorded = policies.bind_policy_settings(policies.gold, {"reasoning_effort": None})
+    assert unchanged is policies.gold
+    assert recorded == {"reasoning_effort": None, "max_new_tokens": None, "max_sequence_length": None}
+    with pytest.raises(ValueError, match="takes no max_new_tokens"):
+        policies.bind_policy_settings(policies.gold, {"max_new_tokens": 2048}, label="gold")
 
 
 def test_policy_factories_resolve_by_name_and_by_dotted_path():

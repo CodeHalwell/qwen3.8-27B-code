@@ -769,6 +769,103 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
     assert "LEARNING_RATE = 2e-5" in sft_config
 
+    # The run inputs a checkpoint must be attributed to are in its manifest.
+    for cell, keys in (
+        (sft_config, ("learning_rate", "eval_every_steps", "save_every_steps", "optimizer")),
+        (
+            code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
+            (
+                "learning_rate", "beta", "eval_every_steps", "save_every_steps", "optimizer",
+                "max_length_pair_share", "preference_sources",
+            ),
+        ),
+    ):
+        manifest = cell[cell.index("run_manifest = {"):]
+        for key in keys:
+            assert f'"{key}":' in manifest, key
+    dpo_args = code_cell_containing(generator.build_04_dpo(), "dpo_args = DPOConfig(")
+    assert "learning_rate=LEARNING_RATE," in dpo_args
+    assert "beta=DPO_BETA," in dpo_args
+    dpo_train = code_cell_containing(generator.build_04_dpo(), "preference_mixture.json")
+    assert '"dpo" / "run_manifest.json"' in dpo_train
+    # The manifest names the rows actually read, not the configured Hub id.
+    assert 'run_manifest["preference_sources"] = PREFERENCE_SOURCES' in dpo_train
+    dpo_load = code_cell_containing(generator.build_04_dpo(), "demo_preferences = Dataset.from_list")
+    assert "PREFERENCE_SOURCES.append(local_source(PREFERENCE_LOCAL_JSONL, rows))" in dpo_load
+    assert "PREFERENCE_SOURCES.append(local_source(LENGTH_PAIRS_LOCAL_JSONL, length_rows))" in dpo_load
+    assert '"resolved_revision": HfApi(token=hf_token).dataset_info(' in dpo_load
+    assert '"sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()' in dpo_load
+
+
+PUBLISH_MARKERS = (
+    "push_to_hub(",
+    "push_to_hub_merged(",
+    "push_to_hub_gguf(",
+    "upload_folder(",
+    "training_args = SFTConfig(",
+    "dpo_args = DPOConfig(",
+    "GRPOConfig(",
+)
+
+
+def test_every_hub_publish_is_guarded_against_an_existing_public_repo():
+    """`private=True` and `hub_private_repo` apply only when a repo is
+    created; an existing public repo stays public. Every publish site must
+    check first, and a trainer's check must run before the trainer is built,
+    which is when it creates the repo."""
+    generator = load_generator()
+    for runtime in (generator.AUTH_AND_RUNTIME, generator.TEACHER_RUNTIME):
+        assert "def require_private_repo(" in runtime
+        assert "repo_info(repo_id, repo_type=repo_type).private" in runtime
+    notebooks = {
+        "01": generator.build_01_baseline(),
+        "02": generator.build_02_data(),
+        "03": generator.build_03_sft(),
+        "04": generator.build_04_dpo(),
+        "05": generator.build_05_grpo(),
+        "06": generator.build_06_qat_export(),
+        "07": generator.build_07_collect_and_evaluate(),
+        "08": generator.build_08_distil(),
+    }
+    guarded = 0
+    for name, notebook in notebooks.items():
+        cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]
+        seen_guard = False
+        for index, source in enumerate(cells):
+            if "require_private_repo(" in source and "def require_private_repo" not in source:
+                seen_guard = True
+            if not any(marker in source for marker in PUBLISH_MARKERS):
+                continue
+            if "Config(" in source and "push_to_hub=PUSH_ADAPTER" in source:
+                # The guard for a trainer lives in an earlier cell.
+                assert seen_guard, f"notebook {name} cell {index}: trainer built before the repo check"
+                assert "hub_private_repo=True" in source, f"notebook {name} cell {index}"
+            elif "trainer.push_to_hub(" in source:
+                assert seen_guard, f"notebook {name} cell {index}"
+            else:
+                assert "require_private_repo(" in source, f"notebook {name} cell {index}"
+            if "upload_folder(" in source or "push_to_hub_gguf(" in source:
+                # Neither call creates a private repo on its own: upload_folder
+                # has no private flag and push_to_hub_gguf uses its own default.
+                assert "private=True, exist_ok=True" in source, f"notebook {name} cell {index}"
+                assert "private=True,\n" not in source.split("upload_folder(")[-1], f"notebook {name} cell {index}"
+            guarded += 1
+    assert guarded >= 12
+
+    # Where the publish follows an expensive job, an existing public target
+    # is found at configuration time, not after the GPU or the teacher bill.
+    for name, marker, guard in (
+        ("03", "PUSH_MERGED_BF16 = False", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("04", "LENGTH_PAIRS_LOCAL_JSONL", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("05", "ROLLOUT_POLICY_PRECISION = ", "require_private_repo(OUTPUT_ADAPTER_ID)"),
+        ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(QAT_OUTPUT_ID)"),
+        ("06", "RUN_STANDARD_GGUF_EXPORT = False", "require_private_repo(GGUF_OUTPUT_ID)"),
+        ("07", "GATE_REPORTS_REPO =", 'require_private_repo(GATE_REPORTS_REPO, "dataset")'),
+        ("08", "TEACHER_REPO = ", 'require_private_repo(TEACHER_REPO, "dataset")'),
+    ):
+        config_cell = code_cell_containing(notebooks[name], marker)
+        assert guard in config_cell, (name, guard)
+
 
 def test_notebook_07_persists_reports_across_colab_sessions():
     """The gate pairs a candidate with a baseline measured in an earlier
@@ -779,15 +876,70 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "PULL_REPORTS_FROM_HUB = True" in config_cell
     assert "repo_exists(GATE_REPORTS_REPO" in config_cell
     assert "snapshot_download(" in config_cell
-    assert "local_dir=str(REPORT_DIR)" in config_cell
-    # The pull happens before any report is written in this session.
-    assert config_cell.index("snapshot_download(") < config_cell.index("evaluation_suite = evaluation_tasks(")
+    # Pulled copies never land where this session writes: a stale report
+    # must be chosen by name, not found by accident.
+    assert 'HUB_REPORT_DIR = RUN_ROOT / "gate_hub"' in config_cell
+    assert "local_dir=str(HUB_REPORT_DIR)" in config_cell
+    assert "local_dir=str(REPORT_DIR)" not in config_cell
+    assert 'GATE_BASELINE_FILE = "baseline.json"' in config_cell
+    assert "def report_provenance(" in config_cell
+    # One writer for the notebook and the CLI: the notebook passes its
+    # settings to the shared builder rather than assembling the dict itself.
+    assert "return build_provenance(" in config_cell
+    for key in ("model", "harness_revision", "reasoning_effort", "max_new_tokens", "episode_budget", "attempts_per_task"):
+        assert f"{key}=" in config_cell
+    assert '"measured_at"' not in config_cell
+
+    # Every report this notebook writes records how it was measured.
+    # The model reference is pinned: a Hub id resolved to the commit that was
+    # loaded, never the moving branch name.
+    assert 'MODEL_REVISION = "main"' in config_cell
+    assert "def resolved_revision(" in config_cell
+    assert 'stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"' in config_cell
+    for marker, model_ref in (
+        ("RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
+        ("RUN_EFFORT_LADDER:", "report_provenance(stock_model_ref, reasoning_effort=effort)"),
+        ("RUN_CANDIDATE_EVAL:", "report_provenance(candidate_model_ref)"),
+    ):
+        cell = code_cell_containing(notebook, marker)
+        assert model_ref in cell
+        assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
+    assert "seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS]," in config_cell
+    baseline_cell = code_cell_containing(notebook, "RUN_BASELINE_EVAL:")
+    assert "revision=MODEL_REVISION," in baseline_cell
+    assert baseline_cell.index("baseline_report_path.unlink(missing_ok=True)") < baseline_cell.index("evaluate(")
+    candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
+    assert "resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)" in candidate_cell
+    # A candidate counts only when this cell wrote it: the file is removed
+    # before the evaluation and the flag set after the write.
+    assert candidate_cell.index("candidate_written = False") < candidate_cell.index("if RUN_CANDIDATE_EVAL:")
+    assert candidate_cell.index("candidate_report_path.unlink(missing_ok=True)") < candidate_cell.index("evaluate(")
+    assert candidate_cell.index("write_report(candidate, candidate_report_path)") < candidate_cell.index(
+        "candidate_written = True"
+    )
+
+    # The gate pairs only this session's candidate with a named baseline,
+    # and refuses reports measured differently.
+    gate_cell = code_cell_containing(notebook, 'comparison["gate_passed"]')
+    assert 'RUN_CANDIDATE_EVAL and globals().get("candidate_written") and candidate_report_path.exists()' in gate_cell
+    assert "HUB_REPORT_DIR / GATE_BASELINE_FILE" in gate_cell
+    assert "HUB_REPORT_DIR / \"candidate.json\"" not in gate_cell
+    assert "pairing_problems(" in gate_cell
+    assert "GATE NOT RUN" in gate_cell
+    assert 'comparison["provenance"]' in gate_cell
+    # A rerun in the same runtime never republishes an earlier verdict: the
+    # old comparison is removed before the gate decides whether to run.
+    assert "comparison_path.unlink(missing_ok=True)" in gate_cell
+    assert gate_cell.index("comparison_path.unlink(missing_ok=True)") < gate_cell.index("pairing_problems(")
+    assert "comparison_path.write_text(" in gate_cell
 
     persist_cell = code_cell_containing(notebook, "create_repo(GATE_REPORTS_REPO")
     assert "private=True" in persist_cell
     assert "exist_ok=True" in persist_cell
     assert "folder_path=str(REPORT_DIR)" in persist_cell
     assert "repo_revision" in persist_cell
+    # A remote verdict is deleted unless this session's copy replaces it.
+    assert 'delete_patterns=["comparison.json"]' in persist_cell
     # The persist cell is the last code cell, after the collection cell,
     # so it carries everything the session produced.
     code_cells = [cell.source for cell in notebook.cells if cell.cell_type == "code"]

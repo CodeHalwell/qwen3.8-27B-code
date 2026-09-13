@@ -268,6 +268,24 @@ if not hf_token:
 login(token=hf_token, add_to_git_credential=False)
 HF_USERNAME = whoami()["name"]
 
+
+def require_private_repo(repo_id: str, repo_type: str = "model") -> None:
+    # Refuse to publish into a Hub repo that already exists and is public.
+    # private=True on create_repo, push_to_hub and hub_private_repo applies
+    # only when the repo is created; an existing public repo stays public
+    # and every later push lands in the open.
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    if not api.repo_exists(repo_id, repo_type=repo_type):
+        return
+    if not api.repo_info(repo_id, repo_type=repo_type).private:
+        raise RuntimeError(
+            f"{repo_type} repo {repo_id} exists and is public. Make it private first with "
+            f"HfApi(token=hf_token).update_repo_settings(repo_id={repo_id!r}, repo_type={repo_type!r}, "
+            "private=True), or publish under a new id."
+        )
+
 def package_version(name: str) -> str:
     try:
         return version(name)
@@ -1112,12 +1130,11 @@ def build_01_baseline():
                 PUSH_PRIVATE_RESULTS = False
                 if PUSH_PRIVATE_RESULTS:
                     from huggingface_hub import HfApi
-                    HfApi().upload_folder(
-                        repo_id=f"{HF_USERNAME}/qwen38-code-pilot-results",
-                        repo_type="dataset",
-                        folder_path=str(RESULTS_DIR),
-                        private=True,
-                    )
+                    results_repo = f"{HF_USERNAME}/qwen38-code-pilot-results"
+                    require_private_repo(results_repo, "dataset")
+                    api = HfApi(token=hf_token)
+                    api.create_repo(results_repo, repo_type="dataset", private=True, exist_ok=True)
+                    api.upload_folder(repo_id=results_repo, repo_type="dataset", folder_path=str(RESULTS_DIR))
                 """
             ),
             markdown(
@@ -1410,6 +1427,7 @@ def build_02_data():
                 if PUSH_DATASET:
                     if DEMO_MODE:
                         raise RuntimeError("Refusing to publish the synthetic format fixture as training data.")
+                    require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
                 else:
@@ -1494,6 +1512,12 @@ def build_03_sft():
 
                 if DEMO_MODE and (PUSH_ADAPTER or PUSH_MERGED_BF16 or MAX_STEPS > 2):
                     raise RuntimeError("Demo mode is limited to two local smoke steps and cannot be published.")
+                # The trainer creates the Hub repo when it is built, so an
+                # existing public repo is caught here, before that happens.
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
+                if PUSH_MERGED_BF16:
+                    require_private_repo(MERGED_MODEL_ID)
 
                 run_manifest = {
                     "stage": "sft",
@@ -1504,6 +1528,11 @@ def build_03_sft():
                     "dataset_revision": DATASET_REVISION,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "gradient_accumulation_steps": 8,
+                    "optimizer": "adamw_8bit",
+                    "eval_every_steps": EVAL_EVERY_STEPS,
+                    "save_every_steps": SAVE_EVERY_STEPS,
                     "demo_mode": DEMO_MODE,
                     "tool_schema_version": TOOL_SCHEMA_VERSION,
                     "harness_version": "pilot-local-v1",
@@ -1853,6 +1882,7 @@ def build_03_sft():
                     if PUSH_MERGED_BF16:
                         from huggingface_hub import HfApi
 
+                        require_private_repo(MERGED_MODEL_ID)
                         HfApi(token=hf_token).create_repo(
                             repo_id=MERGED_MODEL_ID,
                             repo_type="model",
@@ -1947,6 +1977,12 @@ def build_04_dpo():
                 # save pushes the adapter and each eval scores the held-out split.
                 EVAL_EVERY_STEPS = 1 if DEMO_MODE else 10
                 SAVE_EVERY_STEPS = 1 if DEMO_MODE else 10
+                # 5e-7 is a full-fine-tuning DPO rate. A rank-16 adapter sees
+                # a small fraction of the parameters and barely moves at that
+                # rate; 5e-6 is the conservative end of the usual LoRA band.
+                # Sweep it alongside beta rather than treating it as settled.
+                LEARNING_RATE = 5e-6
+                DPO_BETA = 0.1
 
                 if RUN_TRAINING and MERGED_SFT_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the merged accepted SFT commit before DPO.")
@@ -1954,6 +1990,36 @@ def build_04_dpo():
                     raise RuntimeError("Record the accepted SFT adapter commit for lineage before DPO.")
                 if DEMO_MODE and (PUSH_ADAPTER or MAX_STEPS > 2):
                     raise RuntimeError("Demo preferences are limited to two local smoke steps and cannot be published.")
+                # The trainer creates the Hub repo when it is built, so an
+                # existing public repo is caught here, before that happens.
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
+
+                run_manifest = {
+                    "stage": "dpo",
+                    "objective": "agentic-coding",
+                    "model_id": MERGED_SFT_MODEL_ID,
+                    "model_revision": MERGED_SFT_REVISION,
+                    "sft_adapter_id": SFT_ADAPTER_ID,
+                    "sft_adapter_revision": SFT_ADAPTER_REVISION,
+                    # Filled in by the loading cell from what is actually read:
+                    # a local file with its digest, or the Hub dataset at the
+                    # commit its revision resolved to.
+                    "preference_sources": None,
+                    "max_seq_length": MAX_SEQ_LENGTH,
+                    "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "beta": DPO_BETA,
+                    "loss_type": "sigmoid",
+                    "gradient_accumulation_steps": 8,
+                    "optimizer": "adamw_8bit",
+                    "eval_every_steps": EVAL_EVERY_STEPS,
+                    "save_every_steps": SAVE_EVERY_STEPS,
+                    "max_length_pair_share": MAX_LENGTH_PAIR_SHARE,
+                    "demo_mode": DEMO_MODE,
+                    "run_training": RUN_TRAINING,
+                }
+                print(json.dumps(run_manifest, indent=2))
                 """
             ),
             markdown("## Load the accepted SFT adapter"),
@@ -2114,21 +2180,45 @@ def build_04_dpo():
 
                 USE_DEMO_DATA = DEMO_MODE
                 PREFERENCE_MIXTURE = None  # recorded in the run manifest for a real run
+                PREFERENCE_SOURCES = []    # what was actually read, recorded in the run manifest
+
+                def local_source(path: str, rows: list) -> dict:
+                    return {
+                        "kind": "local",
+                        "path": path,
+                        "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                        "rows": len(rows),
+                    }
+
                 if USE_DEMO_DATA:
                     raw = demo_preferences
                     print("Using synthetic plumbing preferences; this is not a capability run.")
                 else:
                     if PREFERENCE_LOCAL_JSONL:
                         rows = read_jsonl(PREFERENCE_LOCAL_JSONL)
+                        PREFERENCE_SOURCES.append(local_source(PREFERENCE_LOCAL_JSONL, rows))
                     else:
+                        from huggingface_hub import HfApi
+
                         rows = load_dataset(
                             PREFERENCE_DATASET_ID,
                             split="train",
                             revision=PREFERENCE_DATASET_REVISION,
                             token=hf_token,
                         ).to_list()
+                        PREFERENCE_SOURCES.append({
+                            "kind": "hub",
+                            "dataset_id": PREFERENCE_DATASET_ID,
+                            "revision": PREFERENCE_DATASET_REVISION,
+                            "resolved_revision": HfApi(token=hf_token).dataset_info(
+                                PREFERENCE_DATASET_ID, revision=PREFERENCE_DATASET_REVISION
+                            ).sha,
+                            "rows": len(rows),
+                        })
                     if LENGTH_PAIRS_LOCAL_JSONL:
-                        rows += read_jsonl(LENGTH_PAIRS_LOCAL_JSONL)
+                        length_rows = read_jsonl(LENGTH_PAIRS_LOCAL_JSONL)
+                        PREFERENCE_SOURCES.append(local_source(LENGTH_PAIRS_LOCAL_JSONL, length_rows))
+                        rows += length_rows
                     # One Dataset from plain rows: Arrow unions the struct keys of
                     # the different pair sources, and the render below strips
                     # the nulls that union inserts.
@@ -2221,16 +2311,12 @@ def build_04_dpo():
                 dpo_args = DPOConfig(
                     output_dir=str(RUN_ROOT / "dpo"),
                     max_length=MAX_SEQ_LENGTH,
-                    beta=0.1,
+                    beta=DPO_BETA,
                     loss_type="sigmoid",
                     per_device_train_batch_size=1,
                     per_device_eval_batch_size=1,
                     gradient_accumulation_steps=8,
-                    # 5e-7 is a full-fine-tuning DPO rate. A rank-16 adapter sees
-                    # a small fraction of the parameters and barely moves at that
-                    # rate; 5e-6 is the conservative end of the usual LoRA band.
-                    # Sweep it alongside beta rather than treating it as settled.
-                    learning_rate=5e-6,
+                    learning_rate=LEARNING_RATE,
                     warmup_ratio=0.05,
                     lr_scheduler_type="cosine",
                     max_steps=MAX_STEPS,
@@ -2270,6 +2356,11 @@ def build_04_dpo():
                         ).items())),
                     }, indent=2))
                     result = trainer.train()
+                    run_manifest["tool_schema_version"] = TOOL_SCHEMA_VERSION
+                    run_manifest["preference_sources"] = PREFERENCE_SOURCES
+                    run_manifest["preference_mixture"] = PREFERENCE_MIXTURE
+                    run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
+                    (RUN_ROOT / "dpo" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="DPO adapter from verifier-backed preferences")
@@ -2354,6 +2445,8 @@ def build_05_grpo():
                     raise RuntimeError(AGENTIC_RL_BLOCKER)
                 if RUN_TRAINING and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin an accepted adapter revision before RL.")
+                if PUSH_ADAPTER:
+                    require_private_repo(OUTPUT_ADAPTER_ID)
                 if ROLLOUT_POLICY_PRECISION not in {"bf16", "bnb4"}:
                     raise ValueError("ROLLOUT_POLICY_PRECISION must be 'bf16' or 'bnb4'.")
                 if ROLLOUT_POLICY_PRECISION == "bnb4" and not ALLOW_QUANTIZED_ROLLOUT_POLICY:
@@ -2667,6 +2760,7 @@ def build_05_grpo():
                         run_name="qwen38-code-agent-grpo-smoke",
                         push_to_hub=PUSH_ADAPTER,
                         hub_model_id=OUTPUT_ADAPTER_ID,
+                        hub_private_repo=True,
                         seed=3407,
                     )
                     trainer = GRPOTrainer(
@@ -2784,6 +2878,12 @@ def build_06_qat_export():
                 if any([RUN_QAT, RUN_STANDARD_GGUF_EXPORT, BUILD_CALIBRATION_CORPUS]):
                     if ACCEPTED_REVISION.startswith("REPLACE_"):
                         raise RuntimeError("Pin the accepted adapter revision before export.")
+                # An existing public destination is found here, before the
+                # QAT run or the GGUF conversion spends the GPU.
+                if PUSH_QAT:
+                    require_private_repo(QAT_OUTPUT_ID)
+                if RUN_STANDARD_GGUF_EXPORT:
+                    require_private_repo(GGUF_OUTPUT_ID)
                 """
             ),
             markdown("## QAT-LoRA branch (fresh adapter from an accepted merged checkpoint)"),
@@ -2887,6 +2987,8 @@ def build_06_qat_export():
                     qat_tokenizer.save_pretrained(str(qat_dir))
                     if PUSH_QAT:
                         from huggingface_hub import HfApi
+                        require_private_repo(QAT_OUTPUT_ID)
+                        HfApi(token=hf_token).create_repo(QAT_OUTPUT_ID, repo_type="model", private=True, exist_ok=True)
                         HfApi(token=hf_token).upload_folder(
                             repo_id=QAT_OUTPUT_ID,
                             folder_path=str(qat_dir),
@@ -2910,6 +3012,11 @@ def build_06_qat_export():
                         token=hf_token,
                     )
                     assert_model_fully_resident(export_model)
+                    from huggingface_hub import HfApi
+                    require_private_repo(GGUF_OUTPUT_ID)
+                    # push_to_hub_gguf creates a missing repo with its own
+                    # default visibility; create it private first.
+                    HfApi(token=hf_token).create_repo(GGUF_OUTPUT_ID, repo_type="model", private=True, exist_ok=True)
                     export_model.push_to_hub_gguf(
                         GGUF_OUTPUT_ID,
                         export_tokenizer,
@@ -3026,11 +3133,14 @@ def build_07_collect_and_evaluate():
                 from qwen3_8_27b_code.collection import collect, write_corpus
                 from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
                 from qwen3_8_27b_code.evaluation import (
+                    DEFAULT_SEEDS,
+                    build_provenance,
                     compare,
                     effort_ladder,
                     evaluate,
                     gate,
                     gate_passed,
+                    pairing_problems,
                     read_report,
                     write_report,
                 )
@@ -3052,6 +3162,10 @@ def build_07_collect_and_evaluate():
                 from unsloth import FastModel
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
+                # A Hub id is mutable; the baseline is loaded at this revision and
+                # recorded at the commit it resolves to. Pin an immutable commit
+                # for a run that produces artifacts.
+                MODEL_REVISION = "main"
                 ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 ACCEPTED_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
                 # Every think block after the request stays in context for the rest
@@ -3101,11 +3215,17 @@ def build_07_collect_and_evaluate():
 
                 # Colab runtimes are per notebook and per session, so a baseline
                 # measured today is gone before the candidate exists. The reports
-                # live in a private dataset repo; the last cell pushes them and
-                # this pulls whatever is already there so the gate can pair a
-                # fresh candidate with an earlier baseline.
+                # live in a private dataset repo; the last cell pushes this
+                # session's REPORT_DIR and this pulls the earlier ones into a
+                # separate directory. Nothing pulled is ever mistaken for this
+                # session's work: the gate takes the baseline by name from
+                # either place and the candidate only from this session.
                 GATE_REPORTS_REPO = f"{HF_USERNAME}/qwen38-code-gate-reports"
                 PULL_REPORTS_FROM_HUB = True
+                HUB_REPORT_DIR = RUN_ROOT / "gate_hub"
+                # The frozen baseline the gate pairs with this session's candidate:
+                # baseline.json, or a ladder rung such as ladder_medium.json.
+                GATE_BASELINE_FILE = "baseline.json"
                 if PULL_REPORTS_FROM_HUB:
                     from huggingface_hub import HfApi, snapshot_download
 
@@ -3113,13 +3233,44 @@ def build_07_collect_and_evaluate():
                         snapshot_download(
                             GATE_REPORTS_REPO,
                             repo_type="dataset",
-                            local_dir=str(REPORT_DIR),
+                            local_dir=str(HUB_REPORT_DIR),
                             allow_patterns=["*.json", "*.jsonl"],
                             token=hf_token,
                         )
-                        print(f"pulled earlier reports: {sorted(p.name for p in REPORT_DIR.iterdir())}")
+                        print(f"pulled earlier reports: {sorted(p.name for p in HUB_REPORT_DIR.iterdir())}")
                     else:
                         print(f"no earlier reports at {GATE_REPORTS_REPO}; starting fresh.")
+
+                from huggingface_hub import HfApi
+
+                def resolved_revision(repo_id: str, revision: str) -> str:
+                    # The commit a branch or tag points at now, so the record
+                    # names the checkpoint that was measured, not a moving ref.
+                    return HfApi(token=hf_token).model_info(repo_id, revision=revision).sha
+
+                stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"
+                print(json.dumps({"stock_model": stock_model_ref}, indent=2))
+
+                # Recorded on every report this notebook writes, with the same
+                # writer the CLI uses. The gate refuses to pair two reports
+                # whose settings differ, and records a harness revision that does.
+                def report_provenance(model_ref: str, reasoning_effort: str = REASONING_EFFORT) -> dict:
+                    return build_provenance(
+                        model=model_ref,
+                        harness_revision=repo_revision,
+                        reasoning_effort=reasoning_effort,
+                        max_new_tokens=MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort],
+                        max_sequence_length=MAX_SEQUENCE_LENGTH,
+                        episode_budget=EPISODE_BUDGET,
+                        attempts_per_task=EVAL_ATTEMPTS,
+                        seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS],
+                        variants_per_family=EVAL_VARIANTS_PER_FAMILY,
+                    )
+
+                # Publishing is the last cell, but an existing public target
+                # is found now, before any GPU time is spent.
+                if PUSH_ARTIFACTS:
+                    require_private_repo(GATE_REPORTS_REPO, "dataset")
 
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
@@ -3226,9 +3377,13 @@ def build_07_collect_and_evaluate():
                 baseline_report_path = REPORT_DIR / "baseline.json"
 
                 if RUN_BASELINE_EVAL:
+                    # A baseline from an earlier run of this cell must not
+                    # survive an evaluation that fails before it writes.
+                    baseline_report_path.unlink(missing_ok=True)
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
                         model_name=MODEL_ID,
+                        revision=MODEL_REVISION,
                         max_seq_length=MAX_SEQUENCE_LENGTH,
                         load_in_4bit=False,
                         full_finetuning=False,
@@ -3244,6 +3399,7 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
+                    baseline.metadata = report_provenance(stock_model_ref)
                     write_report(baseline, baseline_report_path)
                     print(json.dumps(baseline.scorecard(), indent=2))
                     print(f"wrote {baseline_report_path}")
@@ -3279,6 +3435,7 @@ def build_07_collect_and_evaluate():
                             attempts_per_task=EVAL_ATTEMPTS,
                             budget=EPISODE_BUDGET,
                         )
+                        ladder_reports[effort].metadata = report_provenance(stock_model_ref, reasoning_effort=effort)
                         write_report(ladder_reports[effort], REPORT_DIR / f"ladder_{effort}.json")
                     ladder = effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)
                     (REPORT_DIR / "effort_ladder.json").write_text(json.dumps(ladder, indent=2))
@@ -3306,8 +3463,13 @@ def build_07_collect_and_evaluate():
             code(
                 r"""
                 candidate_report_path = REPORT_DIR / "candidate.json"
+                # Set only when this cell writes the report; the gate reads it
+                # rather than inferring from the flag and a file that may be
+                # left over from an earlier run in the same runtime.
+                candidate_written = False
 
                 if RUN_CANDIDATE_EVAL:
+                    candidate_report_path.unlink(missing_ok=True)
                     release_stale_gpu_state()
                     require_free_vram(60.0)
                     model, tokenizer = FastModel.from_pretrained(
@@ -3327,7 +3489,10 @@ def build_07_collect_and_evaluate():
                         attempts_per_task=EVAL_ATTEMPTS,
                         budget=EPISODE_BUDGET,
                     )
+                    candidate_model_ref = f"{ACCEPTED_ADAPTER_ID}@{resolved_revision(ACCEPTED_ADAPTER_ID, ACCEPTED_REVISION)}"
+                    candidate.metadata = report_provenance(candidate_model_ref)
                     write_report(candidate, candidate_report_path)
+                    candidate_written = True
                     print(json.dumps(candidate.scorecard(), indent=2))
                 else:
                     print("Candidate evaluation is off. Turn it on once an adapter revision is accepted.")
@@ -3336,17 +3501,52 @@ def build_07_collect_and_evaluate():
             markdown("## Apply the gate"),
             code(
                 r"""
-                if baseline_report_path.exists() and candidate_report_path.exists():
-                    comparison = compare(
-                        read_report(baseline_report_path), read_report(candidate_report_path)
-                    )
+                # The candidate is always the one measured in this session. The
+                # baseline is GATE_BASELINE_FILE from this session if it wrote
+                # one, else the pulled copy. A pulled candidate is never used:
+                # a fresh baseline gated against a stale candidate would
+                # republish a verdict nobody asked for.
+                comparison_path = REPORT_DIR / "comparison.json"
+                # A verdict from an earlier run of this cell in the same runtime
+                # must not survive a gate that is skipped or refused now, or the
+                # persist cell would push it as if it were this run's.
+                comparison_path.unlink(missing_ok=True)
+                baseline_for_gate = next(
+                    (
+                        path
+                        for path in (REPORT_DIR / GATE_BASELINE_FILE, HUB_REPORT_DIR / GATE_BASELINE_FILE)
+                        if path.exists()
+                    ),
+                    None,
+                )
+                if not (RUN_CANDIDATE_EVAL and globals().get("candidate_written") and candidate_report_path.exists()):
+                    print("The gate needs a candidate measured in this session (RUN_CANDIDATE_EVAL).")
+                elif baseline_for_gate is None:
+                    print(f"No {GATE_BASELINE_FILE} in this session or on {GATE_REPORTS_REPO}; measure a baseline first.")
+                elif (blocking := pairing_problems(
+                    baseline_report := read_report(baseline_for_gate),
+                    candidate_report := read_report(candidate_report_path),
+                ))[0]:
+                    for problem in blocking[0]:
+                        print(f"  [REFUSED] {problem}")
+                    print("GATE NOT RUN: the two reports were not measured the same way.")
+                else:
+                    advisory = blocking[1]
+                    for note in advisory:
+                        print(f"  [NOTE] {note}")
+                    comparison = compare(baseline_report, candidate_report)
+                    comparison["provenance"] = {
+                        "baseline": {**baseline_report.metadata, "path": str(baseline_for_gate)},
+                        "candidate": candidate_report.metadata,
+                        "notes": advisory,
+                    }
                     checks = gate(comparison, max_reasoning_growth=MAX_REASONING_GROWTH)
                     comparison["gate"] = [
                         {"name": check.name, "passed": check.passed, "detail": check.detail}
                         for check in checks
                     ]
                     comparison["gate_passed"] = gate_passed(checks)
-                    (REPORT_DIR / "comparison.json").write_text(json.dumps(comparison, indent=2))
+                    comparison_path.write_text(json.dumps(comparison, indent=2))
 
                     print(json.dumps(comparison["deltas"], indent=2))
                     # Reasoning tokens per turn, share of generation spent thinking,
@@ -3362,8 +3562,6 @@ def build_07_collect_and_evaluate():
                         f"{task_level['ties']} unchanged, of {task_level['tasks']} tasks."
                     )
                     print("GATE PASSED" if comparison["gate_passed"] else "GATE FAILED")
-                else:
-                    print("Both a baseline and a candidate report are required before the gate can run.")
                 """
             ),
             markdown(
@@ -3431,11 +3629,12 @@ def build_07_collect_and_evaluate():
                 """
                 ## Persist the reports
 
-                Everything this notebook wrote under `REPORT_DIR` — baseline,
+                Everything this session wrote under `REPORT_DIR` — baseline,
                 candidate, comparison, ladder rungs, any collected corpus and
                 its length pairs — goes to one private dataset repo, tagged
-                with the harness revision that produced it. The configuration
-                cell pulls the same repo back at the start of the next session.
+                with the harness revision that produced it. Pulled copies live
+                in `HUB_REPORT_DIR` and are not pushed back. The configuration
+                cell pulls the same repo at the start of the next session.
                 """
             ),
             code(
@@ -3443,6 +3642,7 @@ def build_07_collect_and_evaluate():
                 if PUSH_ARTIFACTS:
                     from huggingface_hub import HfApi
 
+                    require_private_repo(GATE_REPORTS_REPO, "dataset")
                     api = HfApi(token=hf_token)
                     api.create_repo(GATE_REPORTS_REPO, repo_type="dataset", private=True, exist_ok=True)
                     commit = api.upload_folder(
@@ -3450,6 +3650,10 @@ def build_07_collect_and_evaluate():
                         repo_type="dataset",
                         folder_path=str(REPORT_DIR),
                         allow_patterns=["*.json", "*.jsonl"],
+                        # An earlier verdict on the Hub must not outlive a gate
+                        # that was skipped or refused here: the remote file is
+                        # deleted unless this session's copy replaces it.
+                        delete_patterns=["comparison.json"],
                         commit_message=f"gate reports from {repo_revision[:12]}",
                     )
                     print(f"pushed {sorted(p.name for p in REPORT_DIR.iterdir())} to {GATE_REPORTS_REPO}")
@@ -3517,6 +3721,23 @@ if not hf_token:
 login(token=hf_token, add_to_git_credential=False)
 HF_USERNAME = whoami()["name"]
 os.environ["HF_TOKEN"] = hf_token
+
+def require_private_repo(repo_id: str, repo_type: str = "model") -> None:
+    # Refuse to publish into a Hub repo that already exists and is public.
+    # private=True on create_repo, push_to_hub and hub_private_repo applies
+    # only when the repo is created; an existing public repo stays public
+    # and every later push lands in the open.
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token)
+    if not api.repo_exists(repo_id, repo_type=repo_type):
+        return
+    if not api.repo_info(repo_id, repo_type=repo_type).private:
+        raise RuntimeError(
+            f"{repo_type} repo {repo_id} exists and is public. Make it private first with "
+            f"HfApi(token=hf_token).update_repo_settings(repo_id={repo_id!r}, repo_type={repo_type!r}, "
+            "private=True), or publish under a new id."
+        )
 
 # Vendor endpoints read their own key. Copy each one that exists in Secrets
 # into the environment name its preset expects; the task harness strips
@@ -3643,6 +3864,11 @@ def build_08_distil():
                         teacher = TeacherConfig(**{**teacher.__dict__, "api_key_env": TEACHER_API_KEY_ENV})
                 TEACHER_DIR = RUN_ROOT / "teacher" / TEACHER_MODEL.replace("/", "-")
                 TEACHER_DIR.mkdir(parents=True, exist_ok=True)
+                TEACHER_REPO = f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}"
+                # An existing public destination is found here, before any
+                # teacher calls are paid for.
+                if PUSH_ARTIFACTS:
+                    require_private_repo(TEACHER_REPO, "dataset")
                 print(json.dumps({"teacher": teacher.label, "endpoint": teacher.base_url, "out": str(TEACHER_DIR)}, indent=2))
                 """
             ),
@@ -3745,12 +3971,10 @@ def build_08_distil():
                     if PUSH_ARTIFACTS:
                         from huggingface_hub import HfApi
 
-                        HfApi(token=hf_token).upload_folder(
-                            repo_id=f"{HF_USERNAME}/qwen38-code-teacher-{TEACHER_MODEL.replace('/', '-')}",
-                            repo_type="dataset",
-                            folder_path=str(TEACHER_DIR),
-                            private=True,
-                        )
+                        require_private_repo(TEACHER_REPO, "dataset")
+                        api = HfApi(token=hf_token)
+                        api.create_repo(TEACHER_REPO, repo_type="dataset", private=True, exist_ok=True)
+                        api.upload_folder(repo_id=TEACHER_REPO, repo_type="dataset", folder_path=str(TEACHER_DIR))
                 else:
                     print("No teacher attempts in this session; nothing to pair.")
                 """

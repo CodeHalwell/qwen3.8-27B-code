@@ -36,8 +36,12 @@ Its reports outlive the runtime. Colab runtimes are per notebook and per
 session, so the baseline measured in one sitting is gone before the candidate
 exists; with `PUSH_ARTIFACTS = True` the last cell pushes everything under
 `REPORT_DIR` to a private dataset repo (`{HF_USERNAME}/qwen38-code-gate-reports`)
-and the configuration cell pulls it back at the start of the next session, so
-the gate can pair a fresh candidate with an earlier baseline.
+and the configuration cell pulls it into a separate directory at the start of
+the next session. Every report records how it was measured (the model or
+adapter at the commit it resolved to, a fingerprint of the harness code, the
+repository revision, effort, caps, budget, attempts), and the gate pairs only a
+candidate measured in the current session with the baseline named by
+`GATE_BASELINE_FILE`, refusing the pair when those settings differ.
 
 ## Colab setup
 
