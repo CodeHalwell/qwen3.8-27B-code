@@ -967,15 +967,18 @@ def _cell_symbols(index: int, source: str) -> tuple[set[str], set[str], set[str]
     }
     nested_reads: set[str] = set()
 
-    def walk(scope) -> None:
+    def walk(scope, deferred: bool) -> None:
+        # A class body runs when its cell does; a function or lambda body
+        # runs when called, and so does anything nested inside one.
+        deferred = deferred or scope.get_type() != "class"
         for symbol in scope.get_symbols():
             if symbol.is_global() and symbol.is_referenced():
-                nested_reads.add(symbol.get_name())
+                (nested_reads if deferred else top_reads).add(symbol.get_name())
         for child in scope.get_children():
-            walk(child)
+            walk(child, deferred)
 
     for child in table.get_children():
-        walk(child)
+        walk(child, False)
     return binds, top_reads, nested_reads
 
 
@@ -1014,6 +1017,11 @@ def test_undefined_name_checker_models_cell_boundaries():
     # A function body may read a name a later cell binds; one nothing binds is a bug.
     assert undefined_notebook_names(["def render():\n    return tokenizer.name", "tokenizer = object()"]) == []
     assert undefined_notebook_names(["def g():\n    return helper()", "x = 1"]) == ["cell 0: helper"]
+    # A class body runs with its cell; a method body does not.
+    assert undefined_notebook_names(["class C:\n    digest = hashlib.sha256(b'x')", "import hashlib"]) == [
+        "cell 0: hashlib"
+    ]
+    assert undefined_notebook_names(["class C:\n    def run(self):\n        return tokenizer", "tokenizer = 1"]) == []
 
 
 def test_every_notebook_cell_uses_only_names_defined_earlier():
