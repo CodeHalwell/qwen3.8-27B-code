@@ -31,6 +31,21 @@ def _swe_row(resolved: int = 1, turns: int = 2, tool: str = "bash", output_chars
     return {"resolved": resolved, "repo": "owner/repo", "trajectory_id": f"traj-{turns}", "messages": messages}
 
 
+def _load_generator():
+    spec = importlib.util.spec_from_file_location("build_notebooks", ROOT / "scripts" / "build_notebooks.py")
+    assert spec and spec.loader
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    return generator
+
+
+def _validate_cell(generator) -> str:
+    return next(
+        cell.source for cell in generator.build_02_data().cells
+        if cell.cell_type == "code" and "def validate_row" in cell.source
+    )
+
+
 def test_open_swe_bash_becomes_the_native_shell_tool():
     rows = ps.convert_open_swe_row(_swe_row(), budget_tokens=10_000)
     assert len(rows) == 1
@@ -186,19 +201,41 @@ def test_convert_rows_stops_at_the_limit_and_drops_rows_over_budget():
         list(ps.convert_rows("nobody/nothing", rows, limit=1, budget_tokens=10))
 
 
-def test_converted_rows_pass_notebook_02_validation():
-    """The notebook's validator, not a re-statement of it."""
-    spec = importlib.util.spec_from_file_location("build_notebooks", ROOT / "scripts" / "build_notebooks.py")
-    assert spec and spec.loader
-    generator = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(generator)
+def test_public_rows_keep_their_lane_behind_a_bootstrap_row():
+    """The corpus notebook 02 actually builds: bootstrap rows first."""
+    from datasets import Dataset
+
+    generator = _load_generator()
     namespace = {"json": json, "raw_dataset": []}
     exec(generator.TOOLS_CELL, namespace)
-    validate_cell = next(
-        cell.source for cell in generator.build_02_data().cells
-        if cell.cell_type == "code" and "def validate_row" in cell.source
-    )
-    exec(validate_cell, namespace)
+    exec(_validate_cell(generator), namespace)
+    validate_row = namespace["validate_row"]
+
+    # A row in the committed bootstrap corpus shape: no lane column at all.
+    bootstrap = json.loads((ROOT / "data" / "native_sft" / "trajectories.jsonl").read_text().splitlines()[0])
+    assert "lane" not in bootstrap
+    public = ps.convert_open_code_instruct_row(
+        {"id": "1", "input": "q", "output": "a", "domain": "generic", "average_test_score": "1.0"}
+    ) + ps.convert_open_code_reasoning_row({"id": "2", "source": "s", "input": "q", "output": "<think>t</think>a"})
+
+    # Dataset.from_list names its columns from the first row, so without the
+    # helper the lane of every public row is dropped and the non-agentic
+    # rows read as agentic trajectories with no tool call.
+    naive = Dataset.from_list([bootstrap] + public)
+    assert "lane" not in naive.column_names
+    assert [validate_row(row) for row in naive][1:] != [[], []]
+
+    unified = Dataset.from_list(namespace["unify_columns"]([bootstrap] + public))
+    assert [row["lane"] for row in unified] == [None, "non_agentic", "non_agentic"]
+    assert [validate_row(row) for row in unified] == [[], [], []]
+
+
+def test_converted_rows_pass_notebook_02_validation():
+    """The notebook's validator, not a re-statement of it."""
+    generator = _load_generator()
+    namespace = {"json": json, "raw_dataset": []}
+    exec(generator.TOOLS_CELL, namespace)
+    exec(_validate_cell(generator), namespace)
     validate_row = namespace["validate_row"]
 
     for row in ps.convert_open_swe_row(_swe_row(turns=3), budget_tokens=10_000):

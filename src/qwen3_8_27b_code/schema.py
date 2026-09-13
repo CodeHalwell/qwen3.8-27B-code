@@ -108,6 +108,20 @@ def without_arrow_nulls(value):
     return value
 
 
+def unify_columns(rows: list[dict]) -> list[dict]:
+    """Give every row every key that any row in the list carries.
+
+    ``Dataset.from_list`` names its columns from the first row alone, so a
+    key that row happens not to carry is dropped from the whole table: a
+    corpus whose bootstrap rows predate ``lane`` silently loses the lane of
+    every public row after them, and non-agentic rows are then read as
+    agentic. Filling the gaps with None keeps each row's own value and
+    leaves the absent ones null, which is what the readers already expect.
+    """
+    columns = sorted({key for row in rows for key in row})
+    return [{column: row.get(column) for column in columns} for row in rows]
+
+
 def canonical_tool_schema(tools: list[dict]) -> str:
     """Return a stable semantic fingerprint while retaining tool order."""
     return json.dumps(

@@ -64,6 +64,11 @@ def test_package_schema_matches_notebook_tools_cell():
         {"role": "assistant", "content": "Done."},
     ]
     assert namespace["canonical_to_qwen"](probe) == schema.canonical_to_qwen(probe)
+    mixed = [{"id": "a"}, {"id": "b", "lane": "non_agentic"}]
+    assert namespace["unify_columns"](mixed) == schema.unify_columns(mixed)
+    assert schema.unify_columns(mixed) == [
+        {"id": "a", "lane": None}, {"id": "b", "lane": "non_agentic"},
+    ]
 
 
 def test_package_parser_matches_notebook_parser_cell():
