@@ -1,7 +1,7 @@
 {
   "generator_version": "scripted-gold-v1",
   "rows": 60,
-  "corpus_sha256": "c1ffc9ec81ec11ba90bffabdc34ff79d9ca5a3f37ce509da0a21f155c8c34979",
+  "corpus_sha256": "d8181719b3c1d84c9b5ef2543fd574010af81772440c0904cb2c12225c35135b",
   "families": {
     "bounds": 5,
     "config": 5,
@@ -21,6 +21,9 @@
     "patch_outcome": 24,
     "test_integrity": 12,
     "verification_claim": 12
+  },
+  "reasoning_effort": {
+    "medium": 60
   },
   "chosen_tool_call_pairs": 60,
   "rejected_tool_call_pairs": 48,

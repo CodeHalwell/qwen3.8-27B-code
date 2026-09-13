@@ -42,7 +42,7 @@ is an inference baseline and a reference for supported quant types.
 | --- | --- |
 | [Colab notebooks](../notebooks/README.md) | Executable preflight, baseline, data, SFT, DPO, agentic GRPO and quantisation suite |
 | [Minimum path](minimum-path.md) | The deliberately small route to the first useful baseline, including what is adopted, built and deferred |
-| [Model and hardware](model-and-hardware.md) | Model identity, architecture, VRAM feasibility, context constraints and the GPU assumption |
+| [Model and hardware](model-and-hardware.md) | Model identity, architecture, VRAM feasibility, context constraints, the GPU assumption and the Kaggle T4 x2 plumbing lane |
 | [Agentic harness](agentic-harness.md) | Tool protocol, sandbox, episode lifecycle and trajectory format |
 | [Data strategy](data-strategy.md) | SFT, preference and RL datasets; validation, mixing and contamination controls |
 | [Distillation](distillation.md) | Using a larger open model (Qwen3.8, Kimi K3, GLM 5.3) as a teacher through the same harness: verified trajectories, reasoning-length pairs and teacher-versus-student outcome pairs, and why logit distillation is out of scope |
@@ -67,8 +67,10 @@ is an inference baseline and a reference for supported quant types.
    evaluation share that adapter and schema.
 4. **Optimise verified outcomes.** Tests, compilation and regression results
    dominate rewards. Style and verbosity are secondary.
-5. **Earn longer horizons.** Begin with short, deterministic episodes and
-   increase the tool-call and context budgets only after reliability gates pass.
+5. **Measure every horizon from the start.** Both suites carry short,
+   medium and long tasks, budgets are ceilings sized for the long band, and
+   the gate reads success per designed band; task difficulty still advances
+   one axis at a time.
 6. **Keep a BF16 golden checkpoint.** Every quantised artifact is compared to
    the same merged BF16 model.
 7. **Separate QAT from Dynamic GGUF.** Current Unsloth/TorchAO QAT is a 4-bit
@@ -90,6 +92,10 @@ Training loss alone is not a success criterion.
 
 - Hardware is assumed to be a **Google Colab G4 runtime using the RTX PRO 6000
   Blackwell Server Edition with 96 GB GDDR7 ECC**.
+- A free Kaggle T4 x2 kernel is a second lane for 4-bit plumbing checks only
+  (loader, template, masking, adapter round trip). Nothing measured there is
+  a capability result; see
+  [Model and hardware](model-and-hardware.md#second-lane-kaggle-t4-x2).
 - The primary workload is text-only software engineering. Vision weights are
   preserved but frozen.
 - The native context limit is 262,144 tokens, but initial training will use
@@ -105,4 +111,7 @@ Training loss alone is not a success criterion.
 
 The model and its ecosystem are very new. Version pins, model-card facts and
 runtime support should be rechecked before each major training or export run.
-These documents were last reviewed on **2026-08-17**.
+These documents were last reviewed on **2026-08-17**. The model, template and
+hardware facts in [Model and hardware](model-and-hardware.md) and the
+[training plan](training-plan.md) were rechecked against the Hub and against
+Unsloth's own Qwen3.8-27B Kaggle notebook on **2026-09-12**.

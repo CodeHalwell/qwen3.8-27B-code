@@ -111,7 +111,7 @@ def main() -> int:
     parser.add_argument("--variants-per-family", type=int, default=2)
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--seeds", type=int, nargs="+", default=[3407, 9176, 20261])
-    parser.add_argument("--tool-calls", type=int, default=10)
+    parser.add_argument("--tool-calls", type=int, default=30, help="per-episode ceiling; the long band needs it")
     parser.add_argument("--wall-seconds", type=float, default=900.0)
     parser.add_argument("--max-rows-per-task", type=int, default=2)
     parser.add_argument("--selection", choices=SELECTIONS, default="shortest_reasoning")

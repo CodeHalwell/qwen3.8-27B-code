@@ -164,8 +164,11 @@ def test_outcome_pairs_satisfy_notebook_04_after_an_arrow_round_trip(tmp_path):
         "hashlib": __import__("hashlib"),
         "Dataset": Dataset,
         "load_dataset": load_dataset,
+        "Path": Path,
         "DEMO_MODE": False,
         "PREFERENCE_LOCAL_JSONL": str(corpus),
+        "LENGTH_PAIRS_LOCAL_JSONL": "",
+        "MAX_LENGTH_PAIR_SHARE": 1 / 3,
         "PREFERENCE_DATASET_ID": "unused",
         "PREFERENCE_DATASET_REVISION": "main",
         "hf_token": None,
@@ -174,6 +177,12 @@ def test_outcome_pairs_satisfy_notebook_04_after_an_arrow_round_trip(tmp_path):
     exec(generator.TOOLS_CELL, namespace)
     exec(code_cell_containing(generator.build_04_dpo(), "demo_preferences = Dataset.from_list"), namespace)
     assert len(namespace["preferences"]) == 2
+    # Outcome pairs are correctness contrasts: none of them count against
+    # the reasoning-length share.
+    assert namespace["PREFERENCE_MIXTURE"]["correctness_pairs"] == 2
+    assert namespace["PREFERENCE_MIXTURE"]["length_pairs_kept"] == 0
+    assert {pair["reasoning_effort"] for pair in pairs} == {"medium"}
+    assert pairs[0]["evidence"]["chosen_reasoning_effort"] == pairs[0]["evidence"]["rejected_reasoning_effort"] == "medium"
 
 
 def test_collector_cli_writes_attempts_and_self_play_outcome_pairs(tmp_path):
@@ -189,7 +198,11 @@ def test_collector_cli_writes_attempts_and_self_play_outcome_pairs(tmp_path):
     completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
     assert completed.returncode == 0, completed.stderr[-2000:]
     attempts = read_attempts(out / "attempts.jsonl")
-    assert len(attempts) == 14 and all(attempt.policy == "gold" for attempt in attempts)
+    # Twelve single-file fixtures plus the three multi-file training families.
+    assert len(attempts) == 15 and all(attempt.policy == "gold" for attempt in attempts)
+    assert {attempt.reasoning_effort for attempt in attempts} == {"medium"}
+    assert max(attempt.episode.tool_calls for attempt in attempts) == 17
+    assert {attempt.task_horizon for attempt in attempts} == {"short", "medium", "long"}
     assert json.loads((out / "outcome.json").read_text())["rows"] == 0
     assert json.loads((out / "report.json").read_text())["policy"] == "gold"
 

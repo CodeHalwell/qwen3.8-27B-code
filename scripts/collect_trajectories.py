@@ -64,8 +64,8 @@ def main() -> None:
     parser.add_argument("--attempts", type=int, default=3, help="attempts per task")
     parser.add_argument("--seeds", type=int, nargs="+", default=[3407, 9176, 20261])
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="medium")
-    parser.add_argument("--tool-calls", type=int, default=10, help="per-episode tool-call budget")
-    parser.add_argument("--wall-seconds", type=float, default=480.0)
+    parser.add_argument("--tool-calls", type=int, default=30, help="per-episode tool-call budget")
+    parser.add_argument("--wall-seconds", type=float, default=900.0)
     parser.add_argument("--max-rows-per-task", type=int, default=None)
     parser.add_argument(
         "--selection",

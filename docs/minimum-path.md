@@ -28,7 +28,7 @@ allowing them to remain open-ended.
 | Control agent | mini-SWE-agent where useful; bash-only traces are not SFT data |
 | Task count | 12 trusted tasks from at least 3 held-out repository families |
 | Attempts | Three fixed seeds per task because generation is sampled |
-| Episode budget | 10 tool calls, 8-minute timeout, fixed token ceiling |
+| Episode budget | 30 tool calls, 15-minute timeout, a per-effort token cap; ceilings, not targets, so the long band is admitted |
 | Reasoning | `medium` for the first comparison; one small effort-mode probe |
 | Durable storage | Hugging Face Hub or Drive after every irreplaceable output |
 | Reasoning retention | Private experiment traces only; keep operational events separable and do not publish raw reasoning by default |

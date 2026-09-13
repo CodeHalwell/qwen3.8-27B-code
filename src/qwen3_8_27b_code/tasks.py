@@ -71,6 +71,12 @@ class AgentTask:
     # leave this None and use module_path/reference_module; multi-file tasks
     # set it, and ``gold_patch`` builds one multi-file unified diff from it.
     reference_files: dict[str, str] | None = None
+    # The horizon band the task is designed for (docs/evaluation.md): short
+    # for a single-file fix, medium for two coupled modules, long for a
+    # pipeline repaired a stage at a time. Bands by tool calls actually made
+    # move with the policy; this one is fixed per task, which is what lets
+    # the gate compare success per band between two policies.
+    horizon: str = "short"
 
     @property
     def has_hidden_verification(self) -> bool:

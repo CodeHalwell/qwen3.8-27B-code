@@ -3,7 +3,8 @@
 Sources in this document are expected to change. Pin code and model revisions
 in experiments even when a documentation URL is unversioned. Last checked:
 **2026-08-17**; the thinking-budget entries and the Unsloth pull request were
-checked on **2026-09-08**.
+checked on **2026-09-08**; the Hub configuration, chat template, 4-bit build
+and the pull request were rechecked on **2026-09-12**.
 
 ## Model and inference
 
@@ -21,6 +22,9 @@ checked on **2026-09-08**.
   llama.cpp usage and NVFP4 information.
 - [Unsloth Qwen3.8-27B NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) —
   Blackwell-specific deployment candidate.
+- [Unsloth Qwen3.8-27B bnb-4bit](https://huggingface.co/unsloth/Qwen3.8-27B-unsloth-bnb-4bit) —
+  the build `load_in_4bit=True` resolves to; its `llm_int8_skip_modules`
+  names the tensors Unsloth keeps in 16-bit.
 
 ## Training and RL
 
@@ -36,8 +40,9 @@ checked on **2026-09-08**.
 - [NVIDIA NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) — resource-server and
   multi-environment patterns for executable RL.
 - [Unsloth PR #8810](https://github.com/unslothai/unsloth/pull/8810) — raises
-  the TRL cap to 1.10.0; open when last checked. The tracked route to running
-  notebook 05's trainer without bypassing the resolver.
+  the TRL cap to 1.10.0; still open on 2026-09-12. The tracked route to
+  running notebook 05's trainer on the reviewed matrix; the training plan
+  records the frozen-environment alternative.
 
 ## Distillation
 
@@ -115,6 +120,7 @@ references, not production scripts.
 | File | Useful content | Required adaptation |
 | --- | --- | --- |
 | `qwen_3_5_27b_a100(80gb).py` | BF16 27B load, LoRA, chat rendering, assistant-only loss, merge/GGUF patterns | Replace model/revision, validate Qwen3.8 loader and target modules, add configs/eval/tracking |
+| `qwen3_8_27b_kaggle_t4x2.py` | Unsloth's own Qwen3.8-27B QLoRA notebook for a free Kaggle T4 x2 kernel: `FastModel` loader and processor handling, `reasoning_effort` behaviour, two-card placement, the fp16 NaN warning and the measured 4-bit memory budget | Plumbing lane only (4-bit, 1,024 tokens); keep the G4 BF16 path for capability runs and do not copy its `--no-deps` install or its dtype omission into the reviewed core matrix |
 | `nemo_gym_multi_environment.py` | Resource servers and multi-environment GRPO structure | Replace small reasoning environments with sandboxed repositories and coding rewards |
 | `qwen3_5_(4b)_vision_grpo.py` | GRPO/GSPO and reward-function examples | Text/tool environment, no vision tuning, execution rewards |
 | `notebook24f5f9a990.ipynb` | Length analysis, reward validation and GRPO diagnostics | Extract concepts into tests/scripts; do not depend on notebook state |

@@ -46,6 +46,7 @@ from .trajectories import (
 # corpus, which uses variants 0..VARIANTS_PER_FAMILY-1 of the same families.
 PREFERENCE_VARIANT_BASE = 100
 PAIRS_PER_FAMILY = 5
+PREFERENCE_REASONING_EFFORT = "medium"
 
 CONTRAST_CYCLE = [
     "patch_outcome",
@@ -260,6 +261,9 @@ def _build_pair(task: FixtureTask, contrast: str, pair_id: str) -> dict:
         "source": GENERATOR_VERSION,
         "repo_family": task.family,
         "contrast_type": contrast,
+        # Scripted one-sentence reasoning is a medium-effort row, as in the
+        # SFT corpus; notebook 04 renders each pair under its own label.
+        "reasoning_effort": PREFERENCE_REASONING_EFFORT,
         "prompt_messages": prompt,
         "chosen_message": chosen,
         "rejected_message": rejected,
@@ -288,6 +292,7 @@ def quality_report(pairs: list[dict], corpus_path: Path) -> dict:
         "corpus_sha256": hashlib.sha256(corpus_path.read_bytes()).hexdigest(),
         "families": dict(sorted(Counter(pair["repo_family"] for pair in pairs).items())),
         "contrast_types": dict(sorted(Counter(pair["contrast_type"] for pair in pairs).items())),
+        "reasoning_effort": dict(sorted(Counter(pair["reasoning_effort"] for pair in pairs).items())),
         "chosen_tool_call_pairs": sum(1 for pair in pairs if pair["chosen_message"].get("tool_calls")),
         "rejected_tool_call_pairs": sum(1 for pair in pairs if pair["rejected_message"].get("tool_calls")),
         "pairs_with_matched_reasoning_channel": sum(

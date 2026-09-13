@@ -120,6 +120,10 @@ def _pairs_for_couple(short_first, second, unit: str, min_ratio: float, min_gap:
                 "source": LENGTH_PAIRS_VERSION,
                 "repo_family": chosen_attempt.family,
                 "contrast_type": "reasoning_length",
+                # Both sides ran under this instruction, and the pair is
+                # rendered under it: brevity at a given effort, not a
+                # comparison across efforts.
+                "reasoning_effort": chosen_attempt.reasoning_effort,
                 "prompt_messages": prompt,
                 "chosen_message": dict(chosen_attempt.episode.messages[chosen_index]),
                 "rejected_message": dict(rejected_attempt.episode.messages[rejected_index]),
@@ -172,9 +176,12 @@ def build_reasoning_length_pairs(
     from .collection import rejection_reason  # collection imports this module
 
     verified = [attempt for attempt in attempts if rejection_reason(attempt.episode, attempt.verdict) is None]
-    by_task: dict[str, list] = {}
+    # Grouped by task and by effort: a pair compares two continuations
+    # written under the same instruction, otherwise it teaches a rung of
+    # the dial rather than brevity within one.
+    by_task: dict[tuple[str, str], list] = {}
     for attempt in verified:
-        by_task.setdefault(attempt.task_id, []).append(attempt)
+        by_task.setdefault((attempt.task_id, attempt.reasoning_effort), []).append(attempt)
 
     pairs = []
     for _, group in sorted(by_task.items()):
@@ -201,6 +208,7 @@ def length_pairs_report(pairs: list[dict], corpus_path: Path | None = None) -> d
         "rows": len(pairs),
         "corpus_sha256": hashlib.sha256(corpus_path.read_bytes()).hexdigest() if corpus_path else None,
         "families": dict(sorted(Counter(pair["repo_family"] for pair in pairs).items())),
+        "reasoning_effort": dict(sorted(Counter(pair["reasoning_effort"] for pair in pairs).items())),
         "units": dict(sorted(Counter(pair["evidence"]["unit"] for pair in pairs).items())),
         "turn_index": {str(index): count for index, count in sorted(turn_indices.items())},
         "pairs_beyond_first_turn": sum(1 for pair in pairs if pair["evidence"]["turn_index"] > 0),

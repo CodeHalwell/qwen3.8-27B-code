@@ -459,8 +459,19 @@ def canonical_to_qwen(messages: list[dict]) -> list[dict]:
         converted.append({"role": "system", "content": "\n\n".join(pending_system)})
     return converted
 
+def text_tokenizer_of(tokenizer):
+    """The text tokenizer behind a multimodal processor, or the tokenizer itself.
+
+    FastModel hands back a processor for this vision-capable checkpoint. It
+    renders chat templates and decodes, but a bare positional string is read
+    as an image and token-level attributes (eos, added tokens) live one
+    level down. Reach through for those, and pass text= otherwise.
+    """
+    return getattr(tokenizer, "tokenizer", tokenizer)
+
+
 def render_chat(messages: list[dict], *, add_generation_prompt: bool, reasoning_effort: str = "medium") -> str:
-    return tokenizer.apply_chat_template(
+    return text_tokenizer_of(tokenizer).apply_chat_template(
         canonical_to_qwen(messages),
         tools=TOOLS,
         tokenize=False,
@@ -505,7 +516,7 @@ def build_00_preflight():
             markdown("## Load the trainable BF16 checkpoint"),
             code(
                 r"""
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 MODEL_REVISION = None  # Set to an immutable Hub commit after the first successful load.
@@ -523,10 +534,19 @@ def build_00_preflight():
 
                 require_free_vram(60.0)
                 torch.cuda.reset_peak_memory_stats()
-                model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+                model, tokenizer = FastModel.from_pretrained(**load_kwargs)
                 assert_model_fully_resident(model)
                 peak_gib = torch.cuda.max_memory_reserved() / 1024**3
                 print(f"Loaded {MODEL_ID}; peak reserved VRAM={peak_gib:.2f} GiB")
+                # Preflight item 3 of docs/model-and-hardware.md: FastModel returns
+                # a processor for this vision-capable checkpoint, with the text
+                # tokenizer one level down. Record both so later notebooks can
+                # rely on it.
+                print({
+                    "loader": "FastModel",
+                    "returned": type(tokenizer).__name__,
+                    "text_tokenizer": type(getattr(tokenizer, "tokenizer", tokenizer)).__name__,
+                })
 
                 model_type = getattr(model.config, "model_type", None)
                 text_config = getattr(model.config, "text_config", model.config)
@@ -558,7 +578,7 @@ def build_00_preflight():
             markdown("## Run one bounded inference probe"),
             code(
                 r"""
-                FastLanguageModel.for_inference(model)
+                FastModel.for_inference(model)
                 inputs = tokenizer(
                     text=rendered_probe,
                     return_tensors="pt",
@@ -647,15 +667,21 @@ def build_01_baseline():
                 import time
                 import uuid
 
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
-                MAX_SEQUENCE_LENGTH = 16384
+                # Every think block after the request stays in context for the rest
+                # of the episode, so a long-horizon run needs the window sized for
+                # thirty turns of reasoning, not one.
+                MAX_SEQUENCE_LENGTH = 32_768
                 # Thinking mode spends tokens before the tool call appears, so a
-                # 1k cap truncated ordinary turns and scored them as answers.
+                # 1k cap truncated ordinary turns and scored them as answers. This
+                # is a medium-effort cap; notebook 07 sizes one per effort.
                 MAX_NEW_TOKENS_PER_TURN = 2048
-                MAX_TOOL_CALLS = 10
-                EPISODE_TIMEOUT_SECONDS = 480
+                # Ceilings, not targets: the long band of docs/evaluation.md runs to
+                # 30 tool calls, and a smaller budget excludes it by construction.
+                MAX_TOOL_CALLS = 30
+                EPISODE_TIMEOUT_SECONDS = 900
                 BASELINE_SEEDS = (3407, 9176, 20261)
                 DEMO_MODE = True
                 PILOT_MANIFEST = Path("/content/pilot_tasks.jsonl")
@@ -698,14 +724,14 @@ def build_01_baseline():
                 print(f"Task subprocesses isolated to {TASK_HOME} with Hub access disabled.")
 
                 require_free_vram(60.0)
-                model, tokenizer = FastLanguageModel.from_pretrained(
+                model, tokenizer = FastModel.from_pretrained(
                     model_name=MODEL_ID,
                     max_seq_length=MAX_SEQUENCE_LENGTH,
                     load_in_4bit=False,
                     full_finetuning=False,
                 )
                 assert_model_fully_resident(model)
-                FastLanguageModel.for_inference(model)
+                FastModel.for_inference(model)
                 """
             ),
             code(TOOLS_CELL),
@@ -913,7 +939,7 @@ def build_01_baseline():
                     token_id
                     for token_id in (
                         *(generation_eos if isinstance(generation_eos, (list, tuple)) else [generation_eos]),
-                        tokenizer.eos_token_id,
+                        text_tokenizer_of(tokenizer).eos_token_id,
                     )
                     if token_id is not None
                 }
@@ -1439,7 +1465,7 @@ def build_03_sft():
             markdown("## Run configuration"),
             code(
                 r"""
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
                 from unsloth.chat_templates import train_on_responses_only
                 from datasets import Dataset, load_dataset
                 from trl import SFTConfig, SFTTrainer
@@ -1481,7 +1507,7 @@ def build_03_sft():
             code(
                 r"""
                 require_free_vram(60.0)
-                model, tokenizer = FastLanguageModel.from_pretrained(
+                model, tokenizer = FastModel.from_pretrained(
                     model_name=MODEL_ID,
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
@@ -1538,8 +1564,9 @@ def build_03_sft():
                     "language_linear_modules": dict(sorted(expected_module_counts.items())),
                 }, indent=2))
 
-                model = FastLanguageModel.get_peft_model(
+                model = FastModel.get_peft_model(
                     model,
+                    finetune_vision_layers=False,  # text-only specialisation; the reviewed list below decides the rest
                     r=16,
                     target_modules=target_modules,
                     lora_alpha=32,
@@ -1879,7 +1906,7 @@ def build_04_dpo():
                 r"""
                 import hashlib
 
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
                 from datasets import Dataset, load_dataset
                 from trl import DPOConfig, DPOTrainer
 
@@ -1894,6 +1921,12 @@ def build_04_dpo():
                 PREFERENCE_DATASET_REVISION = "main"
                 # Bootstrap pairs generated by scripts/generate_preference_pairs.py.
                 PREFERENCE_LOCAL_JSONL = ""  # e.g. "/content/pairs.jsonl"
+                # Reasoning-length pairs from notebook 07 or collect_trajectories.py.
+                # They teach brevity only (both sides succeeded), so they stay a
+                # minority next to the execution-derived pairs: docs/thinking-budget.md
+                # says no more than roughly a third of the mixture.
+                LENGTH_PAIRS_LOCAL_JSONL = ""  # e.g. "/content/length_pairs.jsonl"
+                MAX_LENGTH_PAIR_SHARE = 1 / 3
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
                 MAX_SEQ_LENGTH = 4_096
                 MAX_STEPS = 2
@@ -1922,7 +1955,7 @@ def build_04_dpo():
                 # behaviour SFT had just trained away. Loading the merged SFT
                 # weights and attaching a fresh adapter makes the reference the
                 # accepted SFT policy, which is what this stage should move from.
-                model, tokenizer = FastLanguageModel.from_pretrained(
+                model, tokenizer = FastModel.from_pretrained(
                     model_name=MERGED_SFT_MODEL_ID,
                     revision=None if MERGED_SFT_REVISION.startswith("REPLACE_") else MERGED_SFT_REVISION,
                     max_seq_length=MAX_SEQ_LENGTH,
@@ -1931,7 +1964,8 @@ def build_04_dpo():
                     token=hf_token,
                 )
                 assert_model_fully_resident(model)
-                tokenizer.padding_side = "left"
+                # FastModel returns a processor; padding is a text-tokenizer setting.
+                getattr(tokenizer, "tokenizer", tokenizer).padding_side = "left"
 
                 # Same reviewed target set as notebook 03; a mismatch between the
                 # stages would silently train a different subnetwork.
@@ -1959,8 +1993,9 @@ def build_04_dpo():
                     )
                 expected_module_counts = Counter(name.rsplit(".", 1)[-1] for name in language_linear_names)
 
-                model = FastLanguageModel.get_peft_model(
+                model = FastModel.get_peft_model(
                     model,
+                    finetune_vision_layers=False,
                     r=16,
                     target_modules=sorted(discovered_suffixes),
                     lora_alpha=32,
@@ -2015,6 +2050,7 @@ def build_04_dpo():
                     },
                     {
                         "repo_family": "fixture/parser",
+                        "reasoning_effort": "low",
                         "prompt_messages": [
                             {"role": "developer", "content": "Inspect evidence before proposing a patch."},
                             {"role": "user", "content": "A parser test fails only for empty input."},
@@ -2029,33 +2065,80 @@ def build_04_dpo():
                     },
                 ])
 
+                # Keep reasoning-length pairs a minority beside the correctness
+                # pairs. Both sides of a length pair succeeded, so those rows
+                # teach brevity and nothing about software engineering; capped at
+                # max_share of the mixture, sampled deterministically, the stage
+                # still learns 'right' more strongly than 'shorter'.
+                import random
+
+                def cap_length_pair_share(rows, max_share, seed=3407):
+                    length = [row for row in rows if row.get("contrast_type") == "reasoning_length"]
+                    correctness = [row for row in rows if row.get("contrast_type") != "reasoning_length"]
+                    if length and not correctness:
+                        raise ValueError(
+                            "Reasoning-length pairs need execution-derived pairs beside them; "
+                            "supply PREFERENCE_LOCAL_JSONL or the Hub preference dataset."
+                        )
+                    allowed = len(length) if max_share >= 1 else int(max_share * len(correctness) / (1 - max_share))
+                    dropped = 0
+                    if len(length) > allowed:
+                        kept = set(random.Random(seed).sample(range(len(length)), allowed))
+                        dropped = len(length) - allowed
+                        length = [row for index, row in enumerate(length) if index in kept]
+                    mixture = {
+                        "correctness_pairs": len(correctness),
+                        "length_pairs_kept": len(length),
+                        "length_pairs_dropped": dropped,
+                        "length_share": round(len(length) / (len(length) + len(correctness)), 3) if rows else 0.0,
+                    }
+                    print(mixture)
+                    return correctness + length, mixture
+
+                def read_jsonl(path):
+                    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+
                 USE_DEMO_DATA = DEMO_MODE
+                PREFERENCE_MIXTURE = None  # recorded in the run manifest for a real run
                 if USE_DEMO_DATA:
                     raw = demo_preferences
                     print("Using synthetic plumbing preferences; this is not a capability run.")
-                elif PREFERENCE_LOCAL_JSONL:
-                    raw = load_dataset("json", data_files=PREFERENCE_LOCAL_JSONL, split="train")
                 else:
-                    raw = load_dataset(
-                        PREFERENCE_DATASET_ID,
-                        split="train",
-                        revision=PREFERENCE_DATASET_REVISION,
-                        token=hf_token,
-                    )
+                    if PREFERENCE_LOCAL_JSONL:
+                        rows = read_jsonl(PREFERENCE_LOCAL_JSONL)
+                    else:
+                        rows = load_dataset(
+                            PREFERENCE_DATASET_ID,
+                            split="train",
+                            revision=PREFERENCE_DATASET_REVISION,
+                            token=hf_token,
+                        ).to_list()
+                    if LENGTH_PAIRS_LOCAL_JSONL:
+                        rows += read_jsonl(LENGTH_PAIRS_LOCAL_JSONL)
+                    # One Dataset from plain rows: Arrow unions the struct keys of
+                    # the different pair sources, and the render below strips
+                    # the nulls that union inserts.
+                    rows, PREFERENCE_MIXTURE = cap_length_pair_share(rows, MAX_LENGTH_PAIR_SHARE)
+                    raw = Dataset.from_list(rows)
 
                 def render_preference(row):
                     if row.get("infra_status") != "ok":
                         raise ValueError("Infrastructure failures must not become preferences.")
                     if not row["chosen_reward"] > row["rejected_reward"]:
                         raise ValueError("Chosen reward must be strictly greater than rejected reward.")
+                    # Render under the effort the continuations were generated at.
+                    # The template injects an instruction for low and xhigh and
+                    # nothing for medium, so a low pair rendered at medium would
+                    # lose the instruction its reasoning was written under.
+                    effort = row.get("reasoning_effort") or "medium"
                     prompt = canonical_to_qwen(row["prompt_messages"])
-                    prompt_text = tokenizer.apply_chat_template(
+                    prompt_text = text_tokenizer_of(tokenizer).apply_chat_template(
                         prompt,
                         tools=TOOLS,
                         tokenize=False,
                         add_generation_prompt=True,
                         enable_thinking=True,
-                        reasoning_effort="medium",
+                        reasoning_effort=effort,
                     )
 
                     def completion(message):
@@ -2064,13 +2147,13 @@ def build_04_dpo():
                         # fields (and null argument keys) that the template would
                         # render as spurious values. Strip them before rendering.
                         message = _without_arrow_nulls(message)
-                        full = tokenizer.apply_chat_template(
+                        full = text_tokenizer_of(tokenizer).apply_chat_template(
                             prompt + [message],
                             tools=TOOLS,
                             tokenize=False,
                             add_generation_prompt=False,
                             enable_thinking=True,
-                            reasoning_effort="medium",
+                            reasoning_effort=effort,
                             preserve_thinking=True,
                         )
                         if not full.startswith(prompt_text):
@@ -2163,6 +2246,14 @@ def build_04_dpo():
                 )
 
                 if RUN_TRAINING:
+                    (RUN_ROOT / "dpo" / "preference_mixture.json").parent.mkdir(parents=True, exist_ok=True)
+                    (RUN_ROOT / "dpo" / "preference_mixture.json").write_text(json.dumps({
+                        "mixture": PREFERENCE_MIXTURE,
+                        "max_length_pair_share": MAX_LENGTH_PAIR_SHARE,
+                        "reasoning_effort": dict(sorted(Counter(
+                            row.get("reasoning_effort") or "medium" for row in raw
+                        ).items())),
+                    }, indent=2))
                     result = trainer.train()
                     trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
                     if PUSH_ADAPTER:
@@ -2219,7 +2310,7 @@ def build_05_grpo():
                 import tempfile
                 from pathlib import Path
 
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
                 from datasets import Dataset
                 from packaging.version import Version
                 from transformers import __version__ as transformers_version
@@ -2528,7 +2619,7 @@ def build_05_grpo():
                 trainer = None
                 if AGENTIC_TRL_AVAILABLE:
                     require_free_vram(24.0 if use_quantized_policy else 60.0)
-                    model, tokenizer = FastLanguageModel.from_pretrained(
+                    model, tokenizer = FastModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
                         revision=None if ACCEPTED_REVISION.startswith("REPLACE_") else ACCEPTED_REVISION,
                         max_seq_length=MAX_SEQ_LENGTH,
@@ -2656,7 +2747,7 @@ def build_06_qat_export():
             markdown("## Artifact configuration"),
             code(
                 r"""
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
                 from unsloth.chat_templates import train_on_responses_only
                 from datasets import Dataset, load_dataset
                 from trl import SFTConfig, SFTTrainer
@@ -2692,7 +2783,7 @@ def build_06_qat_export():
                         raise RuntimeError("Install the matched TorchAO/Fbgemm pair and restart first.") from exc
 
                     require_free_vram(60.0)
-                    qat_model, qat_tokenizer = FastLanguageModel.from_pretrained(
+                    qat_model, qat_tokenizer = FastModel.from_pretrained(
                         model_name=MERGED_MODEL_ID,
                         max_seq_length=MAX_SEQ_LENGTH,
                         dtype=torch.bfloat16,
@@ -2710,8 +2801,9 @@ def build_06_qat_export():
                         "k_proj", "o_proj", "out_proj", "q_proj", "up_proj", "v_proj",
                     ]
                     EXCLUDED_MODULE_MARKERS = ("visual", "vision", "image", "mtp.", "lm_head")
-                    qat_model = FastLanguageModel.get_peft_model(
+                    qat_model = FastModel.get_peft_model(
                         qat_model,
+                        finetune_vision_layers=False,
                         r=16,
                         target_modules=QAT_TARGET_MODULES,
                         lora_alpha=32,
@@ -2794,7 +2886,7 @@ def build_06_qat_export():
                 r"""
                 if RUN_STANDARD_GGUF_EXPORT:
                     require_free_vram(60.0)
-                    export_model, export_tokenizer = FastLanguageModel.from_pretrained(
+                    export_model, export_tokenizer = FastModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
                         revision=ACCEPTED_REVISION,
                         max_seq_length=MAX_SEQ_LENGTH,
@@ -2920,6 +3012,7 @@ def build_07_collect_and_evaluate():
                 from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
                 from qwen3_8_27b_code.evaluation import (
                     compare,
+                    effort_ladder,
                     evaluate,
                     gate,
                     gate_passed,
@@ -2941,13 +3034,23 @@ def build_07_collect_and_evaluate():
             markdown("## Run configuration"),
             code(
                 r"""
-                from unsloth import FastLanguageModel
+                from unsloth import FastModel
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 ACCEPTED_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 ACCEPTED_REVISION = "REPLACE_WITH_ACCEPTED_COMMIT"
-                MAX_SEQUENCE_LENGTH = 16_384
-                MAX_NEW_TOKENS_PER_TURN = 2_048
+                # Every think block after the request stays in context for the rest
+                # of the episode, so a thirty-call episode carries thirty turns of
+                # reasoning: this is where thinking and horizon meet, and why the
+                # window is sized for the long band rather than for one turn.
+                MAX_SEQUENCE_LENGTH = 32_768
+                # Reasoning counts against max_new_tokens, and a turn cut off inside
+                # its think block returns no action. One cap sized for medium turns
+                # the xhigh rung into a truncation measurement, so each effort gets
+                # its own; set each above the p95 reasoning length measured at that
+                # effort (docs/training-plan.md, Stage 0). `high` is deliberately
+                # absent: the template aliases it to xhigh.
+                MAX_NEW_TOKENS_BY_EFFORT = {"low": 2_048, "medium": 4_096, "xhigh": 8_192}
                 REASONING_EFFORT = "medium"
                 # docs/thinking-budget.md: a candidate may spend at most this
                 # fraction more reasoning tokens per turn than the baseline.
@@ -2958,11 +3061,18 @@ def build_07_collect_and_evaluate():
                 # docs/evaluation.md funnel: the sentinel tier is the cheap one
                 # every candidate runs. Widen only for a candidate or release
                 # gate, and price it before starting.
-                EVAL_VARIANTS_PER_FAMILY = 1     # 6 held-out tasks
+                EVAL_VARIANTS_PER_FAMILY = 1     # 9 held-out tasks: 6 short, 2 medium, 1 long
                 EVAL_ATTEMPTS = 1                # deterministic sentinel pass
-                EPISODE_BUDGET = EpisodeBudget(tool_calls=10, wall_seconds=480.0)
+                # Ceilings, not targets: the long band runs to 30 tool calls and a
+                # smaller budget excludes the pipeline tasks by construction.
+                EPISODE_BUDGET = EpisodeBudget(tool_calls=30, wall_seconds=900.0)
 
                 RUN_BASELINE_EVAL = True
+                # The stock model at low, medium and xhigh, each with its own cap;
+                # picks the deployment effort and the gate baseline
+                # (docs/thinking-budget.md, lever 1).
+                RUN_EFFORT_LADDER = False
+                EFFORT_LADDER_TOLERANCE = 0.0    # a rung must match the best success to be eligible
                 RUN_CANDIDATE_EVAL = False       # needs an accepted adapter revision
                 RUN_COLLECTION = False           # expensive; read the cost note below first
                 PUSH_ARTIFACTS = False
@@ -2977,8 +3087,9 @@ def build_07_collect_and_evaluate():
                 if RUN_CANDIDATE_EVAL and ACCEPTED_REVISION.startswith("REPLACE_"):
                     raise RuntimeError("Pin the accepted adapter revision before evaluating it.")
 
-                # Six single-file families plus the two multi-file families from
-                # long_horizon, which put the medium band on the scorecard.
+                # Six single-file families (short band) plus the three multi-file
+                # families from long_horizon: two coupled-module (medium band) and
+                # one four-stage pipeline (long band).
                 evaluation_suite = evaluation_tasks(variants_per_family=EVAL_VARIANTS_PER_FAMILY)
                 print(json.dumps({
                     "held_out_tasks": len(evaluation_suite),
@@ -2995,12 +3106,14 @@ def build_07_collect_and_evaluate():
                 # callable that renders the history, generates one assistant
                 # turn, and reports whether generation finished or was cut off.
                 def build_policy_factory(model, tokenizer, reasoning_effort=REASONING_EFFORT):
+                    max_new_tokens = MAX_NEW_TOKENS_BY_EFFORT[reasoning_effort]
+                    text_tokenizer = text_tokenizer_of(tokenizer)
                     generation_eos = model.generation_config.eos_token_id
                     eos_token_ids = {
                         token_id
                         for token_id in (
                             *(generation_eos if isinstance(generation_eos, (list, tuple)) else [generation_eos]),
-                            tokenizer.eos_token_id,
+                            text_tokenizer.eos_token_id,
                         )
                         if token_id is not None
                     }
@@ -3009,8 +3122,8 @@ def build_07_collect_and_evaluate():
                     # The thinking budget is measured in tokens generated before
                     # the think block closes. Count them from the ids, not from
                     # decoded text, so the number is exact.
-                    think_end_id = tokenizer.convert_tokens_to_ids("</think>")
-                    if think_end_id is None or think_end_id == tokenizer.unk_token_id:
+                    think_end_id = text_tokenizer.convert_tokens_to_ids("</think>")
+                    if think_end_id is None or think_end_id == text_tokenizer.unk_token_id:
                         raise RuntimeError("The tokenizer has no </think> token; reasoning tokens cannot be counted.")
 
                     def policy_factory(task, seed):
@@ -3027,14 +3140,14 @@ def build_07_collect_and_evaluate():
                                 text=rendered, return_tensors="pt", add_special_tokens=False
                             ).to("cuda")
                             prompt_tokens = int(inputs["input_ids"].numel())
-                            if prompt_tokens + MAX_NEW_TOKENS_PER_TURN > MAX_SEQUENCE_LENGTH:
+                            if prompt_tokens + max_new_tokens > MAX_SEQUENCE_LENGTH:
                                 return TurnResult(
                                     text="", prompt_tokens=prompt_tokens, fault="context_budget"
                                 )
                             with torch.inference_mode():
                                 outputs = model.generate(
                                     **inputs,
-                                    max_new_tokens=MAX_NEW_TOKENS_PER_TURN,
+                                    max_new_tokens=max_new_tokens,
                                     temperature=1.0,
                                     top_p=0.95,
                                     top_k=20,
@@ -3077,7 +3190,7 @@ def build_07_collect_and_evaluate():
 
                 if RUN_BASELINE_EVAL:
                     require_free_vram(60.0)
-                    model, tokenizer = FastLanguageModel.from_pretrained(
+                    model, tokenizer = FastModel.from_pretrained(
                         model_name=MODEL_ID,
                         max_seq_length=MAX_SEQUENCE_LENGTH,
                         load_in_4bit=False,
@@ -3085,7 +3198,7 @@ def build_07_collect_and_evaluate():
                         token=hf_token,
                     )
                     assert_model_fully_resident(model)
-                    FastLanguageModel.for_inference(model)
+                    FastModel.for_inference(model)
 
                     baseline = evaluate(
                         evaluation_suite,
@@ -3099,6 +3212,49 @@ def build_07_collect_and_evaluate():
                     print(f"wrote {baseline_report_path}")
                 else:
                     print("Baseline evaluation is off. It is the comparison point for every later claim.")
+                """
+            ),
+            markdown(
+                """
+                ## Effort ladder: the stock model at low, medium and xhigh
+
+                Lever 1 of docs/thinking-budget.md, and it costs no training.
+                Each rung runs with its own per-turn cap, so the table
+                measures effort rather than truncation. The recommendation
+                is the rung that thinks least among those that keep the best
+                success; set `REASONING_EFFORT` to it and use its report as
+                the gate baseline. Read `success_by_task_horizon` before the
+                aggregate: a rung that holds the short tasks and loses the
+                pipeline is not a cheaper rung.
+                """
+            ),
+            code(
+                r"""
+                if RUN_EFFORT_LADDER:
+                    if "model" not in globals():
+                        raise RuntimeError("Load the stock model in the baseline cell first.")
+                    ladder_reports = {}
+                    for effort in ("low", "medium", "xhigh"):
+                        ladder_reports[effort] = evaluate(
+                            evaluation_suite,
+                            build_policy_factory(model, tokenizer, reasoning_effort=effort),
+                            label=f"upstream-bf16-{effort}",
+                            attempts_per_task=EVAL_ATTEMPTS,
+                            budget=EPISODE_BUDGET,
+                        )
+                        write_report(ladder_reports[effort], REPORT_DIR / f"ladder_{effort}.json")
+                    ladder = effort_ladder(ladder_reports, success_tolerance=EFFORT_LADDER_TOLERANCE)
+                    (REPORT_DIR / "effort_ladder.json").write_text(json.dumps(ladder, indent=2))
+                    print(json.dumps(ladder, indent=2))
+                    if ladder["recommended"] is None:
+                        print(f"{ladder['note']}. Do not set REASONING_EFFORT from this ladder.")
+                    else:
+                        print(
+                            f"Recommended deployment effort: {ladder['recommended']}. Set REASONING_EFFORT to it "
+                            f"and use ladder_{ladder['recommended']}.json as the frozen baseline for the gate."
+                        )
+                else:
+                    print("Effort ladder is off. Run it once on the stock model before choosing REASONING_EFFORT.")
                 """
             ),
             markdown(
@@ -3117,7 +3273,7 @@ def build_07_collect_and_evaluate():
                 if RUN_CANDIDATE_EVAL:
                     release_stale_gpu_state()
                     require_free_vram(60.0)
-                    model, tokenizer = FastLanguageModel.from_pretrained(
+                    model, tokenizer = FastModel.from_pretrained(
                         model_name=ACCEPTED_ADAPTER_ID,
                         revision=ACCEPTED_REVISION,
                         max_seq_length=MAX_SEQUENCE_LENGTH,
@@ -3125,7 +3281,7 @@ def build_07_collect_and_evaluate():
                         token=hf_token,
                     )
                     assert_model_fully_resident(model)
-                    FastLanguageModel.for_inference(model)
+                    FastModel.for_inference(model)
 
                     candidate = evaluate(
                         evaluation_suite,
@@ -3267,7 +3423,15 @@ def build_07_collect_and_evaluate():
                 Feed the collected JSONL to notebook 02, which remains the
                 publisher that validates, splits and pushes the dataset that
                 notebooks 03 and 06 consume. The reasoning-length pairs go to
-                notebook 04 (see docs/thinking-budget.md).
+                notebook 04 as `LENGTH_PAIRS_LOCAL_JSONL`, where they are
+                capped to a minority of the mixture (see docs/thinking-budget.md).
+
+                Two long-horizon numbers are on every scorecard now:
+                `peak_prompt_tokens_max`, the largest context any turn needed,
+                and `context_budget_rate`, how often an episode ran out of
+                window. When either climbs towards `MAX_SEQUENCE_LENGTH` the
+                next lever is less thinking per turn, then observation
+                compaction, in that order.
                 """
             ),
         ],
@@ -3399,7 +3563,7 @@ def build_08_distil():
                 COLLECTION_ATTEMPTS = 3
                 COLLECTION_VARIANTS_PER_FAMILY = 2
                 COLLECTION_SEEDS = (3407, 9176, 20261)
-                EPISODE_BUDGET = EpisodeBudget(tool_calls=10, wall_seconds=900.0)
+                EPISODE_BUDGET = EpisodeBudget(tool_calls=30, wall_seconds=900.0)  # long band: up to 30 calls
                 STUDENT_ATTEMPTS_JSONL = ""                 # attempts.jsonl from notebook 07 / collect_trajectories.py
                 PUSH_ARTIFACTS = False
 

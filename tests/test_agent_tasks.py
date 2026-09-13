@@ -37,8 +37,8 @@ from qwen3_8_27b_code.trajectories import unified_patch
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR_PATH = ROOT / "scripts" / "build_notebooks.py"
 
-# One variant per family keeps these tests to eight real repositories: six
-# single-file families and the two multi-file ones from long_horizon.
+# One variant per family keeps these tests to nine real repositories: six
+# single-file families and the three multi-file ones from long_horizon.
 SMOKE_TASKS = evaluation_tasks(variants_per_family=1)
 
 
@@ -252,6 +252,9 @@ def test_collection_rejects_each_way_an_attempt_can_look_successful(policy_name,
 def test_collection_keeps_verified_attempts_and_records_the_evidence():
     result = collect(SMOKE_TASKS, policies.gold, attempts_per_task=1, reasoning_effort="xhigh")
     report = result.report()
+    # The effort travels with every attempt, kept or not, so the pair
+    # builders can render each pair under the instruction it ran at.
+    assert {attempt.reasoning_effort for attempt in result.attempts} == {"xhigh"}
 
     assert len(result.rows) == len(SMOKE_TASKS)
     assert report["rejections"] == {}
@@ -390,7 +393,58 @@ def test_gate_passes_on_improvement_and_fails_on_regression():
 
     backward = evaluation.compare(candidate, baseline)
     failed = [check.name for check in evaluation.gate(backward) if not check.passed]
-    assert failed == ["episode_success", "task_level_not_net_negative"]
+    assert failed == ["episode_success", "task_level_not_net_negative", "task_horizon_no_worse"]
+
+
+def test_gate_fails_when_a_horizon_band_drops_while_the_aggregate_holds():
+    """Brevity or any other change may not be paid for with the long tasks."""
+    long_ids = {task.task_id for task in SMOKE_TASKS if task.horizon == "long"}
+    short_ids = {task.task_id for task in SMOKE_TASKS if task.horizon == "short"}
+    assert long_ids and short_ids
+    sacrificed_short = sorted(short_ids)[0]
+
+    def loses_long(task, seed):
+        return policies.failing(task, seed) if task.task_id in long_ids else policies.gold(task, seed)
+
+    def loses_one_short(task, seed):
+        return policies.failing(task, seed) if task.task_id == sacrificed_short else policies.gold(task, seed)
+
+    baseline = evaluation.evaluate(SMOKE_TASKS, loses_one_short, label="baseline")
+    candidate = evaluation.evaluate(SMOKE_TASKS, loses_long, label="candidate")
+    comparison = evaluation.compare(baseline, candidate)
+    # Same aggregate, one win and one loss: every aggregate check passes.
+    assert comparison["deltas"]["episode_success"] == 0.0
+    assert comparison["task_level"]["wins"] == comparison["task_level"]["losses"] == 1
+    checks = {check.name: check for check in evaluation.gate(comparison)}
+    assert checks["episode_success"].passed and checks["task_level_not_net_negative"].passed
+    assert checks["task_horizon_no_worse"].passed is False
+    assert "long" in checks["task_horizon_no_worse"].detail
+    assert comparison["thinking"]["candidate_success_by_task_horizon"]["long"] == 0.0
+
+
+def test_scorecard_reports_context_pressure():
+    def widening(task, seed):
+        turns = iter([
+            (tool_call_text("read_file", {"path": task.module_path}, "Reading."), 1_000),
+            (answer_text("Done."), 9_000),
+        ])
+
+        def policy(messages):
+            text, prompt_tokens = next(turns)
+            return TurnResult(text=text, prompt_tokens=prompt_tokens, completion_tokens=10)
+
+        return policy
+
+    def exhausted(task, seed):
+        return lambda messages: TurnResult(text="", fault="context_budget", prompt_tokens=32_000)
+
+    widened = evaluation.evaluate(SMOKE_TASKS[:1], widening, label="widening")
+    assert widened.records[0].peak_prompt_tokens == 9_000
+    assert widened.scorecard()["peak_prompt_tokens_max"] == 9_000
+    assert widened.scorecard()["context_budget_rate"] == 0.0
+    out_of_room = evaluation.evaluate(SMOKE_TASKS[:2], exhausted, label="exhausted").scorecard()
+    assert out_of_room["context_budget_rate"] == 1.0
+    assert out_of_room["terminations"] == {"context_budget": 2}
 
 
 def test_gate_fails_a_candidate_that_wins_by_tampering():
@@ -407,6 +461,203 @@ def test_reports_round_trip_through_json(tmp_path):
     restored = evaluation.read_report(path)
     assert restored.scorecard() == report.scorecard()
     assert restored.task_outcomes() == report.task_outcomes()
+    assert {record.task_horizon for record in restored.records} == {"short"}
+
+
+def test_every_task_declares_the_horizon_it_was_designed_for():
+    horizons = {task.family: task.horizon for task in evaluation_tasks(variants_per_family=1)}
+    assert set(horizons.values()) == {"short", "medium", "long"}
+    assert horizons["invoice_pipeline"] == "long"
+    assert horizons["ledger"] == "medium"
+    assert horizons["word_wrap"] == "short"
+    assert task_from_fixture(fixtures.FAMILY_BUILDERS["bounds"](0)).horizon == "short"
+
+
+def test_effort_ladder_picks_the_cheapest_rung_that_keeps_the_best_success():
+    def scaled(scale):
+        def factory(task, seed):
+            policy = policies.gold(task, seed)
+
+            def counted(messages):
+                turn = policy(messages)
+                reasoning = turn.text.split("</think>")[0]
+                return TurnResult(
+                    text=turn.text,
+                    completion_tokens=len(turn.text.split()),
+                    reasoning_tokens=len(reasoning.split()) * scale,
+                )
+
+            return counted
+
+        return factory
+
+    suite = SMOKE_TASKS[:3]
+    reports = {
+        "low": evaluation.evaluate(suite, scaled(1), label="low"),
+        "medium": evaluation.evaluate(suite, scaled(3), label="medium"),
+        "xhigh": evaluation.evaluate(suite, scaled(9), label="xhigh"),
+    }
+    ladder = evaluation.effort_ladder(reports)
+    assert ladder["unit"] == "tokens"
+    assert list(ladder["rungs"]) == ["low", "medium", "xhigh"]
+    assert ladder["best_success"] == 1.0
+    assert ladder["eligible"] == ["low", "medium", "xhigh"]
+    assert ladder["recommended"] == "low"
+    low, xhigh = ladder["rungs"]["low"], ladder["rungs"]["xhigh"]
+    assert xhigh["reasoning_tokens_per_turn"] == pytest.approx(9 * low["reasoning_tokens_per_turn"])
+
+    # A cheaper rung that loses tasks is not eligible, whatever it saves.
+    reports["low"] = evaluation.evaluate(suite, policies.failing, label="low-fails")
+    ladder = evaluation.effort_ladder(reports)
+    assert ladder["eligible"] == ["medium", "xhigh"]
+    assert ladder["recommended"] == "medium"
+    # Unless the tolerance says that loss is acceptable.
+    assert evaluation.effort_ladder(reports, success_tolerance=1.0)["recommended"] == "low"
+
+    with pytest.raises(ValueError, match="unknown reasoning effort"):
+        evaluation.effort_ladder({"high": reports["medium"]})
+    with pytest.raises(ValueError, match="same tasks"):
+        evaluation.effort_ladder({
+            "low": reports["medium"],
+            "medium": evaluation.evaluate(SMOKE_TASKS[3:5], policies.gold, label="other"),
+        })
+    # The same tasks with different attempts or seeds are a different
+    # experiment: success from unequal samples must not pick the effort.
+    with pytest.raises(ValueError, match="same attempts and seeds"):
+        evaluation.effort_ladder({
+            "low": reports["medium"],
+            "medium": evaluation.evaluate(suite, scaled(3), label="two-seeds", attempts_per_task=2),
+        })
+    with pytest.raises(ValueError, match="same attempts and seeds"):
+        evaluation.effort_ladder({
+            "low": reports["medium"],
+            "medium": evaluation.evaluate(suite, scaled(3), label="other-seed", seeds=(1,)),
+        })
+
+    # An attempt lost to the harness is excluded from every rate, so equal
+    # attempted samples are not equal scored samples: the rung is refused
+    # rather than ranked on an inflated success.
+    def broken_once(task, seed):
+        if task.task_id == suite[0].task_id:
+            def policy(messages):
+                raise RuntimeError("model server went away")
+            return policy
+        return scaled(3)(task, seed)
+
+    lost_one = evaluation.evaluate(suite, broken_once, label="lost-one")
+    assert lost_one.attempt_signature(scored_only=False) == reports["medium"].attempt_signature(scored_only=False)
+    assert lost_one.attempt_signature() != reports["medium"].attempt_signature()
+    with pytest.raises(ValueError, match="infrastructure failures"):
+        evaluation.effort_ladder({"low": reports["medium"], "medium": lost_one})
+
+
+def test_effort_ladder_never_recommends_a_rung_that_loses_a_band():
+    """Equal or tolerable aggregate success does not excuse losing the pipeline."""
+    long_task = next(task for task in SMOKE_TASKS if task.horizon == "long")
+    short_a, short_b = [task for task in SMOKE_TASKS if task.horizon == "short"][:2]
+    suite = [short_a, short_b, long_task]
+
+    def solving(solved, scale):
+        def factory(task, seed):
+            policy = (policies.gold if task.task_id in solved else policies.failing)(task, seed)
+
+            def counted(messages):
+                turn = policy(messages)
+                return TurnResult(text=turn.text, completion_tokens=50, reasoning_tokens=10 * scale)
+
+            return counted
+
+        return factory
+
+    everything = {task.task_id for task in suite}
+    # low solves both short tasks and loses the pipeline; medium solves all
+    # three at three times the reasoning.
+    reports = {
+        "low": evaluation.evaluate(suite, solving({short_a.task_id, short_b.task_id}, 1), label="low"),
+        "medium": evaluation.evaluate(suite, solving(everything, 3), label="medium"),
+    }
+    strict = evaluation.effort_ladder(reports)
+    assert strict["recommended"] == "medium"
+    # A tolerance that would excuse the aggregate loss still does not
+    # excuse losing the whole long band.
+    tolerant = evaluation.effort_ladder(reports, success_tolerance=0.34)
+    assert tolerant["eligible"] == ["medium"]
+    assert tolerant["recommended"] == "medium"
+    assert tolerant["best_success_by_band"] == {"long": 1.0, "short": 1.0}
+
+    # Two rungs with equal aggregate success that split the bands between
+    # them: neither keeps every band, so nothing is recommended.
+    reports["medium"] = evaluation.evaluate(suite, solving({short_a.task_id, long_task.task_id}, 3), label="medium")
+    split = evaluation.effort_ladder(reports)
+    assert split["rungs"]["low"]["episode_success"] == split["rungs"]["medium"]["episode_success"]
+    assert split["eligible"] == []
+    assert split["recommended"] is None
+    assert "read the rungs by band" in split["note"]
+
+
+def test_horizon_gate_refuses_reports_that_scored_different_tasks():
+    """A candidate that skipped the long tasks cannot pass the band check by omission."""
+    baseline = evaluation.evaluate(SMOKE_TASKS, policies.gold, label="baseline")
+    narrower = [task for task in SMOKE_TASKS if task.horizon != "long"]
+    candidate = evaluation.evaluate(narrower, policies.gold, label="narrow")
+    comparison = evaluation.compare(baseline, candidate)
+    check = {check.name: check for check in evaluation.gate(comparison)}["task_horizon_no_worse"]
+    assert check.passed is False
+    assert "task membership differs" in check.detail
+    assert all(
+        entry["baseline_task_horizon"] == entry["candidate_task_horizon"] != ""
+        for entry in comparison["paired_tasks"].values()
+    )
+
+    # A band lost entirely to infrastructure failures is an unmatched task
+    # on that side, not a silently absent band.
+    def broken_on_long(task, seed):
+        if task.horizon == "long":
+            def policy(messages):
+                raise RuntimeError("model server went away")
+            return policy
+        return policies.gold(task, seed)
+
+    partial = evaluation.evaluate(SMOKE_TASKS, broken_on_long, label="partial")
+    check = {check.name: check for check in evaluation.gate(evaluation.compare(baseline, partial))}["task_horizon_no_worse"]
+    assert check.passed is False
+    assert "only in baseline" in check.detail
+
+    # An attempt lost to the harness on one side leaves that task's success
+    # rate intact and its coverage hollow; uneven attempt counts fail too.
+    trio = [task for task in SMOKE_TASKS if task.horizon == "short"][:2] + [
+        task for task in SMOKE_TASKS if task.horizon == "long"
+    ]
+
+    def flaky_on_long(task, seed):
+        if task.horizon == "long" and seed == 9176:
+            def policy(messages):
+                raise RuntimeError("model server went away")
+            return policy
+        return policies.gold(task, seed)
+
+    steady = evaluation.evaluate(trio, policies.gold, label="steady", attempts_per_task=2)
+    flaky = evaluation.evaluate(trio, flaky_on_long, label="flaky", attempts_per_task=2)
+    comparison = evaluation.compare(steady, flaky)
+    assert comparison["deltas"]["episode_success"] == 0.0
+    check = {check.name: check for check in evaluation.gate(comparison)}["task_horizon_no_worse"]
+    assert check.passed is False
+    assert "attempt counts differ" in check.detail
+
+    # Reports that predate the label are reported as unmeasured, not failed;
+    # reports that label a shared task differently are a changed suite.
+    unlabelled = evaluation.EvaluationReport.from_dict({
+        **baseline.as_dict(),
+        "attempts": [{**row, "task_horizon": ""} for row in baseline.as_dict()["attempts"]],
+    })
+    check = {check.name: check for check in evaluation.gate(evaluation.compare(unlabelled, baseline))}["task_horizon_no_worse"]
+    assert check.passed is True and "not measured" in check.detail
+    relabelled = evaluation.EvaluationReport.from_dict({
+        **baseline.as_dict(),
+        "attempts": [{**row, "task_horizon": "short"} for row in baseline.as_dict()["attempts"]],
+    })
+    check = {check.name: check for check in evaluation.gate(evaluation.compare(baseline, relabelled))}["task_horizon_no_worse"]
+    assert check.passed is False and "labels disagree" in check.detail
 
 
 def test_comparing_reports_with_no_shared_tasks_is_an_error():

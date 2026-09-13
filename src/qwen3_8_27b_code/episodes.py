@@ -76,8 +76,12 @@ class Policy(Protocol):
 
 @dataclass(frozen=True)
 class EpisodeBudget:
-    tool_calls: int = 10
-    wall_seconds: float = 480.0
+    """Ceilings, not targets: the long band of docs/evaluation.md runs to
+    30 tool calls, and a budget below it excludes long-horizon tasks by
+    construction rather than measuring them."""
+
+    tool_calls: int = 30
+    wall_seconds: float = 900.0
 
 
 @dataclass
@@ -94,6 +98,11 @@ class Episode:
     turns: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # The largest prompt any turn was generated from: the context the
+    # episode actually needed. Every think block after the user's request
+    # stays in context for the rest of the episode, so this is where
+    # thinking and horizon meet, and where compaction becomes necessary.
+    peak_prompt_tokens: int = 0
     wall_seconds: float = 0.0
     # Thinking budget. Tokens come from the policy (see TurnResult); the
     # character count is always available and is the CPU-side proxy. Both
@@ -137,6 +146,7 @@ class Episode:
     def usage(self) -> dict:
         return {
             "prompt_tokens": self.prompt_tokens,
+            "peak_prompt_tokens": self.peak_prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "reasoning_chars": self.reasoning_chars,
@@ -191,6 +201,7 @@ def run_episode(
 
         episode.turns += 1
         episode.prompt_tokens += turn.prompt_tokens
+        episode.peak_prompt_tokens = max(episode.peak_prompt_tokens, turn.prompt_tokens)
         episode.completion_tokens += turn.completion_tokens
         if turn.reasoning_tokens is not None:
             episode.reasoning_tokens += turn.reasoning_tokens

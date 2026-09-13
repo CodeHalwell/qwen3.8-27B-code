@@ -53,6 +53,13 @@ class Attempt:
     verdict: Verdict
     rejection: str | None = None
     policy: str = ""
+    # The effort the policy ran at. Rows and pairs render under this label,
+    # so the instruction the reasoning was written under is the one it is
+    # trained under; never relabel it.
+    reasoning_effort: str = "medium"
+    # The band the task was designed for (AgentTask.horizon), so attempts
+    # and rows keep it and a corpus report can say how much is long-horizon.
+    task_horizon: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -73,6 +80,8 @@ class Attempt:
             "task_id": self.task_id,
             "seed": self.seed,
             "policy": self.policy,
+            "reasoning_effort": self.reasoning_effort,
+            "task_horizon": self.task_horizon,
             "termination": self.episode.termination,
             "succeeded": self.verdict.succeeded,
             "rejection": self.rejection,
@@ -91,6 +100,8 @@ class Attempt:
             "family": self.family,
             "seed": self.seed,
             "policy": self.policy,
+            "reasoning_effort": self.reasoning_effort,
+            "task_horizon": self.task_horizon,
             "rejection": self.rejection,
             "episode": {
                 "messages": self.episode.messages,
@@ -102,6 +113,7 @@ class Attempt:
                 "tool_errors": self.episode.tool_errors,
                 "turns": self.episode.turns,
                 "prompt_tokens": self.episode.prompt_tokens,
+                "peak_prompt_tokens": self.episode.peak_prompt_tokens,
                 "completion_tokens": self.episode.completion_tokens,
                 "wall_seconds": self.episode.wall_seconds,
                 "reasoning_tokens": self.episode.reasoning_tokens,
@@ -124,10 +136,12 @@ class Attempt:
             task_id=payload["task_id"],
             family=payload["family"],
             seed=payload["seed"],
-            episode=Episode(**payload["episode"]),
+            episode=Episode(**{"peak_prompt_tokens": 0, **payload["episode"]}),
             verdict=Verdict(**payload["verdict"]),
             rejection=payload.get("rejection"),
             policy=payload.get("policy", ""),
+            reasoning_effort=payload.get("reasoning_effort", "medium"),
+            task_horizon=payload.get("task_horizon", ""),
         )
 
 
@@ -197,6 +211,7 @@ def build_row(
         },
         "provenance": {
             "task_id": task.task_id,
+            "task_horizon": task.horizon,
             "seed": attempt.seed,
             "policy": attempt.policy,
             "collector_version": COLLECTOR_VERSION,
@@ -287,6 +302,14 @@ class CollectionResult:
                 1 for row in self.rows if row["verification"]["hidden_verified"]
             ),
             "task_success_rate": success_rate,
+            # By the band each task was designed for (docs/evaluation.md), so
+            # the corpus says how much of it is long-horizon.
+            "rows_by_task_horizon": dict(sorted(Counter(
+                row["provenance"].get("task_horizon") or "unlabelled" for row in self.rows
+            ).items())),
+            "attempts_by_task_horizon": dict(sorted(Counter(
+                attempt.task_horizon or "unlabelled" for attempt in scored
+            ).items())),
             # docs/data-strategy.md difficulty ladder: only the learnable band
             # is useful for the preference and RL curriculum.
             "difficulty_bands": dict(sorted(Counter(
@@ -364,6 +387,8 @@ def collect(
                 verdict=verdict,
                 rejection=rejection_reason(episode, verdict),
                 policy=policy_label,
+                reasoning_effort=reasoning_effort,
+                task_horizon=task.horizon,
             )
             result.attempts.append(attempt)
             if attempt.accepted:

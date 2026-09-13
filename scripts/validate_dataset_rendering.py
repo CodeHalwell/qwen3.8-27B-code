@@ -87,13 +87,14 @@ def validate_preferences(tokenizer, corpus_path: Path) -> dict:
     completion_lengths = []
     for pair in pairs:
         prompt = canonical_to_qwen(pair["prompt_messages"])
+        effort = pair.get("reasoning_effort") or "medium"
         prompt_text = tokenizer.apply_chat_template(
             prompt,
             tools=TOOLS,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=True,
-            reasoning_effort="medium",
+            reasoning_effort=effort,
         )
         for key in ("chosen_message", "rejected_message"):
             full = tokenizer.apply_chat_template(
@@ -102,7 +103,7 @@ def validate_preferences(tokenizer, corpus_path: Path) -> dict:
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=True,
-                reasoning_effort="medium",
+                reasoning_effort=effort,
                 preserve_thinking=True,
             )
             assert full.startswith(prompt_text), f"{pair['id']}: template prefix drift on {key}"

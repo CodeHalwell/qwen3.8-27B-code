@@ -31,12 +31,47 @@ def _fix_patch(task: AgentTask) -> str:
 def gold(task: AgentTask, seed: int) -> Policy:
     """Inspect, patch minimally, verify, report. The behaviour being taught.
 
-    On a multi-file task the inspection is correspondingly wider: list the
+    On a two-module task the inspection is correspondingly wider: list the
     repository, read the tests and every module the fix touches, then patch
-    once. That is the medium-horizon shape a real policy has to produce.
+    once. That is the medium-horizon shape a real policy has to produce. On
+    a pipeline of three or more stages the repair is one stage at a time, in
+    the order the task lists them (upstream first), re-running the suite
+    after each fix: the long-horizon shape.
     """
     del seed
     changed = sorted(task.gold_files)
+    if len(changed) >= 3:
+        # A pipeline with several broken stages is repaired one stage at a
+        # time, re-running the suite after each fix: the long-band shape of
+        # docs/evaluation.md, where the failure count falling after every
+        # verification is the evidence the agent has to read and act on.
+        # Stages go in the order the builder lists them, which is upstream
+        # first; sorting by filename would reorder them with each variant's
+        # module names.
+        stages = list(task.gold_files)
+        turns = [
+            tool_call_text("list_files", {"path": "."}, "Several stages may be involved; I should see the layout first."),
+            *[
+                tool_call_text("read_file", {"path": path}, f"The tests in {path} say what each stage must satisfy.")
+                for path in task.test_paths
+            ],
+        ]
+        for path in stages:
+            turns.extend([
+                tool_call_text("read_file", {"path": path}, f"I should read {path} before changing it."),
+                tool_call_text(
+                    "apply_patch",
+                    {"patch": unified_patch(path, task.files[path], task.gold_files[path])},
+                    f"The defect in {path} is local; I should correct it in place.",
+                ),
+                tool_call_text(
+                    "run_tests",
+                    {"profile": "unit"},
+                    "Re-running the suite shows whether this stage is fixed and what remains.",
+                ),
+            ])
+        turns.append(answer_text("Repaired every stage of the pipeline and verified the suite is green."))
+        return scripted_policy(turns)
     if len(changed) > 1:
         inspection = [
             tool_call_text("list_files", {"path": "."}, "Several modules may be involved; I should see the layout first."),

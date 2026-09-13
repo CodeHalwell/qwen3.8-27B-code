@@ -58,6 +58,11 @@ class AttemptRecord:
     reasoning_chars: int = 0
     reasoning_tokens_reported: bool = False
     thinking_overrun: bool = False
+    # Long horizon. The task's designed band is fixed per task, so success
+    # per band can be compared between two policies; the band by calls made
+    # (horizon_band) moves with the policy and stays a diagnostic.
+    task_horizon: str = ""
+    peak_prompt_tokens: int = 0
 
     @property
     def unsupported_success_claim(self) -> bool:
@@ -110,6 +115,27 @@ class EvaluationReport:
             outcomes.setdefault(record.task_id, []).append(record.succeeded)
         return dict(sorted(outcomes.items()))
 
+    def task_horizons(self) -> dict[str, str]:
+        """Designed band per task; empty where a report predates the label."""
+        horizons: dict[str, str] = {}
+        for record in self.records:
+            horizons.setdefault(record.task_id, record.task_horizon)
+        return dict(sorted(horizons.items()))
+
+    def attempt_signature(self, scored_only: bool = True) -> tuple[tuple[str, int], ...]:
+        """The (task, seed) samples a report's numbers are computed from.
+
+        Only scored attempts count by default: an attempt lost to the
+        harness is excluded from every rate, so two reports that attempted
+        the same samples but scored different ones are not the same
+        experiment, and the ladder refuses to rank them. Success computed
+        from different samples would let sampling variation, or a lost
+        attempt, pick the effort. ``scored_only=False`` gives what was
+        attempted, for reporting.
+        """
+        records = self.scored if scored_only else self.records
+        return tuple(sorted((record.task_id, record.seed) for record in records))
+
     def scorecard(self) -> dict:
         scored = self.scored
         total = len(scored)
@@ -137,6 +163,13 @@ class EvaluationReport:
         success_by_horizon = {
             band: _rate(sum(1 for r in scored if r.horizon_band == band and r.succeeded), count)
             for band, count in sorted(bands.items())
+        }
+        task_bands = Counter(record.task_horizon or "unlabelled" for record in scored)
+        success_by_task_horizon = {
+            band: _rate(
+                sum(1 for r in scored if (r.task_horizon or "unlabelled") == band and r.succeeded), count
+            )
+            for band, count in sorted(task_bands.items())
         }
 
         return {
@@ -166,9 +199,18 @@ class EvaluationReport:
                 if reasoning_measured and total_completion else 0.0
             ),
             "thinking_overrun_rate": _rate(sum(r.thinking_overrun for r in scored), total),
-            # Long-horizon bands, by tool calls made.
+            # Long-horizon bands, by tool calls made (diagnostic) and by the
+            # band each task was designed for (gated).
             "horizon_bands": dict(sorted(bands.items())),
             "success_by_horizon": success_by_horizon,
+            "task_horizon_bands": dict(sorted(task_bands.items())),
+            "success_by_task_horizon": success_by_task_horizon,
+            # Context: the largest prompt any turn needed, and how often an
+            # episode ended because the window ran out.
+            "peak_prompt_tokens_max": max((r.peak_prompt_tokens for r in scored), default=0),
+            "context_budget_rate": _rate(
+                sum(1 for r in scored if r.termination == "context_budget"), total
+            ),
             "terminations": dict(sorted(Counter(r.termination for r in self.records).items())),
             "mean_episode_seconds": round(
                 statistics.mean([r.wall_seconds for r in self.records]), 3
@@ -247,6 +289,8 @@ def _record(task: AgentTask, seed: int, episode: Episode, verdict: Verdict) -> A
         reasoning_chars=episode.reasoning_chars,
         reasoning_tokens_reported=episode.reasoning_tokens_reported,
         thinking_overrun=episode.thinking_overrun,
+        task_horizon=task.horizon,
+        peak_prompt_tokens=episode.peak_prompt_tokens,
     )
 
 
@@ -265,6 +309,8 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
     if not shared:
         raise ValueError("The two reports share no tasks; they cannot be compared.")
 
+    baseline_horizons = baseline.task_horizons()
+    candidate_horizons = candidate.task_horizons()
     paired = {}
     wins = losses = ties = 0
     for task_id in shared:
@@ -275,6 +321,8 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
             "baseline_attempts": len(baseline_outcomes[task_id]),
             "candidate_successes": after,
             "candidate_attempts": len(candidate_outcomes[task_id]),
+            "baseline_task_horizon": baseline_horizons.get(task_id, ""),
+            "candidate_task_horizon": candidate_horizons.get(task_id, ""),
         }
         if after > before:
             wins += 1
@@ -297,6 +345,7 @@ def compare(baseline: EvaluationReport, candidate: EvaluationReport) -> dict:
             "thinking_overrun_rate",
             "reasoning_chars_per_turn",
             "reasoning_tokens_per_turn",
+            "context_budget_rate",
         )
     }
     return {
@@ -343,6 +392,10 @@ def thinking_comparison(before_card: dict, after_card: dict) -> dict:
         "candidate_reasoning_share": after_card["reasoning_share_of_completion"],
         "baseline_success_by_horizon": before_card["success_by_horizon"],
         "candidate_success_by_horizon": after_card["success_by_horizon"],
+        "baseline_success_by_task_horizon": before_card["success_by_task_horizon"],
+        "candidate_success_by_task_horizon": after_card["success_by_task_horizon"],
+        "baseline_peak_prompt_tokens_max": before_card["peak_prompt_tokens_max"],
+        "candidate_peak_prompt_tokens_max": after_card["peak_prompt_tokens_max"],
     }
 
 
@@ -405,10 +458,74 @@ def gate(
             deltas["thinking_overrun_rate"] <= 0.0,
             f"turns cut off inside the think block: rate delta {deltas['thinking_overrun_rate']:+.4f}",
         ),
+        task_horizon_check(comparison),
     ]
     if max_reasoning_growth is not None:
         checks.append(thinking_budget_check(comparison, max_reasoning_growth))
     return checks
+
+
+def task_horizon_check(comparison: dict) -> GateCheck:
+    """Success may not fall in any horizon band the tasks were designed for.
+
+    The aggregate can hold while the long tasks are lost: a policy taught to
+    think less on three-call fixes may stop inspecting enough on seventeen-
+    call pipelines. The bands are computed here from the paired tasks, so
+    both sides are the same tasks by construction; a report that scored
+    tasks the other did not (a narrower suite, or a band lost entirely to
+    infrastructure failures) fails the check rather than slipping past it,
+    and so do two reports that label a shared task with different bands or
+    scored it a different number of times: an attempt lost to the harness
+    leaves the success rate intact and the coverage hollow, and the check
+    refuses to compare hollow coverage rather than silently accepting it.
+    """
+    name = "task_horizon_no_worse"
+    unmatched = list(comparison.get("only_in_baseline", [])) + list(comparison.get("only_in_candidate", []))
+    if unmatched:
+        return GateCheck(
+            name,
+            False,
+            "task membership differs, so bands cannot be compared: "
+            f"only in baseline {sorted(comparison.get('only_in_baseline', []))}, "
+            f"only in candidate {sorted(comparison.get('only_in_candidate', []))}",
+        )
+    paired = comparison["paired_tasks"]
+    before_labels = {task_id: entry.get("baseline_task_horizon", "") for task_id, entry in paired.items()}
+    after_labels = {task_id: entry.get("candidate_task_horizon", "") for task_id, entry in paired.items()}
+    if not any(before_labels.values()) or not any(after_labels.values()):
+        return GateCheck(name, True, "not measured: at least one report carries no task horizons")
+    disagreements = sorted(task_id for task_id in paired if before_labels[task_id] != after_labels[task_id])
+    if disagreements:
+        return GateCheck(name, False, f"horizon labels disagree between the reports for {disagreements}")
+    uneven = sorted(
+        task_id for task_id, entry in paired.items()
+        if entry["baseline_attempts"] != entry["candidate_attempts"]
+    )
+    if uneven:
+        return GateCheck(
+            name,
+            False,
+            "scored attempt counts differ per task, so a band could be hollowed out by "
+            f"infrastructure failures on one side: {uneven}",
+        )
+
+    def band_rate(side: str) -> dict[str, float]:
+        successes: Counter = Counter()
+        attempts: Counter = Counter()
+        for task_id, entry in paired.items():
+            band = before_labels[task_id] or "unlabelled"
+            successes[band] += entry[f"{side}_successes"]
+            attempts[band] += entry[f"{side}_attempts"]
+        return {band: _rate(successes[band], attempts[band]) for band in sorted(attempts)}
+
+    before, after = band_rate("baseline"), band_rate("candidate")
+    dropped = [f"{band} {before[band]:.2f}->{after[band]:.2f}" for band in before if after[band] < before[band]]
+    held = ", ".join(f"{band} {before[band]:.2f}->{after[band]:.2f}" for band in before)
+    return GateCheck(
+        name,
+        not dropped,
+        f"success fell in band(s): {'; '.join(dropped)}" if dropped else f"no band fell: {held}",
+    )
 
 
 def thinking_budget_check(comparison: dict, max_reasoning_growth: float) -> GateCheck:
@@ -432,6 +549,102 @@ def thinking_budget_check(comparison: dict, max_reasoning_growth: float) -> Gate
 
 def gate_passed(checks: list[GateCheck]) -> bool:
     return all(check.passed for check in checks)
+
+
+EFFORT_ORDER = ("low", "medium", "xhigh")
+
+
+def effort_ladder(reports: dict[str, EvaluationReport], success_tolerance: float = 0.0) -> dict:
+    """Tabulate the effort ladder of docs/thinking-budget.md and pick a deployment effort.
+
+    ``reports`` maps an effort label to the held-out report scored at that
+    effort with the same policy on the same tasks, attempts and seeds, none
+    of them lost to the harness. A
+    rung is eligible when its episode success is within ``success_tolerance``
+    of the best rung both in aggregate and in every designed horizon band,
+    so a cheaper rung that trades the pipeline tasks for an extra short one
+    is never recommended. Among the eligible rungs the recommendation is the
+    one that thinks least; a tie goes to the lower overrun rate, then to the
+    lower effort. When no rung keeps every band, ``recommended`` is None and
+    the rungs have to be read by band. It chooses the dial setting for
+    deployment and for the gate baseline; the training levers in
+    thinking-budget.md are what move the model.
+    """
+    if not reports:
+        raise ValueError("an effort ladder needs at least one report")
+    unknown = sorted(set(reports) - set(EFFORT_ORDER))
+    if unknown:
+        raise ValueError(f"unknown reasoning effort(s) {unknown}; the template accepts {EFFORT_ORDER}")
+    signatures = {effort: report.attempt_signature() for effort, report in reports.items()}
+    if len(set(signatures.values())) != 1:
+        lost = {
+            effort: len(report.records) - len(report.scored)
+            for effort, report in reports.items()
+            if len(report.records) != len(report.scored)
+        }
+        raise ValueError(
+            "every rung of the ladder must score the same tasks with the same attempts and seeds; "
+            "success from unequal samples would let sampling variation pick the effort"
+            + (f" (attempts lost to infrastructure failures, re-run them: {lost})" if lost else "")
+        )
+
+    rungs = {}
+    for effort in EFFORT_ORDER:
+        if effort not in reports:
+            continue
+        card = reports[effort].scorecard()
+        rungs[effort] = {
+            "label": card["label"],
+            "scored_attempts": card["scored_attempts"],
+            "infrastructure_failures": card["infrastructure_failures"],
+            "episode_success": card["episode_success"],
+            "reasoning_tokens_reported": card["reasoning_tokens_reported"],
+            "reasoning_tokens_per_turn": card["reasoning_tokens_per_turn"],
+            "reasoning_chars_per_turn": card["reasoning_chars_per_turn"],
+            "thinking_overrun_rate": card["thinking_overrun_rate"],
+            "context_budget_rate": card["context_budget_rate"],
+            "peak_prompt_tokens_max": card["peak_prompt_tokens_max"],
+            "success_by_task_horizon": card["success_by_task_horizon"],
+        }
+    unit = "tokens" if all(rung["reasoning_tokens_reported"] for rung in rungs.values()) else "chars"
+    best = max(rung["episode_success"] for rung in rungs.values())
+    bands = sorted({band for rung in rungs.values() for band in rung["success_by_task_horizon"]})
+    best_by_band = {
+        band: max(rung["success_by_task_horizon"].get(band, 0.0) for rung in rungs.values()) for band in bands
+    }
+
+    def keeps_every_band(rung: dict) -> bool:
+        return all(
+            rung["success_by_task_horizon"].get(band, 0.0) >= best_by_band[band] - success_tolerance
+            for band in bands
+        )
+
+    eligible = [
+        effort
+        for effort, rung in rungs.items()
+        if rung["episode_success"] >= best - success_tolerance and keeps_every_band(rung)
+    ]
+    recommended = min(
+        eligible,
+        key=lambda effort: (
+            rungs[effort][f"reasoning_{unit}_per_turn"],
+            rungs[effort]["thinking_overrun_rate"],
+            EFFORT_ORDER.index(effort),
+        ),
+    ) if eligible else None
+    return {
+        "unit": unit,
+        "best_success": best,
+        "best_success_by_band": best_by_band,
+        "success_tolerance": success_tolerance,
+        "rungs": rungs,
+        "eligible": eligible,
+        "recommended": recommended,
+        "note": (
+            None if recommended is not None else
+            "no rung keeps every designed band within the tolerance; nothing is recommended, read the rungs by band"
+        ),
+    }
 
 
 def write_report(report: EvaluationReport, path: Path) -> dict:

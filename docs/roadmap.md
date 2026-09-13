@@ -89,7 +89,9 @@ Exit criteria:
 Deliverables:
 
 - Tiny overfit/plumbing run.
-- Main BF16-LoRA run at 8K.
+- Main BF16-LoRA run at 8K, with long-band rows (the pipeline family and
+  its real-repository successors) in the mixture and per-turn slices for
+  trajectories beyond the window.
 - Rank/learning-rate comparison only if the first run leaves a clear question.
 - Accepted adapter and merged BF16 candidate.
 
@@ -99,6 +101,7 @@ Exit criteria:
 - Vision parameters remained frozen.
 - Tool-call validity and held-out coding did not regress.
 - Reasoning tokens per turn stayed within the thinking-budget ceiling.
+- No designed horizon band lost success.
 
 ## Milestone 4: preferences
 
@@ -106,7 +109,8 @@ Deliverables:
 
 - Candidate generation from the accepted SFT policy.
 - Execution-derived chosen/rejected pairs.
-- Reasoning-length pairs from the collection, as a minority of the mixture.
+- Reasoning-length pairs from the collection, as a minority of the mixture
+  (capped in notebook 04, each pair rendered at its own effort).
 - DPO configuration sweep with memory profiling.
 - Accepted or explicitly rejected preference checkpoint.
 
@@ -188,7 +192,7 @@ src/qwen3_8_27b_code/
   collection.py                  # attempt filtering and the corpus report
   evaluation.py                  # scorecard, paired comparison, gate
   policies.py                    # scripted policies incl. reward-hack fixtures
-  long_horizon.py                # multi-file training and held-out families (medium band)
+  long_horizon.py                # multi-file training and held-out families (medium and long bands)
   thinking.py                    # thinking budget: selection, length pairs, brevity reward
   teachers.py                    # OpenAI-compatible teacher policy for distillation
   distillation.py                # verified-versus-failed outcome pairs across policies

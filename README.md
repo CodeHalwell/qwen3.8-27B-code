@@ -5,7 +5,10 @@ agentic reinforcement learning and low-bit deployment of Qwen3.8-27B for
 long-horizon software-engineering work.
 
 Training is intended to run in a Google Colab notebook on a G4 runtime with an
-NVIDIA RTX PRO 6000 Blackwell Server Edition GPU and 96 GB VRAM.
+NVIDIA RTX PRO 6000 Blackwell Server Edition GPU and 96 GB VRAM. A free Kaggle
+T4 x2 kernel can run the 4-bit plumbing lane described in
+[docs/model-and-hardware.md](docs/model-and-hardware.md#second-lane-kaggle-t4-x2);
+it cannot run the capability stages.
 
 Start with:
 
@@ -39,6 +42,8 @@ verified trajectories from a real policy, with:
 uv run --group dev python scripts/evaluate_agent.py run --policy gold --out reports/candidate.json
 uv run --group dev python scripts/evaluate_agent.py compare reports/baseline.json reports/candidate.json
 uv run --group dev python scripts/collect_trajectories.py --policy gold --attempts 3
+uv run --group dev python scripts/evaluate_agent.py ladder \
+    low=reports/ladder_low.json medium=reports/ladder_medium.json xhigh=reports/ladder_xhigh.json
 ```
 
 The `gold` policy is a scripted stand-in that exercises the whole path on CPU.
@@ -47,7 +52,12 @@ comparison exits non-zero when the gate fails.
 
 The gate checks quality first and then the thinking budget: a candidate may
 not spend more than 10% more reasoning tokens per turn than the baseline
-(`--max-reasoning-growth`), and its thinking-overrun rate may not rise.
+(`--max-reasoning-growth`), its thinking-overrun rate may not rise, and its
+success may not fall in any horizon band the tasks were designed for (the
+held-out suite has short, medium and long tasks, the long ones being
+four-stage pipelines repaired a stage at a time). The `ladder` command
+tabulates the stock model at `low`, `medium` and `xhigh` and recommends the
+cheapest effort that keeps the best success.
 Collection keeps, of the attempts that verified, the ones that reasoned least,
 samples the multi-file training families as well as the single-file fixtures,
 and writes reasoning-length preference pairs beside the corpus. See

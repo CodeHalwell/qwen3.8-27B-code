@@ -56,6 +56,15 @@ checkpoint:
 Start with `int4` or `fp8-int4`. QAT adds training complexity and is accepted
 only if it measurably improves repository-agent success over ordinary PTQ.
 
+Whatever the scheme, start from the tensors Unsloth already declines to
+quantise in its own 4-bit build of this checkpoint: `lm_head`, the vision
+tower and the Gated DeltaNet `in_proj_qkv`, `in_proj_a` and `in_proj_b`
+projections stay in 16-bit there (`llm_int8_skip_modules` in
+`unsloth/Qwen3.8-27B-unsloth-bnb-4bit`). Apply fake quantisation to the
+other language linears only, and treat a recipe that quantises those
+tensors as a separate experiment with its own gate. The DeltaNet recurrent
+state is float32 by configuration and is not a quantisation target at all.
+
 ## Branch B: Dynamic GGUF
 
 Produce a ladder from the same BF16 model:
@@ -83,6 +92,12 @@ The importance-matrix corpus should represent deployment traffic:
 
 Do not calibrate only on Wikipedia or generic chat if the target is coding
 agency.
+
+Dynamic quantisation is selective by design, so start the ladder with the
+same tensors at higher precision that Unsloth's 4-bit build keeps in
+16-bit (`lm_head` and the DeltaNet input projections, see Branch A), and let
+the long-horizon evaluation, not the file size, decide whether any of them
+can go lower.
 
 ## Format targets
 

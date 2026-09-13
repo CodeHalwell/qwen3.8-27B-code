@@ -25,6 +25,44 @@ dataset.
 Before implementing this full sequence, complete the deliberately reduced
 [Minimum path to Experiment 1](minimum-path.md).
 
+## What decides the outcome
+
+The stock model already posts strong agentic-coding scores (see the
+[published baseline](model-and-hardware.md#published-coding-baseline)), so the
+question is not whether this pipeline can train, it is whether it can move a
+model that good without breaking it. Three things decide that, in this order,
+and none of them is a hyperparameter:
+
+1. **Task supply at real-repository scale.** The bootstrap corpus is 204
+   scripted trajectories over twelve toy fixture families, 233K tokens in
+   total. It proves plumbing. A main SFT that changes the behaviour of a 27B
+   model needs verified trajectories from real repositories in the thousands,
+   and tens of millions of assistant tokens, before the rank or the learning
+   rate matter. The teacher route (notebook 08) and the collector are the
+   machinery; resolvable real-repository tasks with executable tests are the
+   missing input, and they are the next item of work.
+2. **Sequence length policy.** Real trajectories run to 8K-32K tokens once
+   tool output is in the transcript, and right truncation at 4K or 8K cuts
+   the patch and the verification off exactly the rows that carry the most
+   signal. Raise the window to 16K first, which the
+   [logit memory](model-and-hardware.md#logit-memory) arithmetic makes
+   conditional on the chunked loss. For trajectories that still do not fit,
+   slice at assistant-turn boundaries into examples whose context is the
+   compacted preceding history, with loss on that one turn only, rather than
+   truncating from the right; accept the multiplied prefix cost for those
+   rows alone. The long-horizon band then stops being excluded from training
+   by construction; the [long-horizon requirements](#long-horizon) below
+   are what make that exclusion measurable in the meantime.
+3. **An external gate.** The held-out suite is nine families across the
+   short, medium and long bands. It detects
+   regression and protocol damage; it cannot support a claim about coding
+   ability in general. Before any checkpoint is called an improvement, score
+   a contamination-aware external slice (SWE-bench Verified through the
+   official harness, or Terminal-Bench) against a served checkpoint, as
+   [Evaluation](evaluation.md#3-repository-tasks) describes.
+
+Everything else in this plan is in service of those three.
+
 ## Colab execution contract
 
 The notebook runs on an ephemeral Google Colab G4 session. Every training stage
@@ -42,6 +80,62 @@ must therefore:
 Notebook cells should be idempotent: rerunning setup, data validation or resume
 cells must not silently create a different experiment.
 
+## Hardware lanes
+
+| Lane | Hardware | Runs | Does not run |
+| --- | --- | --- | --- |
+| Capability | Colab G4, RTX PRO 6000 Blackwell, 96 GB, BF16 LoRA | Every stage below, every gate, every number that is compared | Nothing is excluded |
+| Plumbing | Kaggle T4 x2, 2 x 16 GB, 4-bit QLoRA, 1,024-2,048 tokens | Notebook 00's template and masking checks, adapter save and reload, tool-parser and harness fixtures, `DEMO_MODE` smoke steps | Any run whose loss, memory, speed or held-out result will be quoted |
+
+The plumbing lane follows Unsloth's own Qwen3.8-27B notebook
+(`references/qwen3_8_27b_kaggle_t4x2.py`), and its rules are not negotiable
+there: 4-bit load, no `dtype` or `fp16` flags (the DeltaNet path produces
+NaN gradients in pure float16 and a T4 has no bfloat16), `device_map` left at
+Unsloth's sequential default, device batch 1 with gradient accumulation,
+rank 8, and no merge on the kernel. The measured budget and the reasons are
+in [Model and hardware](model-and-hardware.md#second-lane-kaggle-t4-x2). A
+row that renders, masks and trains for two steps there has proved the data
+path; it has proved nothing about the model, and the gates stay on the G4.
+
+## Long horizon
+
+The deliverable is a long-horizon agent, so the long band is a requirement
+at every stage rather than a later curriculum step:
+
+- **Budgets are ceilings sized for the band.** Every episode, collected or
+  evaluated, runs with 30 tool calls and 15 minutes (`EpisodeBudget`, the
+  scripts, and notebooks 01, 07 and 08). A budget of ten excluded the long
+  band by construction: the gold path through a four-stage pipeline is
+  seventeen calls.
+- **Both suites carry the band.** The training suite has a four-stage
+  pipeline family (`readings_pipeline`) and the held-out suite another
+  (`invoice_pipeline`), each with one defect per stage and a test file per
+  stage, so the suite goes green only when every stage is fixed and a
+  policy that repairs a stage and re-runs the tests watches the failure
+  count fall. Every task records the band it was designed for
+  (`AgentTask.horizon`), and the scorecard reports success per designed
+  band (`success_by_task_horizon`) next to the band by calls actually made.
+- **The gate reads the bands.** `task_horizon_no_worse` fails a candidate
+  whose success falls in any designed band, whatever the aggregate does.
+  It is the check that stops a brevity lever from being paid for with the
+  pipeline tasks.
+- **Thinking is a context cost.** Every think block after the request stays
+  in context for the rest of the episode (the template facts in
+  [Model and hardware](model-and-hardware.md#native-conversation-behaviour)),
+  so thirty turns at 2K reasoning tokens each is 60K tokens of think blocks
+  before a single observation. The scorecard records
+  `peak_prompt_tokens_max` and `context_budget_rate`; when they climb
+  towards the window, the levers are less reasoning per turn first and
+  observation compaction second.
+- **Compaction waits for per-turn views.** Folding old observations changes
+  what the model saw at every earlier turn, so a full-trajectory SFT row
+  rendered from a compacted transcript would supervise decisions on
+  evidence the model no longer has. Compaction lands together with the
+  per-turn training examples of item 2 above, not before.
+- **Evaluate at the window the agent will run in.** Notebooks 01 and 07
+  evaluate at 32,768 tokens. SFT at 8K or 16K trains on the rows that fit,
+  and per-turn slicing is what admits the rest.
+
 ## Stage 0: upstream baseline
 
 Run the stock trainable checkpoint and at least one published GGUF in the same
@@ -56,6 +150,28 @@ harness. Capture:
 - success and reasoning tokens per turn at `low`, `medium` and `xhigh`
   reasoning effort, the effort ladder of [Thinking budget](thinking-budget.md).
 
+Give each rung of the effort ladder its own per-turn generation cap.
+Reasoning tokens count against `max_new_tokens`, and a turn cut off inside
+its think block returns no action, so one cap sized for `medium` turns the
+`xhigh` rung into a measurement of truncation rather than of effort.
+Notebook 07 carries `MAX_NEW_TOKENS_BY_EFFORT` (2,048, 4,096 and 8,192 to
+start) and a 32,768-token window; measure the p95 reasoning length per
+effort on a few tasks first and set each cap above it. `medium` renders no
+instruction at all, so that rung measures the model's uninstructed
+behaviour.
+
+The ladder is then a decision, not only a table. `evaluation.effort_ladder()`
+(notebook 07's `RUN_EFFORT_LADDER`, or `scripts/evaluate_agent.py ladder`)
+takes the three reports, scored on the same tasks, attempts and seeds with
+none lost to the harness, and
+recommends the rung that thinks least among those whose success matches
+the best rung within a frozen tolerance, in aggregate and in every designed
+horizon band, ties going to the lower overrun rate. That rung becomes the
+deployment default
+and the frozen baseline the gate compares against, so every later claim of
+thinking less is measured from the cheapest setting the stock model already
+supports rather than from `xhigh`.
+
 Freeze this result and the exact harness version. It is the comparison point
 for every later claim.
 
@@ -63,7 +179,9 @@ for every later claim.
 
 Use a small, audited dataset to prove the complete path:
 
-1. Load the pinned BF16 Unsloth checkpoint.
+1. Load the pinned BF16 Unsloth checkpoint, recording the loader class and
+   whether it returned a processor (preflight item 3 in
+   [Model and hardware](model-and-hardware.md#preflight-checks)).
 2. Freeze vision parameters.
 3. Discover and attach LoRA to language linear modules.
 4. Render native multi-turn tool conversations.
@@ -83,23 +201,30 @@ Starting configuration:
 | Setting | Initial value | Notes |
 | --- | --- | --- |
 | Base model | `unsloth/Qwen3.8-27B` | Pin Hub revision |
-| Precision | BF16 LoRA | Fall back to 4-bit QLoRA after measured OOM only |
+| Loader | Preflight result; `FastModel` in Unsloth's own Qwen3.8 notebook | Returns a processor, so tokenise text by keyword and reach the inner tokenizer for bare strings |
+| Precision | BF16 LoRA | The DeltaNet recurrent state is float32 by configuration; never force float16 anywhere in the stack (NaN gradients). Fall back to 4-bit QLoRA after measured OOM only, noting that the 4-bit build keeps `lm_head` and the DeltaNet `in_proj_qkv/a/b` in 16-bit |
 | LoRA rank / alpha | 16 / 32 | Escalate to 32 / 64 as the specialisation lever once the 16 / 32 baseline passes its gate; change one axis per run |
 | LoRA dropout | 0 | Unsloth-optimised default |
 | Target | Language all-linear after module discovery | Includes the Gated DeltaNet `in_proj_qkv/z/a/b` and `out_proj`; exclude vision, MTP and `lm_head` |
-| Sequence length | 8,192 | 4,096 smoke; profile 16,384 separately |
+| Sequence length | 8,192 | 4,096 smoke; 16,384 only once the chunked loss is confirmed active, because full logits at 16K are about 38 GiB on their own ([logit memory](model-and-hardware.md#logit-memory)) |
 | Device batch | 1 | Single GPU |
 | Gradient accumulation | Tune to token budget | Report tokens/update, not only examples/update |
 | Checkpointing | Unsloth gradient checkpointing | Record peak VRAM |
+| Kernels | Fused linear-attention kernels where the pinned stack supports them | The reviewed install omits `flash-linear-attention` and `causal_conv1d`, which the adjacent Qwen3.5 example installs; record the active DeltaNet path and tokens/s either way |
 | Optimizer | 8-bit AdamW initially | Verify support with pinned stack |
-| Learning rate | Begin near `2e-5` for the main run | `2e-4` is only a short-LoRA experiment candidate |
+| Learning rate | Begin near `2e-5` for the main run | Unsloth's own notebook uses `2e-4` for a 30-step demo and says to drop to `2e-5` for long runs; sweep `2e-5`, `5e-5` and `1e-4` at smoke scale, gated on held-out success, before committing the main run |
 | Training length | Token-budgeted, at most roughly one pass initially | Stop on held-out regression |
+| Horizon mix | Short, medium and long rows in every mixture | Bucket by length; never drop the long rows to fit a window, slice them per turn instead; report tokens per designed band |
 | Loss | Assistant tokens only | Includes assistant tool calls |
 | Tracking | Trackio plus machine-readable run manifest | Required for comparable experiments |
 
-The exact loader (`FastLanguageModel` versus the current multimodal loader) and
-target module names are preflight results, not constants to copy from an older
-notebook.
+The target module names are preflight results, not constants to copy from an
+older notebook. The loader is `FastModel`, as in Unsloth's Qwen3.8 notebook:
+the suite calls it everywhere, the contract tests count its load cells, and
+`text_tokenizer_of` reaches the text tokenizer behind the processor it
+returns. That choice has not yet run on the G4; if the pinned stack refuses
+the checkpoint through it, notebook 00 is where it shows, and the fix is
+made in the generator, never in one notebook.
 
 Evaluate frequently enough to catch protocol and coding regression, but do not
 run the full repository suite every few steps. Use a small sentinel set during
@@ -138,6 +263,22 @@ as a minority next to the execution-derived pairs. The gate then reads the
 thinking check and the medium horizon band together: shorter thinking that
 costs the multi-file tasks is a regression, not a win.
 
+Every pair carries the effort its continuations were generated at
+(`reasoning_effort` on the row, set by the collector, the length-pair and
+outcome-pair builders and the bootstrap generator), and notebook 04 renders
+each pair under its own label. The template injects an instruction for
+`low` and `xhigh` and nothing for `medium`, so a `low` pair rendered at
+`medium` would lose the instruction its reasoning was written under.
+Reasoning-length pairs are built only between attempts at the same effort;
+an outcome pair between a teacher and a student may cross efforts and is
+rendered under the verified side's, with both recorded in its evidence.
+
+Notebook 04 also enforces the minority rule: `LENGTH_PAIRS_LOCAL_JSONL`
+adds the length pairs, `MAX_LENGTH_PAIR_SHARE` (one third) caps their share
+of the mixture by deterministic subsampling, length pairs with no
+correctness pairs beside them are refused, and the resulting mixture is
+written next to the run.
+
 ## Stage 4: agentic GRPO/GSPO
 
 Use online RL only for tasks with executable rewards. Begin with 2–4 samples
@@ -155,10 +296,26 @@ proven separately:
    compatible Unsloth environment performs updates; or
 3. a custom, unit-tested rollout adapter whose policy/version skew is recorded.
 
-Do not bypass the resolver with `--no-deps` and call the resulting run
-reproducible. Upstream Unsloth PR #8810 raises the TRL cap to 1.10.0 and was
-still open when last checked; once it ships, pin that revision in the install
-cell and re-run notebook 05's compatibility probe before enabling training.
+Upstream Unsloth PR #8810 raises the TRL cap to 1.10.0 and was still open on
+2026-09-12. Waiting on it is not the only route. Unsloth's own notebooks pin
+TRL past the declared cap with `--no-deps` as a matter of course: the Kaggle
+Qwen3.8 notebook does it for 0.22.2, and the GRPO reference in
+`references/notebook24f5f9a990.ipynb` runs TRL 1.9.2 against Unsloth's git
+head. That is acceptable here on one condition: it happens in a separate,
+frozen environment for notebook 05 whose full `pip freeze`, git revisions and
+compatibility-probe output are committed next to the run manifest, so the
+environment is reproducible by construction rather than by the resolver's
+blessing. A bare `--no-deps` in the reviewed core matrix, with nothing
+recorded, is still not a reproducible run. Do not enable training until the
+probe passes in that environment.
+
+Two memory facts from the same references shape the first GRPO run. GRPO's
+chunked log-softmax materialises `rows x 248,320` logits plus a float32 copy
+on whichever card holds `lm_head`, so `num_generations` and
+`max_completion_length` are the two knobs that decide whether a step fits,
+and a multi-GPU rollout needs the hidden states co-located with the head
+before the matmul. On one 96 GB card neither blocks the group sizes below,
+but record peak reserved memory per step from the first run.
 
 The reward is a named vector before it is a scalar:
 
@@ -227,9 +384,14 @@ Advance in this order:
 2. Inspect then answer without editing.
 3. Inspect, make one edit and run one test.
 4. Recover from a failed test or malformed assumption.
-5. Multi-file implementation with regression tests.
-6. Longer debugging involving repeated observation and replanning.
+5. Multi-file implementation with regression tests (the two-module families).
+6. Longer debugging involving repeated observation and replanning (the
+   four-stage pipelines: fix a stage, re-run, read what remains, repeat).
 7. Long-context repository work and context compaction.
+
+Steps 1 to 6 are represented in both suites today, so the curriculum orders
+difficulty within a mixture rather than deciding when the long band is
+allowed to exist.
 
 Increase one axis at a time: task difficulty, tool-call budget, output length or
 context length. Changing all four makes regressions difficult to diagnose.
@@ -242,6 +404,9 @@ Trackio runs should include:
 - LoRA configuration and trainable parameter count;
 - tokens per update and length-bucket distribution;
 - loss, learning rate, gradient norm and throughput;
+- a NaN/inf check on loss and gradient norm over the first steps, which is
+  where a float16 path or a broken DeltaNet kernel shows;
+- the active DeltaNet kernel path and loss implementation;
 - peak allocated/reserved VRAM;
 - validation tool-call parse rate;
 - sentinel repository success;
