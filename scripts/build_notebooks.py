@@ -329,7 +329,7 @@ TOOLS_CELL = r'''
 # Bumped from v1 when the `shell` description stopped carrying pilot status
 # text. Tool descriptions are model inputs and part of the fingerprint, so a
 # wording change is a schema change.
-TOOL_SCHEMA_VERSION = "qwen38-six-tools-v2"
+TOOL_SCHEMA_VERSION = "qwen38-six-tools-v3"
 
 TOOLS = [
     {
@@ -401,7 +401,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a command from the harness allow-list.",
+            "description": "Run one bash command in the repository; output is bounded and a non-zero exit code is reported.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -947,21 +947,29 @@ def build_01_baseline():
                     if name == "shell":
                         # The same scrubbed environment, working directory,
                         # time limit and bounded observation as run_tests;
-                        # the package twin is RepoHarness._shell.
+                        # the package twin is RepoHarness._shell. Its own
+                        # process group, so a timeout kills whatever the
+                        # command started, not only bash.
+                        import os
+                        import signal
+
+                        process = subprocess.Popen(
+                            ["bash", "-c", arguments["command"]],
+                            cwd=root,
+                            env=TASK_ENV,
+                            text=True,
+                            errors="replace",
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
                         try:
-                            result = subprocess.run(
-                                ["bash", "-c", arguments["command"]],
-                                cwd=root,
-                                env=TASK_ENV,
-                                text=True,
-                                errors="replace",
-                                capture_output=True,
-                                timeout=120,
-                            )
+                            output, _ = process.communicate(timeout=120)
                         except subprocess.TimeoutExpired:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.communicate()
                             return "[timed out after 120s]"
-                        observation = ("" if result.returncode == 0 else f"[exit code {result.returncode}]\n")
-                        observation += result.stdout + result.stderr
+                        observation = ("" if process.returncode == 0 else f"[exit code {process.returncode}]\n") + output
                         marker = "\n... [output trimmed] ...\n"
                         if len(observation) > 12_000:
                             keep = (12_000 - len(marker)) // 2
@@ -1302,6 +1310,9 @@ def build_02_data():
                 def count_tokens(text):
                     return len(tokenizer(text=text, add_special_tokens=False)["input_ids"])
 
+                # Reset on every run of this cell, so a rerun with the public
+                # sources off cannot publish the report of an earlier run.
+                public_report = None
                 if DEMO_MODE:
                     raw_dataset = Dataset.from_list(demo_rows)
                 else:
@@ -1526,7 +1537,7 @@ def build_02_data():
                     require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
-                    if globals().get("public_report"):
+                    if public_report:
                         # Which public commits and how many rows of each went
                         # in, kept beside the corpus so it can be rebuilt.
                         from huggingface_hub import HfApi
@@ -2165,26 +2176,30 @@ def build_04_dpo():
                 LEARNING_RATE = 5e-6
                 DPO_BETA = 0.1
 
-                # The commit the merged checkpoint resolves to, recorded with
-                # this adapter: notebook 03 keeps one merge on the Hub, so a
-                # later SFT run replaces this parent and, at the same time,
-                # removes this adapter's completion marker.
+                # The commit the merged checkpoint resolves to, pinned here so
+                # the marker check, the load and the manifest all name the same
+                # weights even if notebook 03 republishes meanwhile. Notebook 03
+                # keeps one merge on the Hub, so a later SFT run replaces this
+                # parent and, at the same time, removes this adapter's
+                # completion marker.
                 MERGED_SFT_COMMIT = None
                 if RUN_TRAINING and not DEMO_MODE:
                     from huggingface_hub import HfApi
 
-                    # The run manifest is uploaded last, after the weights, so it
-                    # proves the merge finished; a repo alone does not.
                     api = HfApi(token=hf_token)
-                    if not (
-                        api.repo_exists(MERGED_SFT_MODEL_ID)
-                        and api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION)
-                    ):
+                    if not api.repo_exists(MERGED_SFT_MODEL_ID):
                         raise RuntimeError(
-                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. Notebook 03 "
-                            "publishes it at the end of training; run notebook 03 to completion first."
+                            f"{MERGED_SFT_MODEL_ID} does not exist. Notebook 03 publishes it at the end of "
+                            "training; run notebook 03 to completion first."
                         )
                     MERGED_SFT_COMMIT = api.repo_info(MERGED_SFT_MODEL_ID, revision=MERGED_SFT_REVISION).sha
+                    # The run manifest is uploaded last, after the weights, so it
+                    # proves the merge finished; a repo alone does not.
+                    if not api.file_exists(MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_COMMIT):
+                        raise RuntimeError(
+                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_COMMIT[:12]} has no completed merge. Notebook 03 "
+                            "publishes it at the end of training; run notebook 03 to completion first."
+                        )
                 # The trainer creates the Hub repo when it is built, so an
                 # existing public repo is caught here, before that happens.
                 if PUSH_ADAPTER:
@@ -2234,7 +2249,7 @@ def build_04_dpo():
                 # accepted SFT policy, which is what this stage should move from.
                 model, tokenizer = FastModel.from_pretrained(
                     model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID,
-                    revision=None if DEMO_MODE else MERGED_SFT_REVISION,
+                    revision=MERGED_SFT_COMMIT,  # None in demo mode; the pinned commit otherwise
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,

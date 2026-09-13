@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -187,17 +188,23 @@ class RepoHarness:
         # The same scrubbed environment, working directory, time limit and
         # bounded observation as run_tests. run_tests already executes
         # whatever the repository and the model's patches contain, so a
-        # command here adds no exposure a test file could not.
+        # command here adds no exposure a test file could not. The command
+        # runs in its own process group so that a timeout kills whatever
+        # it started, not only bash.
+        process = subprocess.Popen(
+            ["bash", "-c", command],
+            cwd=self.root,
+            env=self.environment,
+            text=True,
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         try:
-            result = subprocess.run(
-                ["bash", "-c", command],
-                cwd=self.root,
-                env=self.environment,
-                text=True,
-                errors="replace",
-                capture_output=True,
-                timeout=SHELL_TIMEOUT_SECONDS,
-            )
+            output, _ = process.communicate(timeout=SHELL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
             return f"[timed out after {SHELL_TIMEOUT_SECONDS}s]"
-        return format_command_observation(result.returncode, result.stdout + result.stderr)
+        return format_command_observation(process.returncode, output)

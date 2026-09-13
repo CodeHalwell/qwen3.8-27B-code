@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,17 @@ def test_converted_shell_observations_match_what_the_executor_returns(tmp_path):
     assert executor.execute("shell", {"command": "printf fine"}) == "fine"
     long = executor.execute("shell", {"command": "head -c 30000 /dev/zero | tr '\\0' a"})
     assert len(long) <= harness.SHELL_OUTPUT_LIMIT and harness.TRUNCATION_MARKER in long
+
+
+def test_shell_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "SHELL_TIMEOUT_SECONDS", 1)
+    executor = harness.RepoHarness(tmp_path)
+    started = time.monotonic()
+    # The background sleep holds the output pipe; if it survived the
+    # timeout, reading the pipe would wait for it, not for the 1 s limit.
+    observed = executor.execute("shell", {"command": "sleep 30 & sleep 30"})
+    assert observed == "[timed out after 1s]"
+    assert time.monotonic() - started < 10
 
 
 def test_sources_are_pinned_and_the_report_records_the_commit(monkeypatch):
