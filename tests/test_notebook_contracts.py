@@ -1043,3 +1043,19 @@ def test_every_notebook_cell_uses_only_names_defined_earlier():
     for name, build in builders.items():
         cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
         assert undefined_notebook_names(cells) == [], f"notebook {name}"
+
+
+def test_fixture_rows_are_refused_at_publish_and_at_training():
+    """Flipping DEMO_MODE and rerunning only the publish cell once pushed
+    the two-row fixture as the corpus. The guards read the rows, not the flag."""
+    generator = load_generator()
+    publish_cell = code_cell_containing(generator.build_02_data(), "PUSH_DATASET = False")
+    assert 'str(row_id).startswith("fixture/")' in publish_cell
+    assert "if DEMO_MODE or fixture_rows:" in publish_cell
+    assert publish_cell.index("if DEMO_MODE or fixture_rows:") < publish_cell.index("require_private_repo(")
+    load_cell = code_cell_containing(generator.build_03_sft(), "loaded = load_dataset(DATASET_ID")
+    assert 'str(row_id).startswith("fixture/")' in load_cell
+    assert "Rerun notebook 02 with DEMO_MODE=False" in load_cell
+    # The fixture rows really are marked that way.
+    demo_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
+    assert demo_cell.count('"id": "fixture/') >= 2

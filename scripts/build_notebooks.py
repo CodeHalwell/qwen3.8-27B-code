@@ -1427,8 +1427,17 @@ def build_02_data():
 
                 PUSH_DATASET = False
                 if PUSH_DATASET:
-                    if DEMO_MODE:
-                        raise RuntimeError("Refusing to publish the synthetic format fixture as training data.")
+                    # The flag says what was asked for; the ids say what is in
+                    # memory. Flipping DEMO_MODE and rerunning only this cell
+                    # would otherwise publish the fixture the loading cell built.
+                    fixture_rows = sum(
+                        str(row_id).startswith("fixture/") for split in dataset_dict.values() for row_id in split["id"]
+                    )
+                    if DEMO_MODE or fixture_rows:
+                        raise RuntimeError(
+                            "Refusing to publish the synthetic format fixture as training data. "
+                            "Set DEMO_MODE=False and rerun from the loading cell so the corpus is what is in memory."
+                        )
                     require_private_repo(OUTPUT_DATASET_ID, "dataset")
                     dataset_dict.push_to_hub(OUTPUT_DATASET_ID, private=True)
                     print(f"Pushed {OUTPUT_DATASET_ID}")
@@ -1704,6 +1713,14 @@ def build_03_sft():
                         )
                     if len(loaded["train"]) == 0 or len(loaded["validation"]) == 0:
                         raise ValueError("Both train and validation splits must contain at least one repository family.")
+                    fixture_rows = sum(
+                        str(row_id).startswith("fixture/") for split in ("train", "validation") for row_id in loaded[split]["id"]
+                    )
+                    if fixture_rows:
+                        raise ValueError(
+                            f"{DATASET_ID}@{DATASET_REVISION} holds notebook 02's format fixture ({fixture_rows} rows), "
+                            "not a corpus. Rerun notebook 02 with DEMO_MODE=False and push again."
+                        )
                     train_raw = loaded["train"]
                     eval_raw = loaded["validation"]
 
