@@ -1517,8 +1517,9 @@ def build_03_sft():
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 MERGED_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
                 MAX_SEQ_LENGTH = 4_096       # the longest bootstrap row renders to 1,780 tokens; 8_192 after this run
-                # 187 training rows at batch 1 x GA 8 is 23 steps per epoch: two epochs.
-                MAX_STEPS = 46
+                # 187 training rows at batch 1 x GA 8 is 24 optimiser updates per
+                # epoch (the last accumulation is a partial one): two epochs.
+                MAX_STEPS = 48
                 # True trains two local smoke steps on the fixture and publishes nothing.
                 DEMO_MODE = False
                 RUN_TRAINING = True
@@ -1905,7 +1906,18 @@ def build_03_sft():
                     tokenizer.save_pretrained(str(RUN_ROOT / "sft" / "final_adapter"))
                     (RUN_ROOT / "sft" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     if PUSH_ADAPTER:
+                        from huggingface_hub import HfApi
+
                         trainer.push_to_hub(commit_message="SFT adapter with native six-tool schema")
+                        # A completion marker. The trainer created the repo before
+                        # training, so its existence proves nothing; notebook 07
+                        # gates an adapter only once this file is on the Hub.
+                        HfApi(token=hf_token).upload_file(
+                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_in_repo="run_manifest.json",
+                            repo_id=OUTPUT_ADAPTER_ID,
+                            commit_message="run manifest: training completed",
+                        )
                     print(result.metrics)
                     print({
                         "peak_reserved_gib": round(peak_reserved_gib, 3),
@@ -1934,6 +1946,14 @@ def build_03_sft():
                             tokenizer,
                             save_method="merged_16bit",
                             token=hf_token,
+                        )
+                        # The same completion marker as the adapter: notebook 04
+                        # starts only from a merge whose upload finished.
+                        HfApi(token=hf_token).upload_file(
+                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_in_repo="run_manifest.json",
+                            repo_id=MERGED_MODEL_ID,
+                            commit_message="run manifest: merge completed",
                         )
                         print(f"Published private merged checkpoint to {MERGED_MODEL_ID}.")
                     else:
@@ -1996,6 +2016,9 @@ def build_04_dpo():
                 # decides what the KL reference actually is.
                 MERGED_SFT_MODEL_ID = f"{HF_USERNAME}/qwen38-27b-code-accepted-merged"
                 MERGED_SFT_REVISION = "main"  # pin a commit to repeat a run exactly
+                # Demo mode loads the stock model instead, so the two-step smoke
+                # needs nothing published; the KL reference is then the base.
+                SMOKE_MODEL_ID = "unsloth/Qwen3.8-27B"
                 SFT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
                 SFT_ADAPTER_REVISION = "main"  # recorded for lineage only
                 PREFERENCE_DATASET_ID = f"{HF_USERNAME}/qwen38-code-preferences"
@@ -2037,11 +2060,16 @@ def build_04_dpo():
                 if RUN_TRAINING and not DEMO_MODE:
                     from huggingface_hub import HfApi
 
-                    if not HfApi(token=hf_token).repo_exists(MERGED_SFT_MODEL_ID):
+                    # The run manifest is uploaded last, after the weights, so it
+                    # proves the merge finished; a repo alone does not.
+                    if not HfApi(token=hf_token).file_exists(
+                        MERGED_SFT_MODEL_ID, "run_manifest.json", revision=MERGED_SFT_REVISION
+                    ):
                         raise RuntimeError(
-                            f"{MERGED_SFT_MODEL_ID} does not exist yet. DPO starts from the merged accepted SFT "
-                            "checkpoint: once notebook 07's gate accepts an adapter, run notebook 03 with "
-                            "SAVE_MERGED_BF16 = PUSH_MERGED_BF16 = True to publish it, then rerun this notebook."
+                            f"{MERGED_SFT_MODEL_ID}@{MERGED_SFT_REVISION} has no completed merge. DPO starts "
+                            "from the merged accepted SFT checkpoint: once notebook 07's gate accepts an "
+                            "adapter, run notebook 03 with SAVE_MERGED_BF16 = PUSH_MERGED_BF16 = True to "
+                            "publish it, then rerun this notebook."
                         )
                 # The trainer creates the Hub repo when it is built, so an
                 # existing public repo is caught here, before that happens.
@@ -2089,8 +2117,8 @@ def build_04_dpo():
                 # weights and attaching a fresh adapter makes the reference the
                 # accepted SFT policy, which is what this stage should move from.
                 model, tokenizer = FastModel.from_pretrained(
-                    model_name=MERGED_SFT_MODEL_ID,
-                    revision=MERGED_SFT_REVISION,
+                    model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID,
+                    revision=None if DEMO_MODE else MERGED_SFT_REVISION,
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,
@@ -3339,8 +3367,16 @@ def build_07_collect_and_evaluate():
                         RUN_BASELINE_EVAL = bool(mismatches)
                         for line in mismatches:
                             print(f"pulled baseline differs, measuring a new one: {line}")
+                if not RUN_BASELINE_EVAL:
+                    # The gate prefers this session's file over the pulled copy,
+                    # so one left by an earlier run in this runtime must go.
+                    (REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)
                 if RUN_CANDIDATE_EVAL is None:
-                    RUN_CANDIDATE_EVAL = HfApi(token=hf_token).repo_exists(ACCEPTED_ADAPTER_ID)
+                    # Notebook 03 uploads its run manifest after the final adapter
+                    # push, so this is true only for a training run that finished.
+                    RUN_CANDIDATE_EVAL = HfApi(token=hf_token).file_exists(
+                        ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=ACCEPTED_REVISION
+                    )
                 print(json.dumps({"run_baseline_eval": RUN_BASELINE_EVAL, "run_candidate_eval": RUN_CANDIDATE_EVAL}, indent=2))
 
                 # Six single-file families (short band) plus the three multi-file

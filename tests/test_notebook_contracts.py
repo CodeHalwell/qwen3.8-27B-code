@@ -526,7 +526,9 @@ def run_lora_discovery(cell: str) -> dict:
         "assert_model_fully_resident": lambda *_, **__: None,
         "MODEL_ID": "unsloth/Qwen3.8-27B",
         "MERGED_SFT_MODEL_ID": "user/merged",
-        "MERGED_SFT_REVISION": "REPLACE_WITH_ACCEPTED_COMMIT",
+        "MERGED_SFT_REVISION": "main",
+        "SMOKE_MODEL_ID": "unsloth/Qwen3.8-27B",
+        "DEMO_MODE": False,
         "MAX_SEQ_LENGTH": 4096,
         "hf_token": "token",
     }
@@ -897,7 +899,7 @@ def test_notebook_07_persists_reports_across_colab_sessions():
     assert "def resolved_revision(" in config_cell
     assert 'stock_model_ref = f"{MODEL_ID}@{resolved_revision(MODEL_ID, MODEL_REVISION)}"' in config_cell
     for marker, model_ref in (
-        ("RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
+        ("if RUN_BASELINE_EVAL:", "report_provenance(stock_model_ref)"),
         ("RUN_EFFORT_LADDER:", "report_provenance(stock_model_ref, reasoning_effort=effort)"),
         ("RUN_CANDIDATE_EVAL:", "report_provenance(candidate_model_ref)"),
     ):
@@ -905,7 +907,7 @@ def test_notebook_07_persists_reports_across_colab_sessions():
         assert model_ref in cell
         assert cell.index(".metadata = report_provenance(") < cell.index("write_report(")
     assert "seeds=DEFAULT_SEEDS[:EVAL_ATTEMPTS]," in config_cell
-    baseline_cell = code_cell_containing(notebook, "RUN_BASELINE_EVAL:")
+    baseline_cell = code_cell_containing(notebook, "if RUN_BASELINE_EVAL:")
     assert "revision=MODEL_REVISION," in baseline_cell
     assert baseline_cell.index("baseline_report_path.unlink(missing_ok=True)") < baseline_cell.index("evaluate(")
     candidate_cell = code_cell_containing(notebook, "RUN_CANDIDATE_EVAL:")
@@ -1076,8 +1078,13 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
 
     sft_config = code_cell_containing(generator.build_03_sft(), "PUSH_MERGED_BF16 = False")
-    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 46"):
+    for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 48"):
         assert line in sft_config, line
+    # Completion markers: the manifest goes up after the weights, on both repos.
+    train_cell = code_cell_containing(generator.build_03_sft(), 'commit_message="SFT adapter')
+    assert train_cell.index("trainer.push_to_hub(") < train_cell.index('path_in_repo="run_manifest.json"')
+    merge_cell = code_cell_containing(generator.build_03_sft(), "push_to_hub_merged(")
+    assert merge_cell.index("push_to_hub_merged(") < merge_cell.index('path_in_repo="run_manifest.json"')
     # Demo mode clamps rather than raising, so a smoke needs one flag.
     assert "MAX_STEPS, PUSH_ADAPTER, PUSH_MERGED_BF16 = 2, False, False" in sft_config
 
@@ -1085,7 +1092,12 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     for line in ("DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "MAX_STEPS = 16"):
         assert line in dpo_config, line
     assert 'PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")' in dpo_config
-    assert "repo_exists(MERGED_SFT_MODEL_ID)" in dpo_config
+    assert 'file_exists(\n                        MERGED_SFT_MODEL_ID, "run_manifest.json"' in dpo_config.replace(
+        "\n    ", "\n                    "
+    ) or '"run_manifest.json", revision=MERGED_SFT_REVISION' in dpo_config
+    # The smoke loads the stock model, so it needs nothing published.
+    dpo_load = code_cell_containing(generator.build_04_dpo(), "model_name=SMOKE_MODEL_ID if DEMO_MODE else MERGED_SFT_MODEL_ID")
+    assert "revision=None if DEMO_MODE else MERGED_SFT_REVISION" in dpo_load
 
     gate_config = code_cell_containing(generator.build_07_collect_and_evaluate(), "GATE_REPORTS_REPO =")
     assert "EVAL_ATTEMPTS = 2" in gate_config
@@ -1096,7 +1108,13 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     # session measures; otherwise the candidate would be refused at the gate.
     assert "RUN_BASELINE_EVAL = bool(mismatches)" in gate_config
     assert "read_report(pulled_baseline).metadata, report_provenance(stock_model_ref)" in gate_config
-    assert "RUN_CANDIDATE_EVAL = HfApi(token=hf_token).repo_exists(ACCEPTED_ADAPTER_ID)" in gate_config
+    assert 'ACCEPTED_ADAPTER_ID, "run_manifest.json", revision=ACCEPTED_REVISION' in gate_config
+    assert "repo_exists(ACCEPTED_ADAPTER_ID)" not in gate_config
+    # A baseline left by an earlier run in this runtime cannot shadow the pulled one.
+    assert "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)" in gate_config
+    assert gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)") < gate_config.index(
+        "(REPORT_DIR / GATE_BASELINE_FILE).unlink(missing_ok=True)"
+    )
     # The decision comes after the pull and the provenance helper that inform it.
     assert gate_config.index("snapshot_download(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
     assert gate_config.index("def report_provenance(") < gate_config.index("RUN_BASELINE_EVAL = bool(mismatches)")
