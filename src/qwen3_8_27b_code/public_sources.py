@@ -4,10 +4,12 @@ Three sources, two lanes (docs/data-strategy.md):
 
 * ``nvidia/Open-SWE-Traces`` — repository-agent trajectories that use one
   ``bash`` tool, which maps onto this harness's ``shell`` tool without
-  loss. Only resolved trajectories are kept. They are long (a median of
-  tens of thousands of tokens), so each is cut into windows that fit a
-  token budget: the head, which teaches exploration, and the tail, which
-  teaches editing, testing and finishing. Tool outputs are trimmed.
+  loss, observation format included. Only resolved trajectories are
+  kept, and each stops before the harness's final submit command, which
+  nothing answers. They are long (a median of tens of thousands of
+  tokens), so one over the token budget is cut to a head window, a
+  faithful prefix; no tail window is cut, since its test results would
+  vouch for edits the window leaves out. Tool outputs are trimmed.
 * ``nvidia/OpenCodeInstruct`` — instruction and answer pairs with unit
   tests; only rows whose tests all passed are kept, as non-agentic rows.
 * ``nvidia/OpenCodeReasoning`` — competitive-programming answers with the

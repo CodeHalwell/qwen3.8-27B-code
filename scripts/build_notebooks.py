@@ -827,6 +827,9 @@ def build_01_baseline():
                     request: str
                     visible_test_command: list[str]
                     hidden_test_command: list[str]
+                    # Written to the command's path only when it runs, after
+                    # the episode: a shell command cannot read it meanwhile.
+                    hidden_test_source: str | None = None
 
                 def make_demo_task() -> PilotTask:
                     repo = Path("/content/qwen38_demo_repo")
@@ -844,7 +847,7 @@ def build_01_baseline():
                         "    assert clamp(5, 0, 10) == 5\n"
                     )
                     hidden = Path("/content/qwen38_hidden_test.py")
-                    hidden.write_text(
+                    hidden_source = (
                         "from pathlib import Path\n"
                         "ns = {}\n"
                         "exec((Path.cwd() / 'src' / 'clamp.py').read_text(), ns)\n"
@@ -866,6 +869,7 @@ def build_01_baseline():
                         request="Fix clamp so values inside the range are unchanged and out-of-range values use the nearest bound. Run the unit tests.",
                         visible_test_command=[sys.executable, "-m", "pytest", "-q"],
                         hidden_test_command=[sys.executable, str(hidden)],
+                        hidden_test_source=hidden_source,
                     )
 
                 def load_tasks() -> list[PilotTask]:
@@ -949,30 +953,50 @@ def build_01_baseline():
                         # time limit and bounded observation as run_tests;
                         # the package twin is RepoHarness._shell. Its own
                         # process group, so a timeout kills whatever the
-                        # command started, not only bash.
+                        # command started, not only bash; and only the head
+                        # and tail of the output are held, so a command that
+                        # prints without end costs bounded memory.
                         import os
                         import signal
+                        import threading
 
                         process = subprocess.Popen(
                             ["bash", "-c", arguments["command"]],
                             cwd=root,
                             env=TASK_ENV,
-                            text=True,
-                            errors="replace",
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             start_new_session=True,
                         )
+                        timed_out = threading.Event()
+
+                        def kill_group():
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                return
+                            timed_out.set()
+
+                        timer = threading.Timer(120, kill_group)
+                        timer.start()
+                        limit = 12_000
+                        head, tail, total = bytearray(), bytearray(), 0
                         try:
-                            output, _ = process.communicate(timeout=120)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.communicate()
+                            while chunk := process.stdout.read1(65_536):
+                                total += len(chunk)
+                                head += chunk[: max(0, limit - len(head))]
+                                tail += chunk
+                                del tail[:-limit]
+                        finally:
+                            timer.cancel()
+                            process.wait()
+                        if timed_out.is_set():
                             return "[timed out after 120s]"
+                        output = bytes(head if total <= limit else head + tail).decode("utf-8", errors="replace")
                         observation = ("" if process.returncode == 0 else f"[exit code {process.returncode}]\n") + output
                         marker = "\n... [output trimmed] ...\n"
-                        if len(observation) > 12_000:
-                            keep = (12_000 - len(marker)) // 2
+                        if len(observation) > limit:
+                            keep = (limit - len(marker)) // 2
                             observation = observation[:keep] + marker + observation[-keep:]
                         return observation
                     return f"unknown tool: {name}"
@@ -1078,14 +1102,23 @@ def build_01_baseline():
                     else:
                         termination = "tool_budget"
 
-                    hidden = subprocess.run(
-                        task.hidden_test_command,
-                        cwd=task.repo_path,
-                        env=TASK_ENV,
-                        text=True,
-                        capture_output=True,
-                        timeout=120,
-                    )
+                    # The verifier reaches disk only now, once the episode is
+                    # over: while the model held the shell, it was not there.
+                    hidden_path = Path(task.hidden_test_command[-1])
+                    if task.hidden_test_source is not None:
+                        hidden_path.write_text(task.hidden_test_source)
+                    try:
+                        hidden = subprocess.run(
+                            task.hidden_test_command,
+                            cwd=task.repo_path,
+                            env=TASK_ENV,
+                            text=True,
+                            capture_output=True,
+                            timeout=120,
+                        )
+                    finally:
+                        if task.hidden_test_source is not None:
+                            hidden_path.unlink(missing_ok=True)
                     elapsed = time.monotonic() - start
                     return {
                         "trajectory_id": str(uuid.uuid4()),

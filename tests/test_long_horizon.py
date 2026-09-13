@@ -64,7 +64,12 @@ def test_hidden_verifiers_import_the_repository_from_outside_it():
     with materialise(task) as workspace:
         listing = workspace.harness.execute("list_files", {"path": "."})
         assert "contract" not in listing and "hidden" not in listing
-        assert sorted(path.name for path in workspace.hidden_dir.iterdir()) == ["contract.py", "no_regression.py"]
+        # Off disk during the episode: a shell command beside the checkout
+        # would otherwise find them. They exist only while verify() runs them.
+        assert list(workspace.hidden_dir.iterdir()) == []
+        verdict = workspace.verify()
+        assert sorted(verdict.hidden) == ["contract", "no_regression"]
+        assert list(workspace.hidden_dir.iterdir()) == []
 
 
 def test_gold_walks_the_medium_and_long_bands_on_multi_file_tasks():

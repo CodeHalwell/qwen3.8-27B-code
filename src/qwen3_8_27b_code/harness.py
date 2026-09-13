@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 _SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY")
@@ -31,6 +32,7 @@ TEST_OUTPUT_TAIL = 12_000
 # A shell observation keeps its head and tail inside this bound.
 SHELL_OUTPUT_LIMIT = 12_000
 SHELL_TIMEOUT_SECONDS = 120
+SHELL_READ_CHUNK = 65_536
 TRUNCATION_MARKER = "\n... [output trimmed] ...\n"
 
 
@@ -190,21 +192,39 @@ class RepoHarness:
         # whatever the repository and the model's patches contain, so a
         # command here adds no exposure a test file could not. The command
         # runs in its own process group so that a timeout kills whatever
-        # it started, not only bash.
+        # it started, not only bash, and only the head and tail of its
+        # output are ever held, so a command that prints without end
+        # costs bounded memory rather than the runtime.
         process = subprocess.Popen(
             ["bash", "-c", command],
             cwd=self.root,
             env=self.environment,
-            text=True,
-            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        timed_out = threading.Event()
+
+        def kill_group() -> None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            timed_out.set()
+
+        timer = threading.Timer(SHELL_TIMEOUT_SECONDS, kill_group)
+        timer.start()
+        head, tail, total = bytearray(), bytearray(), 0
         try:
-            output, _ = process.communicate(timeout=SHELL_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
+            while chunk := process.stdout.read1(SHELL_READ_CHUNK):
+                total += len(chunk)
+                head += chunk[: max(0, SHELL_OUTPUT_LIMIT - len(head))]
+                tail += chunk
+                del tail[:-SHELL_OUTPUT_LIMIT]
+        finally:
+            timer.cancel()
+            process.wait()
+        if timed_out.is_set():
             return f"[timed out after {SHELL_TIMEOUT_SECONDS}s]"
-        return format_command_observation(process.returncode, output)
+        output = bytes(head if total <= SHELL_OUTPUT_LIMIT else head + tail)
+        return format_command_observation(process.returncode, output.decode("utf-8", errors="replace"))

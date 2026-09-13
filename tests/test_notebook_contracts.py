@@ -1219,3 +1219,16 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     # The windowed rows fit the training window with the rendered overhead.
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 1e-4")
     assert "MAX_SEQ_LENGTH = 8_192" in sft_config
+
+
+def test_notebook_01_writes_the_hidden_verifier_only_when_it_runs():
+    generator = load_generator()
+    notebook = generator.build_01_baseline()
+    task_cell = code_cell_containing(notebook, "def make_demo_task")
+    assert "hidden.write_text(" not in task_cell
+    assert "hidden_test_source=hidden_source" in task_cell
+    episode_cell = code_cell_containing(notebook, "task.hidden_test_command,")
+    assert episode_cell.index("hidden_path.write_text(task.hidden_test_source)") < episode_cell.index(
+        "task.hidden_test_command,"
+    )
+    assert "hidden_path.unlink(missing_ok=True)" in episode_cell

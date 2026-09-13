@@ -115,8 +115,10 @@ def test_converted_shell_observations_match_what_the_executor_returns(tmp_path):
     observed = executor.execute("shell", {"command": "printf boom; exit 2"})
     assert observed == ps._tool_content(json.dumps({"returncode": 2, "output": "boom"})) == "[exit code 2]\nboom"
     assert executor.execute("shell", {"command": "printf fine"}) == "fine"
-    long = executor.execute("shell", {"command": "head -c 30000 /dev/zero | tr '\\0' a"})
+    # Fifty megabytes of output: only the head and tail are ever held.
+    long = executor.execute("shell", {"command": "head -c 50000000 /dev/zero | tr '\\0' a"})
     assert len(long) <= harness.SHELL_OUTPUT_LIMIT and harness.TRUNCATION_MARKER in long
+    assert long.startswith("a" * 100) and long.endswith("a" * 100)
 
 
 def test_shell_timeout_kills_the_whole_process_group(tmp_path, monkeypatch):
