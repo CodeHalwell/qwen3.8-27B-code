@@ -931,7 +931,13 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
 
     # The run inputs a checkpoint must be attributed to are in its manifest.
     for cell, keys in (
-        (sft_config, ("learning_rate", "num_train_epochs", "eval_every_steps", "save_every_steps", "optimizer")),
+        (
+            sft_config,
+            (
+                "learning_rate", "num_train_epochs", "eval_every_steps", "save_every_steps",
+                "optimizer", "lora_rank", "lora_alpha",
+            ),
+        ),
         (
             code_cell_containing(generator.build_04_dpo(), "LENGTH_PAIRS_LOCAL_JSONL"),
             (
