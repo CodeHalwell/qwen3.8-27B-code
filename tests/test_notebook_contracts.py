@@ -132,26 +132,36 @@ def test_validation_split_is_a_share_of_rows_not_of_families():
     assert set(dataset_dict["validation"]["lane"]) == {"agentic", "non_agentic"}
     assert set(dataset_dict["train"]["repo_family"]).isdisjoint(dataset_dict["validation"]["repo_family"])
 
+    def split(rows):
+        namespace = {
+            "prepared": Dataset.from_list(rows), "Counter": Counter, "hashlib": hashlib,
+            "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
+        }
+        exec(split_cell, namespace)
+        return namespace["dataset_dict"]
+
     # A lane held in few, fat families can be walked past before the row
-    # target is met. It is added anyway, or it would go unmeasured.
-    thin = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
-    thin += [{"repo_family": "instruct:generic/00", "lane": "non_agentic"} for _ in range(5)]
-    namespace = {
-        "prepared": Dataset.from_list(thin), "Counter": Counter, "hashlib": hashlib,
-        "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
-    }
-    exec(split_cell, namespace)
-    assert set(namespace["dataset_dict"]["validation"]["lane"]) == {"agentic", "non_agentic"}
+    # target is met. Given a family to spare, it is held out anyway.
+    agentic = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
+    spare = split(agentic + [
+        {"repo_family": f"instruct:generic/{i:02d}", "lane": "non_agentic"}
+        for i in range(2) for _ in range(5)
+    ])
+    assert set(spare["validation"]["lane"]) == {"agentic", "non_agentic"}
+    assert set(spare["train"]["lane"]) == {"agentic", "non_agentic"}
+
+    # With one family, holding it out would leave the lane with no training
+    # rows at all. Unmeasured beats untrained, so it stays in training.
+    sole = split(agentic + [
+        {"repo_family": "instruct:generic/00", "lane": "non_agentic"} for _ in range(5)
+    ])
+    assert set(sole["validation"]["lane"]) == {"agentic"}
+    assert sole["train"]["lane"].count("non_agentic") == 5
 
     # A corpus of one lane stays a corpus of one lane; nothing is invented.
-    single = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(40)]
-    namespace = {
-        "prepared": Dataset.from_list(single), "Counter": Counter, "hashlib": hashlib,
-        "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
-    }
-    exec(split_cell, namespace)
-    assert set(namespace["dataset_dict"]["validation"]["lane"]) == {"agentic"}
-    assert len(namespace["dataset_dict"]["train"]) > 0
+    single = split([{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(40)])
+    assert set(single["validation"]["lane"]) == {"agentic"}
+    assert len(single["train"]) > 0
 
 
 def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
@@ -193,8 +203,23 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     sft_config = code_cell_containing(notebook_03, "LEARNING_RATE = 5e-5")
     assert "EVAL_ROW_CAP = 256" in sft_config
     load_cell = code_cell_containing(notebook_03, "eval_dataset = eval_raw.map(render_row)")
-    assert "eval_raw.shuffle(seed=3407).select(range(EVAL_ROW_CAP))" in load_cell
+    assert "shuffled = eval_raw.shuffle(seed=3407)" in load_cell
     assert load_cell.index("EVAL_ROW_CAP") < load_cell.index("eval_dataset = eval_raw.map(")
+
+    # The cap keeps every lane the split went to the trouble of holding out.
+    cap_namespace = {
+        "EVAL_ROW_CAP": 8,
+        "eval_raw": Dataset.from_list(
+            [{"lane": "agentic", "n": i} for i in range(200)]
+            + [{"lane": "non_agentic", "n": 900 + i} for i in range(3)]
+        ),
+        "train_raw": Dataset.from_list([{"lane": "agentic", "n": 0}]),
+        "render_row": lambda row: {"text": str(row["n"])},
+        "json": json,
+    }
+    exec(load_cell[load_cell.index("eval_rows_available = len(eval_raw)"):], cap_namespace)
+    assert len(cap_namespace["eval_dataset"]) == 8
+    assert set(cap_namespace["eval_dataset"]["lane"]) == {"agentic", "non_agentic"}
 
 
 def test_baseline_search_uses_bounded_python_fallback(tmp_path):

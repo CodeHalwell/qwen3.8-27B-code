@@ -1583,15 +1583,22 @@ def build_02_data():
                 # very thing this split exists to prevent. At the shipped caps
                 # both lanes have hundreds of families and that never happens,
                 # but the caps are meant to be turned down. Each missing lane
-                # contributes its first family in the same hash order.
+                # contributes its first family in the same hash order, unless
+                # that is the lane's only family: holding it out would train on
+                # none of that lane at all, and untrained is worse than
+                # unmeasured. The print below names any lane left that way.
                 for lane in sorted(set(lane_of_family.values())):
                     if any(lane_of_family[family] == lane for family in validation_families):
                         continue
                     if len(validation_families) >= len(repo_families) - 1:
                         break  # no family to spare without emptying the training split
+                    lane_families = [
+                        family for family in ranked_families if lane_of_family[family] == lane
+                    ]
+                    if len(lane_families) < 2:
+                        continue
                     missing = next(
-                        family for family in ranked_families
-                        if family not in validation_families and lane_of_family[family] == lane
+                        family for family in lane_families if family not in validation_families
                     )
                     validation_families.add(missing)
                     held_out_rows += family_sizes[missing]
@@ -1610,6 +1617,15 @@ def build_02_data():
                         if row["split"] == "validation"
                     ).items())),
                 }, indent=2))
+                unmeasured = sorted(
+                    set(lane_of_family.values())
+                    - {lane_of_family[family] for family in validation_families}
+                )
+                if unmeasured:
+                    print(
+                        f"lanes trained but not measured, too few families to hold one out: {unmeasured}. "
+                        "Raise that source's cap in the configuration cell to measure it."
+                    )
 
                 from datasets import DatasetDict
                 dataset_dict = DatasetDict({
@@ -1990,7 +2006,26 @@ def build_03_sft():
 
                 eval_rows_available = len(eval_raw)
                 if EVAL_ROW_CAP and eval_rows_available > EVAL_ROW_CAP:
-                    eval_raw = eval_raw.shuffle(seed=3407).select(range(EVAL_ROW_CAP))
+                    # Taking the first rows of a shuffle can drop a lane the
+                    # split went to the trouble of holding out. Interleaving the
+                    # lanes first keeps each one in the sample, in the shuffled
+                    # order, and makes the sample as even as the split allows.
+                    shuffled = eval_raw.shuffle(seed=3407)
+                    lane_values = (
+                        shuffled["lane"] if "lane" in shuffled.column_names
+                        else [None] * len(shuffled)
+                    )
+                    by_lane = {}
+                    for position, lane in enumerate(lane_values):
+                        by_lane.setdefault(lane or "agentic", []).append(position)
+                    groups = [by_lane[lane] for lane in sorted(by_lane)]
+                    interleaved = [
+                        group[depth]
+                        for depth in range(max(len(group) for group in groups))
+                        for group in groups
+                        if depth < len(group)
+                    ]
+                    eval_raw = shuffled.select(interleaved[:EVAL_ROW_CAP])
                 train_dataset = train_raw.map(render_row)
                 eval_dataset = eval_raw.map(render_row)
                 print(json.dumps({
