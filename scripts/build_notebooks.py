@@ -1281,10 +1281,15 @@ def build_02_data():
                 # the corpus's one unverified slice, labelled as such. The
                 # value is the number of native rows each source contributes;
                 # 0 skips it.
+                # Sized against one training epoch of about four hours on an
+                # A100: the first run measured 2.5 seconds a row. The agentic
+                # source takes the largest share because it is the only one
+                # that teaches the tool protocol this model is being
+                # specialised for.
                 PUBLIC_SOURCES = {
-                    SOURCE_OPEN_SWE: 800,
-                    SOURCE_OPEN_CODE_INSTRUCT: 1_500,
-                    SOURCE_OPEN_CODE_REASONING: 800,
+                    SOURCE_OPEN_SWE: 3_000,
+                    SOURCE_OPEN_CODE_INSTRUCT: 2_000,
+                    SOURCE_OPEN_CODE_REASONING: 1_200,
                 }
                 # Content tokens per row; the rendered prompt and tool schema add
                 # about 1,500, so this fits notebook 03's 8,192 window.
@@ -1544,20 +1549,43 @@ def build_02_data():
                     raise ValueError(
                         "At least two repository families are required to create disjoint train and validation splits."
                     )
-                validation_family_count = max(1, round(len(repo_families) * 0.10))
-                validation_family_count = min(validation_family_count, len(repo_families) - 1)
+                # Families are wildly unequal: one Open-SWE repository is a
+                # single row and a bucketed non-agentic family is dozens, so
+                # holding out a tenth of the families held out a fortieth of
+                # the rows, every one of them from the lane with the most
+                # families. Whole families still move together, but they are
+                # taken until a tenth of the rows are held out, so the
+                # validation loss measures the corpus rather than one lane.
+                VALIDATION_ROW_SHARE = 0.10
+                family_sizes = Counter(prepared["repo_family"])
                 ranked_families = sorted(
                     repo_families,
                     key=lambda family: hashlib.sha256(family.encode()).hexdigest(),
                 )
-                validation_families = set(ranked_families[:validation_family_count])
+                validation_target = max(1, round(len(prepared) * VALIDATION_ROW_SHARE))
+                validation_families, held_out_rows = set(), 0
+                for family in ranked_families:
+                    if held_out_rows >= validation_target:
+                        break
+                    if len(validation_families) == len(repo_families) - 1:
+                        break  # every corpus keeps at least one training family
+                    validation_families.add(family)
+                    held_out_rows += family_sizes[family]
 
                 def split_name(repo_family: str) -> str:
                     return "validation" if repo_family in validation_families else "train"
 
                 prepared = prepared.map(lambda row: {"split": split_name(row["repo_family"])})
                 split_counts = Counter(prepared["split"])
-                print(split_counts)
+                print(json.dumps({
+                    "splits": dict(sorted(split_counts.items())),
+                    "families": {"total": len(repo_families), "validation": len(validation_families)},
+                    "validation_lanes": dict(sorted(Counter(
+                        row.get("lane") or "agentic"
+                        for row in prepared
+                        if row["split"] == "validation"
+                    ).items())),
+                }, indent=2))
 
                 from datasets import DatasetDict
                 dataset_dict = DatasetDict({
@@ -1676,9 +1704,12 @@ def build_03_sft():
                 # starts, and notebook 07 gates this adapter until 04 reruns.
                 DPO_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
                 MAX_SEQ_LENGTH = 8_192       # public rows are windowed to fit this; the 4k run measured the headroom
-                # Two passes over whatever the dataset holds; the trainer counts
+                # One pass over whatever the dataset holds; the trainer counts
                 # the updates. A positive MAX_STEPS would override the epochs.
-                NUM_TRAIN_EPOCHS = 2
+                # The 3,207-row run measured the second epoch: validation sat at
+                # 0.240 from the end of the first to the end of the second, so
+                # those hours now buy fresh rows instead of a repeat.
+                NUM_TRAIN_EPOCHS = 1
                 MAX_STEPS = -1
                 # True trains two local smoke steps on the fixture and publishes nothing.
                 DEMO_MODE = False

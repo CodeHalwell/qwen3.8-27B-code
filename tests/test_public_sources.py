@@ -162,7 +162,10 @@ def test_sources_are_pinned_and_the_report_records_the_commit(monkeypatch):
 def test_open_code_instruct_keeps_only_fully_verified_answers():
     row = {"id": "1", "input": "Write f.", "output": "def f(): pass", "domain": "algorithmic", "average_test_score": "1.0"}
     (converted,) = ps.convert_open_code_instruct_row(row)
-    assert converted["lane"] == "non_agentic" and converted["repo_family"] == "opencodeinstruct:algorithmic"
+    assert converted["lane"] == "non_agentic"
+    # One domain covers every row of this source, so the family is bucketed
+    # by row id: the split can hold out part of it instead of all or none.
+    assert converted["repo_family"].startswith("opencodeinstruct:algorithmic/")
     assert converted["reasoning_effort"] == "low"
     assert converted["messages"] == [{"role": "user", "content": "Write f."}, {"role": "assistant", "content": "def f(): pass"}]
     assert ps.convert_open_code_instruct_row(dict(row, average_test_score="0.9")) == []
@@ -173,12 +176,28 @@ def test_open_code_reasoning_moves_the_think_block_into_the_reasoning_field():
     row = {"id": "7", "source": "codeforces", "input": "Balance brackets.", "output": "<think>\nuse a stack\n</think>\n```python\nprint(1)\n```"}
     (converted,) = ps.convert_open_code_reasoning_row(row)
     assert converted["messages"][1] == {"role": "assistant", "content": "```python\nprint(1)\n```", "reasoning_content": "use a stack"}
-    assert converted["reasoning_effort"] == "xhigh" and converted["repo_family"] == "opencodereasoning:codeforces"
+    assert converted["reasoning_effort"] == "xhigh"
+    assert converted["repo_family"].startswith("opencodereasoning:codeforces/")
     # Nothing ran these answers, and the row says so rather than claiming a pass.
     assert converted["verification"] == {"all_required_tests_pass": None, "runner": "none"}
     # split_1 rows carry "-" and need an external lookup: skipped.
     assert ps.convert_open_code_reasoning_row(dict(row, input="-")) == []
     assert ps.split_think("no tags") == ("", "no tags")
+
+
+def test_non_agentic_families_are_bucketed_but_stay_stable():
+    rows = [
+        ps.convert_open_code_instruct_row(
+            {"id": str(i), "input": "q", "output": "a", "domain": "generic", "average_test_score": "1.0"}
+        )[0]
+        for i in range(400)
+    ]
+    families = {row["repo_family"] for row in rows}
+    # Enough families for the split to take a share, few enough to stay whole.
+    assert len(families) == ps.FAMILY_BUCKETS
+    assert all(family.startswith("opencodeinstruct:generic/") for family in families)
+    # The same row lands in the same family on every rebuild.
+    assert ps.bucketed_family("x", "7") == ps.bucketed_family("x", "7")
 
 
 def test_convert_rows_stops_at_the_limit_and_drops_rows_over_budget():
