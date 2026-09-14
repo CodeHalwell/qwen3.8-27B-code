@@ -194,6 +194,7 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
         "Dataset": Dataset,
         "DEMO_MODE": True,
         "EVAL_ROW_CAP": 256,
+        "MODEL_COMMIT": "c" * 40,
     }
     exec(generator.TOOLS_CELL, namespace_03)
     exec(code_cell_containing(notebook_03, "def demo_rows()"), namespace_03)
@@ -218,7 +219,7 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
             "DATASET_ID": "x/y", "DATASET_REVISION": "main", "MAX_SEQ_LENGTH": 8192,
             "NUM_TRAIN_EPOCHS": 1, "MAX_STEPS": -1, "LEARNING_RATE": 5e-5,
             "train_dataset": range(5760), "eval_dataset": range(256),
-            "DATASET_COMMIT": "a" * 40,
+            "DATASET_COMMIT": "a" * 40, "MODEL_COMMIT": "c" * 40,
             "run_manifest": {}, **overrides,
         }
         body = args_cell[: args_cell.index("training_args = SFTConfig(")]
@@ -231,6 +232,8 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     # The source caps are hit exactly, so a changed converter republishes the
     # same number of different rows. Only the resolved commit tells them apart.
     assert run_key() != run_key(DATASET_COMMIT="b" * 40)
+    # The base repository is mutable too; adapter state belongs to one base.
+    assert run_key() != run_key(MODEL_COMMIT="d" * 40)
     load_cell = code_cell_containing(notebook_03, "loaded = load_dataset(DATASET_ID")
     assert "DATASET_COMMIT = HfApi(token=hf_token).dataset_info(" in load_cell
     assert "load_dataset(DATASET_ID, revision=DATASET_COMMIT, token=hf_token)" in load_cell
@@ -645,9 +648,22 @@ REVIEWED_SUFFIXES = {
 }
 
 
+class _FakeHfApi:
+    """Enough of HfApi for the load cell to resolve a revision."""
+
+    def __init__(self, token=None):
+        self.token = token
+
+    def model_info(self, repo_id, revision=None):
+        return SimpleNamespace(sha="c" * 40)
+
+
 def run_lora_discovery(cell: str) -> dict:
     namespace = {
         "json": json,
+        "HfApi": _FakeHfApi,
+        "MODEL_REVISION": "main",
+        "run_manifest": {},
         "torch": _FakeTorch,
         "FastModel": _FakeFastModel,
         "require_free_vram": lambda *_: 90.0,
@@ -1228,6 +1244,15 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
+    # A checkout left by an earlier run is refreshed, not reused, and the
+    # package it holds is dropped from sys.modules before the import.
+    assert '["git", "fetch", "--depth", "1", "origin", REPO_BRANCH]' in data_config
+    assert '["git", "reset", "--hard", "FETCH_HEAD"]' in data_config
+    assert "if not REPO_DIR.exists():" not in data_config
+    assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
+    assert data_config.index("del sys.modules[module_name]") < data_config.index(
+        "from qwen3_8_27b_code.public_sources import"
+    )
 
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
     for line in (

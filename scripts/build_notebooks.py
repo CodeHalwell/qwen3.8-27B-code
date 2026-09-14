@@ -1250,6 +1250,7 @@ def build_02_data():
                 from collections import Counter
                 from datasets import Dataset, load_dataset
                 import numpy as np
+                import shutil
                 import subprocess
 
                 from transformers import AutoTokenizer
@@ -1259,12 +1260,34 @@ def build_02_data():
                 # The bootstrap corpus lives in this repository; the notebook
                 # clones it, so nothing has to be uploaded or pointed at.
                 REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+                REPO_BRANCH = "main"
                 REPO_DIR = Path("/content/qwen3.8-27B-code")
-                if not REPO_DIR.exists():
+                # Cloning only when the directory was absent meant a rerun in a
+                # runtime that already held a checkout kept whatever was cloned
+                # first: the bootstrap corpus and, more to the point, the
+                # converter this cell is about to import. Fetch and reset, so a
+                # rerun is this notebook's code and not last night's.
+                if (REPO_DIR / ".git").is_dir():
+                    subprocess.run(
+                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
+                    )
+                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+                else:
+                    shutil.rmtree(REPO_DIR, ignore_errors=True)
                     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                REPO_COMMIT = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, check=True
+                ).stdout.strip()
+                print(f"corpus and converter from {REPO_URL}@{REPO_COMMIT[:12]}")
                 SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
                 from qwen3_8_27b_code.public_sources import (
                     SOURCE_OPEN_CODE_INSTRUCT,
                     SOURCE_OPEN_CODE_REASONING,
@@ -1744,6 +1767,7 @@ def build_03_sft():
                 from trl import SFTConfig, SFTTrainer
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
+                MODEL_REVISION = "main"  # resolved to a commit below and recorded in the manifest
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 DATASET_REVISION = "main"  # the dataset notebook 02 pushed; pin a commit to repeat a run exactly
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
@@ -1834,8 +1858,18 @@ def build_03_sft():
             code(
                 r"""
                 require_free_vram(60.0)
+                from huggingface_hub import HfApi
+
+                # The base repository is mutable too. Resolve it once, load that
+                # commit, and record it: a run is otherwise unreproducible, and
+                # adapter state trained against one base could resume against
+                # another without anything noticing.
+                MODEL_COMMIT = HfApi(token=hf_token).model_info(MODEL_ID, revision=MODEL_REVISION).sha
+                run_manifest["model_commit"] = MODEL_COMMIT
+                print(f"{MODEL_ID}@{MODEL_REVISION} is {MODEL_COMMIT}")
                 model, tokenizer = FastModel.from_pretrained(
                     model_name=MODEL_ID,
+                    revision=MODEL_COMMIT,
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,
@@ -2079,6 +2113,7 @@ def build_03_sft():
                 # by what decides the schedule, so a changed run starts clean
                 # while an interrupted identical one still resumes.
                 SFT_RUN_KEY = hashlib.sha256(json.dumps({
+                    "model_commit": MODEL_COMMIT,
                     "dataset_id": DATASET_ID,
                     "dataset_revision": DATASET_COMMIT or DATASET_REVISION,
                     "train_rows": len(train_dataset),
