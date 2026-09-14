@@ -2054,8 +2054,35 @@ def build_03_sft():
             markdown("## Build the assistant-only trainer and inspect its labels"),
             code(
                 r"""
+                import hashlib
+
+                # A rerun in a runtime that still holds the last run's
+                # checkpoints resumes them: same directory, and the resume is
+                # unconditional. When the corpus or the schedule has changed
+                # since, that trains from the wrong state, or skips training
+                # outright because the old run went further, and then publishes
+                # the result under this run's manifest. The directory is keyed
+                # by what decides the schedule, so a changed run starts clean
+                # while an interrupted identical one still resumes.
+                SFT_RUN_KEY = hashlib.sha256(json.dumps({
+                    "dataset_id": DATASET_ID,
+                    "dataset_revision": DATASET_REVISION,
+                    "train_rows": len(train_dataset),
+                    "eval_rows": len(eval_dataset),
+                    "max_seq_length": MAX_SEQ_LENGTH,
+                    "num_train_epochs": NUM_TRAIN_EPOCHS,
+                    "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "gradient_accumulation_steps": 8,
+                    "seed": 3407,
+                }, sort_keys=True).encode()).hexdigest()[:12]
+                SFT_RUN_DIR = RUN_ROOT / "sft" / SFT_RUN_KEY
+                SFT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+                run_manifest["run_key"] = SFT_RUN_KEY
+                print(f"checkpoints and artifacts for this configuration: {SFT_RUN_DIR}")
+
                 training_args = SFTConfig(
-                    output_dir=str(RUN_ROOT / "sft"),
+                    output_dir=str(SFT_RUN_DIR),
                     dataset_text_field="text",
                     max_length=MAX_SEQ_LENGTH,
                     packing=False,
@@ -2183,7 +2210,7 @@ def build_03_sft():
                     return max(numbered)[1] if numbered else None
 
                 if RUN_TRAINING:
-                    resume_from = latest_checkpoint(RUN_ROOT / "sft")
+                    resume_from = latest_checkpoint(SFT_RUN_DIR)
                     torch.cuda.reset_peak_memory_stats()
                     start_reserved_gib = torch.cuda.memory_reserved() / 1024**3
                     if PUSH_ADAPTER:
@@ -2212,9 +2239,9 @@ def build_03_sft():
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     run_manifest["peak_reserved_gib"] = round(peak_reserved_gib, 3)
                     run_manifest["training_memory_delta_gib"] = round(peak_reserved_gib - start_reserved_gib, 3)
-                    trainer.save_model(str(RUN_ROOT / "sft" / "final_adapter"))
-                    tokenizer.save_pretrained(str(RUN_ROOT / "sft" / "final_adapter"))
-                    (RUN_ROOT / "sft" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    trainer.save_model(str(SFT_RUN_DIR / "final_adapter"))
+                    tokenizer.save_pretrained(str(SFT_RUN_DIR / "final_adapter"))
+                    (SFT_RUN_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     if PUSH_ADAPTER:
                         from huggingface_hub import HfApi
 
@@ -2223,7 +2250,7 @@ def build_03_sft():
                         # training, so its existence proves nothing; notebook 07
                         # gates an adapter only once this file is on the Hub.
                         HfApi(token=hf_token).upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -2248,7 +2275,7 @@ def build_03_sft():
                             )
                         model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
                         hub.upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=MERGED_MODEL_ID,
                             commit_message="run manifest: merge completed",

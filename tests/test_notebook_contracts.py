@@ -200,6 +200,34 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     assert len(namespace_03["train_dataset"]) == 1
     assert len(namespace_03["eval_dataset"]) == 1
 
+    # A rerun whose corpus or schedule changed must not resume the previous
+    # run's checkpoints: the directory is keyed by what decides the schedule.
+    args_cell = code_cell_containing(notebook_03, "training_args = SFTConfig(")
+    assert "output_dir=str(SFT_RUN_DIR)" in args_cell
+    for key in ("dataset_revision", "train_rows", "num_train_epochs", "learning_rate"):
+        assert f'"{key}":' in args_cell[args_cell.index("SFT_RUN_KEY = "):], key
+    train_cell = code_cell_containing(notebook_03, "resume_from = latest_checkpoint(")
+    assert "latest_checkpoint(SFT_RUN_DIR)" in train_cell
+    for cell in notebook_03.cells:
+        assert 'RUN_ROOT / "sft"' not in cell.source or "SFT_RUN_KEY" in cell.source
+
+    # Two schedules must not share a directory, and one schedule must keep it.
+    def run_key(**overrides):
+        namespace = {
+            "json": json, "Path": Path, "RUN_ROOT": Path("/tmp/qwen38-key-probe"),
+            "DATASET_ID": "x/y", "DATASET_REVISION": "main", "MAX_SEQ_LENGTH": 8192,
+            "NUM_TRAIN_EPOCHS": 1, "MAX_STEPS": -1, "LEARNING_RATE": 5e-5,
+            "train_dataset": range(5760), "eval_dataset": range(256),
+            "run_manifest": {}, **overrides,
+        }
+        body = args_cell[: args_cell.index("training_args = SFTConfig(")]
+        exec(body, namespace)
+        return namespace["SFT_RUN_KEY"]
+
+    assert run_key() == run_key()
+    assert run_key() != run_key(train_dataset=range(3207))
+    assert run_key() != run_key(NUM_TRAIN_EPOCHS=2)
+
     # The eval split is capped so a bigger corpus cannot stretch the run:
     # every eval reads the whole split, and the split grows with the corpus.
     sft_config = code_cell_containing(notebook_03, "LEARNING_RATE = 5e-5")
