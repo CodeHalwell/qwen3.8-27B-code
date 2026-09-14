@@ -1730,6 +1730,15 @@ def build_03_sft():
                 # upload than in training once a run is hundreds of steps long.
                 EVAL_EVERY_STEPS = 1 if DEMO_MODE else 50
                 SAVE_EVERY_STEPS = 1 if DEMO_MODE else 50
+                # Every eval reads the whole held-out split at batch size one,
+                # so its cost grows with the corpus while its job, drawing a
+                # loss curve, does not. A fixed sample keeps the run's wall
+                # clock tied to the training rows: at the step and forward-pass
+                # costs the 3,207-row run measured, a capped run lands at the
+                # same four and a half hours, where reading the whole 640-row
+                # split every time would add well over an hour. The sample is
+                # seeded, so the curve is comparable between runs.
+                EVAL_ROW_CAP = 256
 
                 if DEMO_MODE:
                     # A smoke run: two local steps on the fixture, nothing published.
@@ -1756,6 +1765,7 @@ def build_03_sft():
                     "gradient_accumulation_steps": 8,
                     "optimizer": "adamw_8bit",
                     "eval_every_steps": EVAL_EVERY_STEPS,
+                    "eval_row_cap": EVAL_ROW_CAP,
                     "save_every_steps": SAVE_EVERY_STEPS,
                     "demo_mode": DEMO_MODE,
                     "tool_schema_version": TOOL_SCHEMA_VERSION,
@@ -1954,8 +1964,16 @@ def build_03_sft():
                         )
                     }
 
+                eval_rows_available = len(eval_raw)
+                if EVAL_ROW_CAP and eval_rows_available > EVAL_ROW_CAP:
+                    eval_raw = eval_raw.shuffle(seed=3407).select(range(EVAL_ROW_CAP))
                 train_dataset = train_raw.map(render_row)
                 eval_dataset = eval_raw.map(render_row)
+                print(json.dumps({
+                    "train_rows": len(train_dataset),
+                    "eval_rows": len(eval_dataset),
+                    "eval_rows_available": eval_rows_available,
+                }, indent=2))
                 print(train_dataset[0]["text"][:4000])
                 """
             ),

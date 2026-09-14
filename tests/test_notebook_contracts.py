@@ -160,11 +160,20 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
         "tokenizer": FakeTokenizer(),
         "Dataset": Dataset,
         "DEMO_MODE": True,
+        "EVAL_ROW_CAP": 256,
     }
     exec(generator.TOOLS_CELL, namespace_03)
     exec(code_cell_containing(notebook_03, "def demo_rows()"), namespace_03)
     assert len(namespace_03["train_dataset"]) == 1
     assert len(namespace_03["eval_dataset"]) == 1
+
+    # The eval split is capped so a bigger corpus cannot stretch the run:
+    # every eval reads the whole split, and the split grows with the corpus.
+    sft_config = code_cell_containing(notebook_03, "LEARNING_RATE = 5e-5")
+    assert "EVAL_ROW_CAP = 256" in sft_config
+    load_cell = code_cell_containing(notebook_03, "eval_dataset = eval_raw.map(render_row)")
+    assert "eval_raw.shuffle(seed=3407).select(range(EVAL_ROW_CAP))" in load_cell
+    assert load_cell.index("EVAL_ROW_CAP") < load_cell.index("eval_dataset = eval_raw.map(")
 
 
 def test_baseline_search_uses_bounded_python_fallback(tmp_path):
