@@ -218,6 +218,7 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
             "DATASET_ID": "x/y", "DATASET_REVISION": "main", "MAX_SEQ_LENGTH": 8192,
             "NUM_TRAIN_EPOCHS": 1, "MAX_STEPS": -1, "LEARNING_RATE": 5e-5,
             "train_dataset": range(5760), "eval_dataset": range(256),
+            "DATASET_COMMIT": "a" * 40,
             "run_manifest": {}, **overrides,
         }
         body = args_cell[: args_cell.index("training_args = SFTConfig(")]
@@ -227,6 +228,13 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     assert run_key() == run_key()
     assert run_key() != run_key(train_dataset=range(3207))
     assert run_key() != run_key(NUM_TRAIN_EPOCHS=2)
+    # The source caps are hit exactly, so a changed converter republishes the
+    # same number of different rows. Only the resolved commit tells them apart.
+    assert run_key() != run_key(DATASET_COMMIT="b" * 40)
+    load_cell = code_cell_containing(notebook_03, "loaded = load_dataset(DATASET_ID")
+    assert "DATASET_COMMIT = HfApi(token=hf_token).dataset_info(" in load_cell
+    assert "load_dataset(DATASET_ID, revision=DATASET_COMMIT, token=hf_token)" in load_cell
+    assert load_cell.index("DATASET_COMMIT = HfApi(") < load_cell.index("loaded = load_dataset(")
 
     # The eval split is capped so a bigger corpus cannot stretch the run:
     # every eval reads the whole split, and the split grows with the corpus.

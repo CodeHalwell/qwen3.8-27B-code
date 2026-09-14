@@ -1976,13 +1976,27 @@ def build_03_sft():
                     ]
 
                 USE_DEMO_DATA = DEMO_MODE
+                DATASET_COMMIT = None
                 if USE_DEMO_DATA:
                     raw = Dataset.from_list(demo_rows())
                     split = raw.train_test_split(test_size=0.5, seed=3407)
                     train_raw, eval_raw = split["train"], split["test"]
                     print("Using synthetic plumbing data; this is not a capability run.")
                 else:
-                    loaded = load_dataset(DATASET_ID, revision=DATASET_REVISION, token=hf_token)
+                    from huggingface_hub import HfApi
+
+                    # "main" moves whenever notebook 02 republishes. Resolve it
+                    # once and load that commit, so what is loaded, what the
+                    # manifest records and what keys the checkpoints are the
+                    # same corpus. Row counts alone would not tell two corpora
+                    # apart: the source caps are hit exactly, so a changed
+                    # converter republishes the same number of different rows.
+                    DATASET_COMMIT = HfApi(token=hf_token).dataset_info(
+                        DATASET_ID, revision=DATASET_REVISION
+                    ).sha
+                    run_manifest["dataset_commit"] = DATASET_COMMIT
+                    print(f"{DATASET_ID}@{DATASET_REVISION} is {DATASET_COMMIT}")
+                    loaded = load_dataset(DATASET_ID, revision=DATASET_COMMIT, token=hf_token)
                     missing_splits = {"train", "validation"} - set(loaded)
                     if missing_splits:
                         raise ValueError(
@@ -2066,7 +2080,7 @@ def build_03_sft():
                 # while an interrupted identical one still resumes.
                 SFT_RUN_KEY = hashlib.sha256(json.dumps({
                     "dataset_id": DATASET_ID,
-                    "dataset_revision": DATASET_REVISION,
+                    "dataset_revision": DATASET_COMMIT or DATASET_REVISION,
                     "train_rows": len(train_dataset),
                     "eval_rows": len(eval_dataset),
                     "max_seq_length": MAX_SEQ_LENGTH,
