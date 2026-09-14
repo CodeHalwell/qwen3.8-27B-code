@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 import json
+import hashlib
 import re
 from collections import Counter
 
@@ -31,7 +32,7 @@ from .harness import TRUNCATION_MARKER as TRUNCATION_MARKER  # re-exported for c
 from .harness import format_command_observation, trim_output
 from .schema import TOOL_SCHEMA_JSON, TOOL_SCHEMA_VERSION, TOOLS
 
-CONVERTER_VERSION = "public-sources-v2"
+CONVERTER_VERSION = "public-sources-v3"
 TokenCounter = Callable[[str], int]
 
 # Roughly one token per 3.6 characters of mixed code and prose; used only
@@ -41,6 +42,13 @@ CHARS_PER_TOKEN = 3.6
 # executor's own format (harness.format_command_observation) at a training
 # budget rather than the executor's bound.
 MAX_TOOL_OUTPUT_CHARS = 3_000
+# A non-agentic source names one domain for all of its rows, so its whole
+# share of the corpus was a single repo_family and notebook 02's
+# family-disjoint split could only take all of it or none. These rows are
+# independent problems with no repository to leak, so the family is split
+# into buckets by row id: disjoint between the splits, and small enough
+# that holding some out is a choice rather than an avalanche.
+FAMILY_BUCKETS = 32
 
 SOURCE_OPEN_SWE = "nvidia/Open-SWE-Traces"
 # mini-swe-agent ends an episode with this command; its observation is the
@@ -85,6 +93,11 @@ def _base_row(row_id: str, source: str, repo_family: str, lane: str, reasoning_e
         "tool_schema_json": TOOL_SCHEMA_JSON,
         "tools": TOOLS,
     }
+
+
+def bucketed_family(prefix: str, row_id: str) -> str:
+    bucket = int(hashlib.sha256(str(row_id).encode()).hexdigest(), 16) % FAMILY_BUCKETS
+    return f"{prefix}/{bucket:02d}"
 
 
 def trim_tool_output(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -261,8 +274,8 @@ def convert_open_code_instruct_row(row: dict) -> list[dict]:
         return []
     base = _base_row(
         f"opencodeinstruct/{row.get('id')}", SOURCE_OPEN_CODE_INSTRUCT,
-        f"opencodeinstruct:{row.get('domain') or 'generic'}", "non_agentic",
-        SOURCE_LOADERS[SOURCE_OPEN_CODE_INSTRUCT]["reasoning_effort"],
+        bucketed_family(f"opencodeinstruct:{row.get('domain') or 'generic'}", row.get("id")),
+        "non_agentic", SOURCE_LOADERS[SOURCE_OPEN_CODE_INSTRUCT]["reasoning_effort"],
     )
     base["messages"] = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
     base["verification"] = {"all_required_tests_pass": True, "runner": "opencodeinstruct unit tests"}
@@ -289,8 +302,8 @@ def convert_open_code_reasoning_row(row: dict) -> list[dict]:
         return []
     base = _base_row(
         f"opencodereasoning/{row.get('id')}", SOURCE_OPEN_CODE_REASONING,
-        f"opencodereasoning:{row.get('source') or 'unknown'}", "non_agentic",
-        SOURCE_LOADERS[SOURCE_OPEN_CODE_REASONING]["reasoning_effort"],
+        bucketed_family(f"opencodereasoning:{row.get('source') or 'unknown'}", row.get("id")),
+        "non_agentic", SOURCE_LOADERS[SOURCE_OPEN_CODE_REASONING]["reasoning_effort"],
     )
     assistant = {"role": "assistant", "content": answer}
     if reasoning:

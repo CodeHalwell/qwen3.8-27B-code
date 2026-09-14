@@ -82,7 +82,7 @@ def test_rendered_tool_block_preserves_semantic_tool_schema():
 
 def test_repository_family_split_always_has_two_nonempty_partitions():
     generator = load_generator()
-    split_cell = code_cell_containing(generator.build_02_data(), "validation_family_count")
+    split_cell = code_cell_containing(generator.build_02_data(), "VALIDATION_ROW_SHARE")
     namespace = {
         "prepared": Dataset.from_list(
             [
@@ -92,6 +92,7 @@ def test_repository_family_split_always_has_two_nonempty_partitions():
         ),
         "Counter": Counter,
         "hashlib": hashlib,
+        "json": json,
         "PUSH_DATASET": False,
         "DEMO_MODE": True,
     }
@@ -104,6 +105,65 @@ def test_repository_family_split_always_has_two_nonempty_partitions():
     assert set(dataset_dict["train"]["repo_family"]).isdisjoint(
         dataset_dict["validation"]["repo_family"]
     )
+
+
+def test_validation_split_is_a_share_of_rows_not_of_families():
+    """One bucketed family holds dozens of rows and one repository holds one,
+    so counting families held out a fortieth of the corpus, all of it agentic."""
+    generator = load_generator()
+    split_cell = code_cell_containing(generator.build_02_data(), "VALIDATION_ROW_SHARE")
+    rows = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
+    rows += [
+        {"repo_family": f"instruct:generic/{i:02d}", "lane": "non_agentic"}
+        for i in range(32) for _ in range(20)
+    ]
+    namespace = {
+        "prepared": Dataset.from_list(rows), "Counter": Counter, "hashlib": hashlib,
+        "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
+    }
+    exec(split_cell, namespace)
+    dataset_dict = namespace["dataset_dict"]
+    held_out = len(dataset_dict["validation"])
+    target = round(len(rows) * 0.10)
+    # Whole families still move together, so the count lands near the target
+    # rather than on it; the old rule held out a quarter of this.
+    assert target <= held_out <= target + 20
+    # Both lanes are measured, which is the point of the change.
+    assert set(dataset_dict["validation"]["lane"]) == {"agentic", "non_agentic"}
+    assert set(dataset_dict["train"]["repo_family"]).isdisjoint(dataset_dict["validation"]["repo_family"])
+
+    def split(rows):
+        namespace = {
+            "prepared": Dataset.from_list(rows), "Counter": Counter, "hashlib": hashlib,
+            "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
+        }
+        exec(split_cell, namespace)
+        return namespace["dataset_dict"]
+
+    # A lane held in few, fat families can be walked past before the row
+    # target is met. Given a family to spare, it is held out anyway.
+    agentic = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
+    spare = split(agentic + [
+        {"repo_family": f"opencodeinstruct:generic/{i:02d}", "lane": "non_agentic"}
+        for i in range(2) for _ in range(5)
+    ])
+    assert set(spare["validation"]["lane"]) == {"agentic", "non_agentic"}
+    assert set(spare["train"]["lane"]) == {"agentic", "non_agentic"}
+
+    # With one family, holding it out would leave the lane with no training
+    # rows at all. Unmeasured beats untrained, so it stays in training.
+    # This family ranks ninth of 301, well inside the walk, so the walk
+    # itself would take it were it not for the rule.
+    sole = split(agentic + [
+        {"repo_family": "opencodeinstruct:generic/00", "lane": "non_agentic"} for _ in range(5)
+    ])
+    assert set(sole["validation"]["lane"]) == {"agentic"}
+    assert sole["train"]["lane"].count("non_agentic") == 5
+
+    # A corpus of one lane stays a corpus of one lane; nothing is invented.
+    single = split([{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(40)])
+    assert set(single["validation"]["lane"]) == {"agentic"}
+    assert len(single["train"]) > 0
 
 
 def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
@@ -123,7 +183,7 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     exec(code_cell_containing(notebook_02, "demo_rows = ["), namespace_02)
     exec(code_cell_containing(notebook_02, "def validate_row"), namespace_02)
     exec(code_cell_containing(notebook_02, "def render_row(row: dict)"), namespace_02)
-    exec(code_cell_containing(notebook_02, "validation_family_count"), namespace_02)
+    exec(code_cell_containing(notebook_02, "VALIDATION_ROW_SHARE"), namespace_02)
     assert len(namespace_02["dataset_dict"]["train"]) == 1
     assert len(namespace_02["dataset_dict"]["validation"]) == 1
 
@@ -133,11 +193,74 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
         "tokenizer": FakeTokenizer(),
         "Dataset": Dataset,
         "DEMO_MODE": True,
+        "EVAL_ROW_CAP": 256,
+        "MODEL_COMMIT": "c" * 40,
     }
     exec(generator.TOOLS_CELL, namespace_03)
     exec(code_cell_containing(notebook_03, "def demo_rows()"), namespace_03)
     assert len(namespace_03["train_dataset"]) == 1
     assert len(namespace_03["eval_dataset"]) == 1
+
+    # A rerun whose corpus or schedule changed must not resume the previous
+    # run's checkpoints: the directory is keyed by what decides the schedule.
+    args_cell = code_cell_containing(notebook_03, "training_args = SFTConfig(")
+    assert "output_dir=str(SFT_RUN_DIR)" in args_cell
+    for key in ("dataset_revision", "train_rows", "num_train_epochs", "learning_rate"):
+        assert f'"{key}":' in args_cell[args_cell.index("SFT_RUN_KEY = "):], key
+    train_cell = code_cell_containing(notebook_03, "resume_from = latest_checkpoint(")
+    assert "latest_checkpoint(SFT_RUN_DIR)" in train_cell
+    for cell in notebook_03.cells:
+        assert 'RUN_ROOT / "sft"' not in cell.source or "SFT_RUN_KEY" in cell.source
+
+    # Two schedules must not share a directory, and one schedule must keep it.
+    def run_key(**overrides):
+        namespace = {
+            "json": json, "Path": Path, "RUN_ROOT": Path("/tmp/qwen38-key-probe"),
+            "DATASET_ID": "x/y", "DATASET_REVISION": "main", "MAX_SEQ_LENGTH": 8192,
+            "NUM_TRAIN_EPOCHS": 1, "MAX_STEPS": -1, "LEARNING_RATE": 5e-5,
+            "train_dataset": range(5760), "eval_dataset": range(256),
+            "DATASET_COMMIT": "a" * 40, "MODEL_COMMIT": "c" * 40,
+            "run_manifest": {}, **overrides,
+        }
+        body = args_cell[: args_cell.index("training_args = SFTConfig(")]
+        exec(body, namespace)
+        return namespace["SFT_RUN_KEY"]
+
+    assert run_key() == run_key()
+    assert run_key() != run_key(train_dataset=range(3207))
+    assert run_key() != run_key(NUM_TRAIN_EPOCHS=2)
+    # The source caps are hit exactly, so a changed converter republishes the
+    # same number of different rows. Only the resolved commit tells them apart.
+    assert run_key() != run_key(DATASET_COMMIT="b" * 40)
+    # The base repository is mutable too; adapter state belongs to one base.
+    assert run_key() != run_key(MODEL_COMMIT="d" * 40)
+    load_cell = code_cell_containing(notebook_03, "loaded = load_dataset(DATASET_ID")
+    assert "DATASET_COMMIT = HfApi(token=hf_token).dataset_info(" in load_cell
+    assert "load_dataset(DATASET_ID, revision=DATASET_COMMIT, token=hf_token)" in load_cell
+    assert load_cell.index("DATASET_COMMIT = HfApi(") < load_cell.index("loaded = load_dataset(")
+
+    # The eval split is capped so a bigger corpus cannot stretch the run:
+    # every eval reads the whole split, and the split grows with the corpus.
+    sft_config = code_cell_containing(notebook_03, "LEARNING_RATE = 5e-5")
+    assert "EVAL_ROW_CAP = 256" in sft_config
+    load_cell = code_cell_containing(notebook_03, "eval_dataset = eval_raw.map(render_row)")
+    assert "shuffled = eval_raw.shuffle(seed=3407)" in load_cell
+    assert load_cell.index("EVAL_ROW_CAP") < load_cell.index("eval_dataset = eval_raw.map(")
+
+    # The cap keeps every lane the split went to the trouble of holding out.
+    cap_namespace = {
+        "EVAL_ROW_CAP": 8,
+        "eval_raw": Dataset.from_list(
+            [{"lane": "agentic", "n": i} for i in range(200)]
+            + [{"lane": "non_agentic", "n": 900 + i} for i in range(3)]
+        ),
+        "train_raw": Dataset.from_list([{"lane": "agentic", "n": 0}]),
+        "render_row": lambda row: {"text": str(row["n"])},
+        "json": json,
+    }
+    exec(load_cell[load_cell.index("eval_rows_available = len(eval_raw)"):], cap_namespace)
+    assert len(cap_namespace["eval_dataset"]) == 8
+    assert set(cap_namespace["eval_dataset"]["lane"]) == {"agentic", "non_agentic"}
 
 
 def test_baseline_search_uses_bounded_python_fallback(tmp_path):
@@ -525,9 +648,22 @@ REVIEWED_SUFFIXES = {
 }
 
 
+class _FakeHfApi:
+    """Enough of HfApi for the load cell to resolve a revision."""
+
+    def __init__(self, token=None):
+        self.token = token
+
+    def model_info(self, repo_id, revision=None):
+        return SimpleNamespace(sha="c" * 40)
+
+
 def run_lora_discovery(cell: str) -> dict:
     namespace = {
         "json": json,
+        "HfApi": _FakeHfApi,
+        "MODEL_REVISION": "main",
+        "run_manifest": {},
         "torch": _FakeTorch,
         "FastModel": _FakeFastModel,
         "require_free_vram": lambda *_: 90.0,
@@ -1108,11 +1244,20 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
+    # A checkout left by an earlier run is refreshed, not reused, and the
+    # package it holds is dropped from sys.modules before the import.
+    assert '["git", "fetch", "--depth", "1", "origin", REPO_BRANCH]' in data_config
+    assert '["git", "reset", "--hard", "FETCH_HEAD"]' in data_config
+    assert "if not REPO_DIR.exists():" not in data_config
+    assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
+    assert data_config.index("del sys.modules[module_name]") < data_config.index(
+        "from qwen3_8_27b_code.public_sources import"
+    )
 
     sft_config = code_cell_containing(generator.build_03_sft(), "LEARNING_RATE = 5e-5")
     for line in (
         "DEMO_MODE = False", "RUN_TRAINING = True", "PUSH_ADAPTER = True", "PUSH_MERGED_SFT = True",
-        "NUM_TRAIN_EPOCHS = 2", "MAX_STEPS = -1",
+        "NUM_TRAIN_EPOCHS = 1", "MAX_STEPS = -1",
     ):
         assert line in sft_config, line
     # Completion markers go up after the weights: the adapter's after its final
@@ -1208,7 +1353,7 @@ def test_notebook_02_streams_the_public_sources_into_the_corpus():
     config_cell = code_cell_containing(generator.build_02_data(), "PUBLIC_SOURCES = {")
     assert "from qwen3_8_27b_code.public_sources import" in config_cell
     assert config_cell.index('sys.path.insert(0, str(REPO_DIR / "src"))') < config_cell.index("from qwen3_8_27b_code.public_sources")
-    for name in ("SOURCE_OPEN_SWE: 800", "SOURCE_OPEN_CODE_INSTRUCT: 1_500", "SOURCE_OPEN_CODE_REASONING: 800"):
+    for name in ("SOURCE_OPEN_SWE: 3_000", "SOURCE_OPEN_CODE_INSTRUCT: 2_000", "SOURCE_OPEN_CODE_REASONING: 1_200"):
         assert name in config_cell, name
     assert "PUBLIC_TOKEN_BUDGET = 6_000" in config_cell
     load_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")

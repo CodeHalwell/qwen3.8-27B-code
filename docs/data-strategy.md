@@ -175,6 +175,15 @@ pinned commit, recorded with the corpus in `public_sources.json`.
 Nemotron-SFT-SWE-v3 mixes several harnesses with different tool surfaces
 and has no converter yet.
 
+A non-agentic source names one domain for every row it holds, which made its
+whole share of the corpus a single repository family: the family-disjoint
+split could take all of it or none, and took none, so a tenth of the families
+was a fortieth of the rows and every held-out row was agentic. These rows are
+independent problems with no repository to leak between splits, so the
+converter buckets them into families by row id, and notebook 02 takes whole
+families in hash order until a tenth of the *rows* are held out. Both lanes
+are then measured, and the notebook prints the lane mix of the split it made.
+
 Do not rename a third-party `bash` call to `run_tests`, split a shell transcript
 into invented semantic calls or fabricate observations. That produces fluent
 but false supervision.

@@ -1250,6 +1250,7 @@ def build_02_data():
                 from collections import Counter
                 from datasets import Dataset, load_dataset
                 import numpy as np
+                import shutil
                 import subprocess
 
                 from transformers import AutoTokenizer
@@ -1259,12 +1260,34 @@ def build_02_data():
                 # The bootstrap corpus lives in this repository; the notebook
                 # clones it, so nothing has to be uploaded or pointed at.
                 REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+                REPO_BRANCH = "main"
                 REPO_DIR = Path("/content/qwen3.8-27B-code")
-                if not REPO_DIR.exists():
+                # Cloning only when the directory was absent meant a rerun in a
+                # runtime that already held a checkout kept whatever was cloned
+                # first: the bootstrap corpus and, more to the point, the
+                # converter this cell is about to import. Fetch and reset, so a
+                # rerun is this notebook's code and not last night's.
+                if (REPO_DIR / ".git").is_dir():
+                    subprocess.run(
+                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
+                    )
+                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+                else:
+                    shutil.rmtree(REPO_DIR, ignore_errors=True)
                     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                REPO_COMMIT = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, check=True
+                ).stdout.strip()
+                print(f"corpus and converter from {REPO_URL}@{REPO_COMMIT[:12]}")
                 SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
                 from qwen3_8_27b_code.public_sources import (
                     SOURCE_OPEN_CODE_INSTRUCT,
                     SOURCE_OPEN_CODE_REASONING,
@@ -1281,10 +1304,15 @@ def build_02_data():
                 # the corpus's one unverified slice, labelled as such. The
                 # value is the number of native rows each source contributes;
                 # 0 skips it.
+                # Sized against one training epoch of about four hours on an
+                # A100: the first run measured 2.5 seconds a row. The agentic
+                # source takes the largest share because it is the only one
+                # that teaches the tool protocol this model is being
+                # specialised for.
                 PUBLIC_SOURCES = {
-                    SOURCE_OPEN_SWE: 800,
-                    SOURCE_OPEN_CODE_INSTRUCT: 1_500,
-                    SOURCE_OPEN_CODE_REASONING: 800,
+                    SOURCE_OPEN_SWE: 3_000,
+                    SOURCE_OPEN_CODE_INSTRUCT: 2_000,
+                    SOURCE_OPEN_CODE_REASONING: 1_200,
                 }
                 # Content tokens per row; the rendered prompt and tool schema add
                 # about 1,500, so this fits notebook 03's 8,192 window.
@@ -1544,20 +1572,98 @@ def build_02_data():
                     raise ValueError(
                         "At least two repository families are required to create disjoint train and validation splits."
                     )
-                validation_family_count = max(1, round(len(repo_families) * 0.10))
-                validation_family_count = min(validation_family_count, len(repo_families) - 1)
+                # Families are wildly unequal: one Open-SWE repository is a
+                # single row and a bucketed non-agentic family is dozens, so
+                # holding out a tenth of the families held out a fortieth of
+                # the rows, every one of them from the lane with the most
+                # families. Whole families still move together, but they are
+                # taken until a tenth of the rows are held out, so the
+                # validation loss measures the corpus rather than one lane.
+                VALIDATION_ROW_SHARE = 0.10
+                family_sizes = Counter(prepared["repo_family"])
+                lane_column = (
+                    prepared["lane"] if "lane" in prepared.column_names else [None] * len(prepared)
+                )
+                lane_of_family = {}
+                for family, lane in zip(prepared["repo_family"], lane_column):
+                    lane_of_family.setdefault(family, lane or "agentic")
                 ranked_families = sorted(
                     repo_families,
                     key=lambda family: hashlib.sha256(family.encode()).hexdigest(),
                 )
-                validation_families = set(ranked_families[:validation_family_count])
+                validation_target = max(1, round(len(prepared) * VALIDATION_ROW_SHARE))
+                lane_family_counts = Counter(lane_of_family.values())
+                lane_held_out = Counter()
+                validation_families, held_out_rows = set(), 0
+
+                # A lane with one family is the case that bites: the target is
+                # met by whichever families rank first, so a lane's only family
+                # ranking early would move every row it has into validation and
+                # the model would train on none of that lane. Untrained is worse
+                # than unmeasured, so every lane keeps a family in training.
+                def keeps_its_lane_trained(family):
+                    lane = lane_of_family[family]
+                    return lane_held_out[lane] + 1 < lane_family_counts[lane]
+
+                for family in ranked_families:
+                    if held_out_rows >= validation_target:
+                        break
+                    if len(validation_families) == len(repo_families) - 1:
+                        break  # every corpus keeps at least one training family
+                    if not keeps_its_lane_trained(family):
+                        continue
+                    validation_families.add(family)
+                    lane_held_out[lane_of_family[family]] += 1
+                    held_out_rows += family_sizes[family]
+                # The row target says how much to hold out, not what. A lane
+                # whose families are few and fat can be passed over entirely
+                # before the target is met, which leaves it unmeasured: the
+                # very thing this split exists to prevent. At the shipped caps
+                # both lanes have hundreds of families and that never happens,
+                # but the caps are meant to be turned down. Each missing lane
+                # contributes its first family in the same hash order, subject
+                # to the same rule: never its last training family. The print
+                # below names any lane left unmeasured that way.
+                for lane in sorted(set(lane_of_family.values())):
+                    if any(lane_of_family[family] == lane for family in validation_families):
+                        continue
+                    if len(validation_families) >= len(repo_families) - 1:
+                        break  # no family to spare without emptying the training split
+                    missing = next(
+                        (
+                            family for family in ranked_families
+                            if lane_of_family[family] == lane and keeps_its_lane_trained(family)
+                        ),
+                        None,
+                    )
+                    if missing is not None:
+                        validation_families.add(missing)
+                        lane_held_out[lane] += 1
+                        held_out_rows += family_sizes[missing]
 
                 def split_name(repo_family: str) -> str:
                     return "validation" if repo_family in validation_families else "train"
 
                 prepared = prepared.map(lambda row: {"split": split_name(row["repo_family"])})
                 split_counts = Counter(prepared["split"])
-                print(split_counts)
+                print(json.dumps({
+                    "splits": dict(sorted(split_counts.items())),
+                    "families": {"total": len(repo_families), "validation": len(validation_families)},
+                    "validation_lanes": dict(sorted(Counter(
+                        row.get("lane") or "agentic"
+                        for row in prepared
+                        if row["split"] == "validation"
+                    ).items())),
+                }, indent=2))
+                unmeasured = sorted(
+                    set(lane_of_family.values())
+                    - {lane_of_family[family] for family in validation_families}
+                )
+                if unmeasured:
+                    print(
+                        f"lanes trained but not measured, too few families to hold one out: {unmeasured}. "
+                        "Raise that source's cap in the configuration cell to measure it."
+                    )
 
                 from datasets import DatasetDict
                 dataset_dict = DatasetDict({
@@ -1661,6 +1767,7 @@ def build_03_sft():
                 from trl import SFTConfig, SFTTrainer
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
+                MODEL_REVISION = "main"  # resolved to a commit below and recorded in the manifest
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 DATASET_REVISION = "main"  # the dataset notebook 02 pushed; pin a commit to repeat a run exactly
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
@@ -1676,9 +1783,12 @@ def build_03_sft():
                 # starts, and notebook 07 gates this adapter until 04 reruns.
                 DPO_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-dpo-lora"
                 MAX_SEQ_LENGTH = 8_192       # public rows are windowed to fit this; the 4k run measured the headroom
-                # Two passes over whatever the dataset holds; the trainer counts
+                # One pass over whatever the dataset holds; the trainer counts
                 # the updates. A positive MAX_STEPS would override the epochs.
-                NUM_TRAIN_EPOCHS = 2
+                # The 3,207-row run measured the second epoch: validation sat at
+                # 0.240 from the end of the first to the end of the second, so
+                # those hours now buy fresh rows instead of a repeat.
+                NUM_TRAIN_EPOCHS = 1
                 MAX_STEPS = -1
                 # True trains two local smoke steps on the fixture and publishes nothing.
                 DEMO_MODE = False
@@ -1699,6 +1809,15 @@ def build_03_sft():
                 # upload than in training once a run is hundreds of steps long.
                 EVAL_EVERY_STEPS = 1 if DEMO_MODE else 50
                 SAVE_EVERY_STEPS = 1 if DEMO_MODE else 50
+                # Every eval reads the whole held-out split at batch size one,
+                # so its cost grows with the corpus while its job, drawing a
+                # loss curve, does not. A fixed sample keeps the run's wall
+                # clock tied to the training rows: at the step and forward-pass
+                # costs the 3,207-row run measured, a capped run lands at the
+                # same four and a half hours, where reading the whole 640-row
+                # split every time would add well over an hour. The sample is
+                # seeded, so the curve is comparable between runs.
+                EVAL_ROW_CAP = 256
 
                 if DEMO_MODE:
                     # A smoke run: two local steps on the fixture, nothing published.
@@ -1725,6 +1844,7 @@ def build_03_sft():
                     "gradient_accumulation_steps": 8,
                     "optimizer": "adamw_8bit",
                     "eval_every_steps": EVAL_EVERY_STEPS,
+                    "eval_row_cap": EVAL_ROW_CAP,
                     "save_every_steps": SAVE_EVERY_STEPS,
                     "demo_mode": DEMO_MODE,
                     "tool_schema_version": TOOL_SCHEMA_VERSION,
@@ -1738,8 +1858,18 @@ def build_03_sft():
             code(
                 r"""
                 require_free_vram(60.0)
+                from huggingface_hub import HfApi
+
+                # The base repository is mutable too. Resolve it once, load that
+                # commit, and record it: a run is otherwise unreproducible, and
+                # adapter state trained against one base could resume against
+                # another without anything noticing.
+                MODEL_COMMIT = HfApi(token=hf_token).model_info(MODEL_ID, revision=MODEL_REVISION).sha
+                run_manifest["model_commit"] = MODEL_COMMIT
+                print(f"{MODEL_ID}@{MODEL_REVISION} is {MODEL_COMMIT}")
                 model, tokenizer = FastModel.from_pretrained(
                     model_name=MODEL_ID,
+                    revision=MODEL_COMMIT,
                     max_seq_length=MAX_SEQ_LENGTH,
                     dtype=torch.bfloat16,
                     load_in_4bit=False,
@@ -1880,13 +2010,27 @@ def build_03_sft():
                     ]
 
                 USE_DEMO_DATA = DEMO_MODE
+                DATASET_COMMIT = None
                 if USE_DEMO_DATA:
                     raw = Dataset.from_list(demo_rows())
                     split = raw.train_test_split(test_size=0.5, seed=3407)
                     train_raw, eval_raw = split["train"], split["test"]
                     print("Using synthetic plumbing data; this is not a capability run.")
                 else:
-                    loaded = load_dataset(DATASET_ID, revision=DATASET_REVISION, token=hf_token)
+                    from huggingface_hub import HfApi
+
+                    # "main" moves whenever notebook 02 republishes. Resolve it
+                    # once and load that commit, so what is loaded, what the
+                    # manifest records and what keys the checkpoints are the
+                    # same corpus. Row counts alone would not tell two corpora
+                    # apart: the source caps are hit exactly, so a changed
+                    # converter republishes the same number of different rows.
+                    DATASET_COMMIT = HfApi(token=hf_token).dataset_info(
+                        DATASET_ID, revision=DATASET_REVISION
+                    ).sha
+                    run_manifest["dataset_commit"] = DATASET_COMMIT
+                    print(f"{DATASET_ID}@{DATASET_REVISION} is {DATASET_COMMIT}")
+                    loaded = load_dataset(DATASET_ID, revision=DATASET_COMMIT, token=hf_token)
                     missing_splits = {"train", "validation"} - set(loaded)
                     if missing_splits:
                         raise ValueError(
@@ -1923,16 +2067,71 @@ def build_03_sft():
                         )
                     }
 
+                eval_rows_available = len(eval_raw)
+                if EVAL_ROW_CAP and eval_rows_available > EVAL_ROW_CAP:
+                    # Taking the first rows of a shuffle can drop a lane the
+                    # split went to the trouble of holding out. Interleaving the
+                    # lanes first keeps each one in the sample, in the shuffled
+                    # order, and makes the sample as even as the split allows.
+                    shuffled = eval_raw.shuffle(seed=3407)
+                    lane_values = (
+                        shuffled["lane"] if "lane" in shuffled.column_names
+                        else [None] * len(shuffled)
+                    )
+                    by_lane = {}
+                    for position, lane in enumerate(lane_values):
+                        by_lane.setdefault(lane or "agentic", []).append(position)
+                    groups = [by_lane[lane] for lane in sorted(by_lane)]
+                    interleaved = [
+                        group[depth]
+                        for depth in range(max(len(group) for group in groups))
+                        for group in groups
+                        if depth < len(group)
+                    ]
+                    eval_raw = shuffled.select(interleaved[:EVAL_ROW_CAP])
                 train_dataset = train_raw.map(render_row)
                 eval_dataset = eval_raw.map(render_row)
+                print(json.dumps({
+                    "train_rows": len(train_dataset),
+                    "eval_rows": len(eval_dataset),
+                    "eval_rows_available": eval_rows_available,
+                }, indent=2))
                 print(train_dataset[0]["text"][:4000])
                 """
             ),
             markdown("## Build the assistant-only trainer and inspect its labels"),
             code(
                 r"""
+                import hashlib
+
+                # A rerun in a runtime that still holds the last run's
+                # checkpoints resumes them: same directory, and the resume is
+                # unconditional. When the corpus or the schedule has changed
+                # since, that trains from the wrong state, or skips training
+                # outright because the old run went further, and then publishes
+                # the result under this run's manifest. The directory is keyed
+                # by what decides the schedule, so a changed run starts clean
+                # while an interrupted identical one still resumes.
+                SFT_RUN_KEY = hashlib.sha256(json.dumps({
+                    "model_commit": MODEL_COMMIT,
+                    "dataset_id": DATASET_ID,
+                    "dataset_revision": DATASET_COMMIT or DATASET_REVISION,
+                    "train_rows": len(train_dataset),
+                    "eval_rows": len(eval_dataset),
+                    "max_seq_length": MAX_SEQ_LENGTH,
+                    "num_train_epochs": NUM_TRAIN_EPOCHS,
+                    "max_steps": MAX_STEPS,
+                    "learning_rate": LEARNING_RATE,
+                    "gradient_accumulation_steps": 8,
+                    "seed": 3407,
+                }, sort_keys=True).encode()).hexdigest()[:12]
+                SFT_RUN_DIR = RUN_ROOT / "sft" / SFT_RUN_KEY
+                SFT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+                run_manifest["run_key"] = SFT_RUN_KEY
+                print(f"checkpoints and artifacts for this configuration: {SFT_RUN_DIR}")
+
                 training_args = SFTConfig(
-                    output_dir=str(RUN_ROOT / "sft"),
+                    output_dir=str(SFT_RUN_DIR),
                     dataset_text_field="text",
                     max_length=MAX_SEQ_LENGTH,
                     packing=False,
@@ -2060,7 +2259,7 @@ def build_03_sft():
                     return max(numbered)[1] if numbered else None
 
                 if RUN_TRAINING:
-                    resume_from = latest_checkpoint(RUN_ROOT / "sft")
+                    resume_from = latest_checkpoint(SFT_RUN_DIR)
                     torch.cuda.reset_peak_memory_stats()
                     start_reserved_gib = torch.cuda.memory_reserved() / 1024**3
                     if PUSH_ADAPTER:
@@ -2089,9 +2288,9 @@ def build_03_sft():
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     run_manifest["peak_reserved_gib"] = round(peak_reserved_gib, 3)
                     run_manifest["training_memory_delta_gib"] = round(peak_reserved_gib - start_reserved_gib, 3)
-                    trainer.save_model(str(RUN_ROOT / "sft" / "final_adapter"))
-                    tokenizer.save_pretrained(str(RUN_ROOT / "sft" / "final_adapter"))
-                    (RUN_ROOT / "sft" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    trainer.save_model(str(SFT_RUN_DIR / "final_adapter"))
+                    tokenizer.save_pretrained(str(SFT_RUN_DIR / "final_adapter"))
+                    (SFT_RUN_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     if PUSH_ADAPTER:
                         from huggingface_hub import HfApi
 
@@ -2100,7 +2299,7 @@ def build_03_sft():
                         # training, so its existence proves nothing; notebook 07
                         # gates an adapter only once this file is on the Hub.
                         HfApi(token=hf_token).upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -2125,7 +2324,7 @@ def build_03_sft():
                             )
                         model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
                         hub.upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "sft" / "run_manifest.json"),
+                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=MERGED_MODEL_ID,
                             commit_message="run manifest: merge completed",
