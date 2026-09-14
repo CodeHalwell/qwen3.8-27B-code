@@ -1558,6 +1558,12 @@ def build_02_data():
                 # validation loss measures the corpus rather than one lane.
                 VALIDATION_ROW_SHARE = 0.10
                 family_sizes = Counter(prepared["repo_family"])
+                lane_column = (
+                    prepared["lane"] if "lane" in prepared.column_names else [None] * len(prepared)
+                )
+                lane_of_family = {}
+                for family, lane in zip(prepared["repo_family"], lane_column):
+                    lane_of_family.setdefault(family, lane or "agentic")
                 ranked_families = sorted(
                     repo_families,
                     key=lambda family: hashlib.sha256(family.encode()).hexdigest(),
@@ -1571,6 +1577,24 @@ def build_02_data():
                         break  # every corpus keeps at least one training family
                     validation_families.add(family)
                     held_out_rows += family_sizes[family]
+                # The row target says how much to hold out, not what. A lane
+                # whose families are few and fat can be passed over entirely
+                # before the target is met, which leaves it unmeasured: the
+                # very thing this split exists to prevent. At the shipped caps
+                # both lanes have hundreds of families and that never happens,
+                # but the caps are meant to be turned down. Each missing lane
+                # contributes its first family in the same hash order.
+                for lane in sorted(set(lane_of_family.values())):
+                    if any(lane_of_family[family] == lane for family in validation_families):
+                        continue
+                    if len(validation_families) >= len(repo_families) - 1:
+                        break  # no family to spare without emptying the training split
+                    missing = next(
+                        family for family in ranked_families
+                        if family not in validation_families and lane_of_family[family] == lane
+                    )
+                    validation_families.add(missing)
+                    held_out_rows += family_sizes[missing]
 
                 def split_name(repo_family: str) -> str:
                     return "validation" if repo_family in validation_families else "train"

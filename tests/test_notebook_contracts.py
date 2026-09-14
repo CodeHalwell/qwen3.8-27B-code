@@ -132,6 +132,27 @@ def test_validation_split_is_a_share_of_rows_not_of_families():
     assert set(dataset_dict["validation"]["lane"]) == {"agentic", "non_agentic"}
     assert set(dataset_dict["train"]["repo_family"]).isdisjoint(dataset_dict["validation"]["repo_family"])
 
+    # A lane held in few, fat families can be walked past before the row
+    # target is met. It is added anyway, or it would go unmeasured.
+    thin = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
+    thin += [{"repo_family": "instruct:generic/00", "lane": "non_agentic"} for _ in range(5)]
+    namespace = {
+        "prepared": Dataset.from_list(thin), "Counter": Counter, "hashlib": hashlib,
+        "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
+    }
+    exec(split_cell, namespace)
+    assert set(namespace["dataset_dict"]["validation"]["lane"]) == {"agentic", "non_agentic"}
+
+    # A corpus of one lane stays a corpus of one lane; nothing is invented.
+    single = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(40)]
+    namespace = {
+        "prepared": Dataset.from_list(single), "Counter": Counter, "hashlib": hashlib,
+        "json": json, "PUSH_DATASET": False, "DEMO_MODE": True,
+    }
+    exec(split_cell, namespace)
+    assert set(namespace["dataset_dict"]["validation"]["lane"]) == {"agentic"}
+    assert len(namespace["dataset_dict"]["train"]) > 0
+
 
 def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
     generator = load_generator()
