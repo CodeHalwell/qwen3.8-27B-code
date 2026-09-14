@@ -144,7 +144,7 @@ def test_validation_split_is_a_share_of_rows_not_of_families():
     # target is met. Given a family to spare, it is held out anyway.
     agentic = [{"repo_family": f"swe:repo-{i}", "lane": "agentic"} for i in range(300)]
     spare = split(agentic + [
-        {"repo_family": f"instruct:generic/{i:02d}", "lane": "non_agentic"}
+        {"repo_family": f"opencodeinstruct:generic/{i:02d}", "lane": "non_agentic"}
         for i in range(2) for _ in range(5)
     ])
     assert set(spare["validation"]["lane"]) == {"agentic", "non_agentic"}
@@ -152,8 +152,10 @@ def test_validation_split_is_a_share_of_rows_not_of_families():
 
     # With one family, holding it out would leave the lane with no training
     # rows at all. Unmeasured beats untrained, so it stays in training.
+    # This family ranks ninth of 301, well inside the walk, so the walk
+    # itself would take it were it not for the rule.
     sole = split(agentic + [
-        {"repo_family": "instruct:generic/00", "lane": "non_agentic"} for _ in range(5)
+        {"repo_family": "opencodeinstruct:generic/00", "lane": "non_agentic"} for _ in range(5)
     ])
     assert set(sole["validation"]["lane"]) == {"agentic"}
     assert sole["train"]["lane"].count("non_agentic") == 5

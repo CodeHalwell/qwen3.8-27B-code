@@ -1569,13 +1569,28 @@ def build_02_data():
                     key=lambda family: hashlib.sha256(family.encode()).hexdigest(),
                 )
                 validation_target = max(1, round(len(prepared) * VALIDATION_ROW_SHARE))
+                lane_family_counts = Counter(lane_of_family.values())
+                lane_held_out = Counter()
                 validation_families, held_out_rows = set(), 0
+
+                # A lane with one family is the case that bites: the target is
+                # met by whichever families rank first, so a lane's only family
+                # ranking early would move every row it has into validation and
+                # the model would train on none of that lane. Untrained is worse
+                # than unmeasured, so every lane keeps a family in training.
+                def keeps_its_lane_trained(family):
+                    lane = lane_of_family[family]
+                    return lane_held_out[lane] + 1 < lane_family_counts[lane]
+
                 for family in ranked_families:
                     if held_out_rows >= validation_target:
                         break
                     if len(validation_families) == len(repo_families) - 1:
                         break  # every corpus keeps at least one training family
+                    if not keeps_its_lane_trained(family):
+                        continue
                     validation_families.add(family)
+                    lane_held_out[lane_of_family[family]] += 1
                     held_out_rows += family_sizes[family]
                 # The row target says how much to hold out, not what. A lane
                 # whose families are few and fat can be passed over entirely
@@ -1583,25 +1598,25 @@ def build_02_data():
                 # very thing this split exists to prevent. At the shipped caps
                 # both lanes have hundreds of families and that never happens,
                 # but the caps are meant to be turned down. Each missing lane
-                # contributes its first family in the same hash order, unless
-                # that is the lane's only family: holding it out would train on
-                # none of that lane at all, and untrained is worse than
-                # unmeasured. The print below names any lane left that way.
+                # contributes its first family in the same hash order, subject
+                # to the same rule: never its last training family. The print
+                # below names any lane left unmeasured that way.
                 for lane in sorted(set(lane_of_family.values())):
                     if any(lane_of_family[family] == lane for family in validation_families):
                         continue
                     if len(validation_families) >= len(repo_families) - 1:
                         break  # no family to spare without emptying the training split
-                    lane_families = [
-                        family for family in ranked_families if lane_of_family[family] == lane
-                    ]
-                    if len(lane_families) < 2:
-                        continue
                     missing = next(
-                        family for family in lane_families if family not in validation_families
+                        (
+                            family for family in ranked_families
+                            if lane_of_family[family] == lane and keeps_its_lane_trained(family)
+                        ),
+                        None,
                     )
-                    validation_families.add(missing)
-                    held_out_rows += family_sizes[missing]
+                    if missing is not None:
+                        validation_families.add(missing)
+                        lane_held_out[lane] += 1
+                        held_out_rows += family_sizes[missing]
 
                 def split_name(repo_family: str) -> str:
                     return "validation" if repo_family in validation_families else "train"
