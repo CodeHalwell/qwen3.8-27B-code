@@ -277,7 +277,9 @@ revisions and environments — not the machinery around them.
 
 Use a few hundred highly verified trajectories, rank-16 BF16 LoRA and
 assistant-only loss. Prove save/merge/reload and check whether tool-call
-validity improves without a static-coding regression.
+validity improves without a static-coding regression. That is this smoke's
+rank; the main run has since moved to 32, see
+[model and hardware](model-and-hardware.md).
 
 ### Experiment 3: 8K capability SFT
 
