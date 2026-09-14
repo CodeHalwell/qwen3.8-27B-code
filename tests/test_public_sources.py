@@ -196,8 +196,18 @@ def test_non_agentic_families_are_bucketed_but_stay_stable():
     # Enough families for the split to take a share, few enough to stay whole.
     assert len(families) == ps.FAMILY_BUCKETS
     assert all(family.startswith("opencodeinstruct:generic/") for family in families)
-    # The same row lands in the same family on every rebuild.
-    assert ps.bucketed_family("x", "7") == ps.bucketed_family("x", "7")
+    # The same row lands in the same family on every rebuild, so a corpus
+    # rebuilt later splits the same way. These are the values this hash
+    # produces; changing them changes which rows are held out.
+    assert [ps.bucketed_family("opencodeinstruct:generic", row_id) for row_id in ("1", "7", "abc", "12345")] == [
+        "opencodeinstruct:generic/11",
+        "opencodeinstruct:generic/17",
+        "opencodeinstruct:generic/13",
+        "opencodeinstruct:generic/05",
+    ]
+    # The prefix is carried through and an integer id reads like its string.
+    assert ps.bucketed_family("other:prefix", "7").startswith("other:prefix/")
+    assert ps.bucketed_family("p", 7) == ps.bucketed_family("p", "7")
 
 
 def test_convert_rows_stops_at_the_limit_and_drops_rows_over_budget():
