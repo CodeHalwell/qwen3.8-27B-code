@@ -1773,7 +1773,16 @@ def build_03_sft():
                 # validation loss: the adapter could not hold what the corpus
                 # had. Alpha tracks the rank so the update scaling (alpha / r)
                 # stays where it was and only capacity changes.
-                LORA_RANK = 64
+                #
+                # 32 rather than 64 because the card decides it. That run peaked
+                # at 88.5 GiB of the roughly 89.4 GiB the G4 reports
+                # (docs/model-and-hardware.md), and each doubling of the rank
+                # costs about 0.65 GiB of weight, gradient and 8-bit optimiser
+                # state: 32 fits in that 0.9 GiB, 64 does not. Going further
+                # means buying room first, and the row windows are already the
+                # shorter end of what these trajectories need, so the sequence
+                # length is the wrong place to buy it from.
+                LORA_RANK = 32
                 LORA_ALPHA = 2 * LORA_RANK
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 DATASET_REVISION = "main"  # the dataset notebook 02 pushed; pin a commit to repeat a run exactly

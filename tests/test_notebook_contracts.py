@@ -220,7 +220,7 @@ def test_notebooks_02_and_03_demo_data_execute_after_arrow_round_trip():
             "NUM_TRAIN_EPOCHS": 1, "MAX_STEPS": -1, "LEARNING_RATE": 5e-5,
             "train_dataset": range(5760), "eval_dataset": range(256),
             "DATASET_COMMIT": "a" * 40, "MODEL_COMMIT": "c" * 40,
-            "LORA_RANK": 64, "LORA_ALPHA": 128,
+            "LORA_RANK": 32, "LORA_ALPHA": 64,
             "run_manifest": {}, **overrides,
         }
         body = args_cell[: args_cell.index("training_args = SFTConfig(")]
@@ -667,8 +667,8 @@ def run_lora_discovery(cell: str) -> dict:
         "HfApi": _FakeHfApi,
         "MODEL_REVISION": "main",
         "run_manifest": {},
-        "LORA_RANK": 64,
-        "LORA_ALPHA": 128,
+        "LORA_RANK": 32,
+        "LORA_ALPHA": 64,
         "torch": _FakeTorch,
         "FastModel": _FakeFastModel,
         "require_free_vram": lambda *_: 90.0,
@@ -1278,7 +1278,10 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert "MAX_STEPS, PUSH_ADAPTER, PUSH_MERGED_SFT = 2, False, False" in sft_config
     # The rank is a configured lever, and alpha tracks it so that raising the
     # rank changes capacity without also changing the update scaling.
-    assert "LORA_RANK = 64" in sft_config
+    assert "LORA_RANK = 32" in sft_config
+    # The card reports about 89.4 GiB and the rank-16 run peaked at 88.5, so a
+    # rank whose extra state exceeds that headroom cannot be the shipped default.
+    assert "88.5 GiB" in sft_config and "89.4 GiB" in sft_config
     assert "LORA_ALPHA = 2 * LORA_RANK" in sft_config
     peft_cell = code_cell_containing(generator.build_03_sft(), "FastModel.get_peft_model(")
     assert "r=LORA_RANK," in peft_cell and "lora_alpha=LORA_ALPHA," in peft_cell
