@@ -954,7 +954,9 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     assert "learning_rate=LEARNING_RATE," in dpo_args
     assert "beta=DPO_BETA," in dpo_args
     dpo_train = code_cell_containing(generator.build_04_dpo(), "preference_mixture.json")
-    assert '"dpo" / "run_manifest.json"' in dpo_train
+    # Beside the trainer's output directory, not inside it; see
+    # test_training_artefacts_are_saved_outside_the_trainer_output_directory.
+    assert '(FINAL_DIR / "run_manifest.json").write_text' in dpo_train
     # The manifest names the rows actually read, not the configured Hub id.
     assert 'run_manifest["preference_sources"] = PREFERENCE_SOURCES' in dpo_train
     dpo_load = code_cell_containing(generator.build_04_dpo(), "demo_preferences = Dataset.from_list")
@@ -1245,6 +1247,47 @@ def test_fixture_rows_are_refused_at_publish_and_at_training():
     # The fixture rows really are marked that way.
     demo_cell = code_cell_containing(generator.build_02_data(), "raw_dataset = Dataset.from_list(demo_rows)")
     assert demo_cell.count('"id": "fixture/') >= 2
+
+
+def test_training_artefacts_are_saved_outside_the_trainer_output_directory():
+    """Everything left in the trainer's output directory is swept into
+    trainer.push_to_hub(): a local copy of the adapter saved there is published
+    a second time under its own subdirectory, and a completion marker written
+    there rides the same commit as the weights it is meant to follow."""
+    generator = load_generator()
+    stages = (
+        ("03", generator.build_03_sft, "SFT_RUN_DIR"),
+        ("04", generator.build_04_dpo, 'RUN_ROOT / "dpo"'),
+        ("05", generator.build_05_grpo, "grpo_root"),
+    )
+    for name, build, run_dir in stages:
+        cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
+        assert any(f"output_dir=str({run_dir})" in cell for cell in cells), name
+        saves = [
+            line.strip() for cell in cells for line in cell.splitlines()
+            if "save_model(" in line or "run_manifest.json\").write_text" in line
+            or "path_or_fileobj=" in line and "run_manifest" in line
+        ]
+        assert saves, name
+        for line in saves:
+            assert run_dir not in line, (name, line)
+            assert "final_adapter" not in line, (name, line)
+
+
+def test_dpo_records_the_shape_of_the_adapter_it_trains():
+    """Notebook 04 trains a fresh adapter over the merged SFT weights, so its
+    rank is its own. As a bare literal beside the model it never reached the
+    manifest, and two adapters of different shapes looked alike in their own
+    provenance records."""
+    generator = load_generator()
+    cells = [cell.source for cell in generator.build_04_dpo().cells if cell.cell_type == "code"]
+    config = next(cell for cell in cells if "DPO_BETA = " in cell)
+    assert "LORA_RANK = 16" in config
+    assert "LORA_ALPHA = 2 * LORA_RANK" in config
+    assert '"lora_rank": LORA_RANK' in config and '"lora_alpha": LORA_ALPHA' in config
+    load = next(cell for cell in cells if "FastModel.get_peft_model(" in cell)
+    assert "r=LORA_RANK," in load and "lora_alpha=LORA_ALPHA," in load
+    assert "r=16," not in load and "lora_alpha=32," not in load
 
 
 def test_every_notebook_checks_the_repository_out_the_same_way():

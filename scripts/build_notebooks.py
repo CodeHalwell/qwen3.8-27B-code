@@ -2343,9 +2343,16 @@ def build_03_sft():
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     run_manifest["peak_reserved_gib"] = round(peak_reserved_gib, 3)
                     run_manifest["training_memory_delta_gib"] = round(peak_reserved_gib - start_reserved_gib, 3)
-                    trainer.save_model(str(SFT_RUN_DIR / "final_adapter"))
-                    tokenizer.save_pretrained(str(SFT_RUN_DIR / "final_adapter"))
-                    (SFT_RUN_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    # Everything inside the trainer's output directory is swept into
+                    # trainer.push_to_hub(), so a local copy saved there is published a
+                    # second time under its own subdirectory, and the completion marker
+                    # rides the same commit as the weights it is meant to follow. Keep
+                    # both beside the run directory rather than inside it.
+                    FINAL_DIR = RUN_ROOT / "final" / "sft" / SFT_RUN_KEY
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
+                    tokenizer.save_pretrained(str(FINAL_DIR / "adapter"))
+                    (FINAL_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     if PUSH_ADAPTER:
                         from huggingface_hub import HfApi
 
@@ -2354,7 +2361,7 @@ def build_03_sft():
                         # training, so its existence proves nothing; notebook 07
                         # gates an adapter only once this file is on the Hub.
                         HfApi(token=hf_token).upload_file(
-                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -2379,7 +2386,7 @@ def build_03_sft():
                             )
                         model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
                         hub.upload_file(
-                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=MERGED_MODEL_ID,
                             commit_message="run manifest: merge completed",
@@ -2489,6 +2496,13 @@ def build_04_dpo():
                 LEARNING_RATE = 5e-6
                 DPO_BETA = 0.1
 
+                # A fresh adapter over the merged SFT weights, so this rank is
+                # independent of notebook 03's. It was a bare literal beside the
+                # model, which kept it out of the manifest: two adapters of different
+                # shapes then looked alike in their own provenance records.
+                LORA_RANK = 16
+                LORA_ALPHA = 2 * LORA_RANK
+
                 # The commit the merged checkpoint resolves to, pinned here so
                 # the marker check, the load and the manifest all name the same
                 # weights even if notebook 03 republishes meanwhile. Notebook 03
@@ -2535,6 +2549,8 @@ def build_04_dpo():
                     "max_steps": MAX_STEPS,
                     "learning_rate": LEARNING_RATE,
                     "beta": DPO_BETA,
+                    "lora_rank": LORA_RANK,
+                    "lora_alpha": LORA_ALPHA,
                     "loss_type": "sigmoid",
                     "gradient_accumulation_steps": 8,
                     "optimizer": "adamw_8bit",
@@ -2601,9 +2617,9 @@ def build_04_dpo():
                 model = FastModel.get_peft_model(
                     model,
                     finetune_vision_layers=False,
-                    r=16,
+                    r=LORA_RANK,
                     target_modules=sorted(discovered_suffixes),
-                    lora_alpha=32,
+                    lora_alpha=LORA_ALPHA,
                     lora_dropout=0,
                     bias="none",
                     use_gradient_checkpointing="unsloth",
@@ -2897,14 +2913,19 @@ def build_04_dpo():
                     run_manifest["preference_sources"] = PREFERENCE_SOURCES
                     run_manifest["preference_mixture"] = PREFERENCE_MIXTURE
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
-                    (RUN_ROOT / "dpo" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
-                    trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
+                    # As in notebook 03: files left inside the trainer's output directory
+                    # are swept into its push, duplicating the adapter and letting the
+                    # completion marker ride the weights' own commit.
+                    FINAL_DIR = RUN_ROOT / "final" / "dpo"
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    (FINAL_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="DPO adapter from verifier-backed preferences")
                         # Completion marker, after the final push: notebook 07 gates
                         # this adapter only once it is there.
                         hub.upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "dpo" / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -3324,7 +3345,10 @@ def build_05_grpo():
                     if trainer is None:
                         raise RuntimeError(AGENTIC_RL_BLOCKER)
                     result = trainer.train()
-                    trainer.save_model(str(RUN_ROOT / "grpo" / "final_adapter"))
+                    # Saved beside the run directory, not inside it: see notebook 03.
+                    FINAL_DIR = RUN_ROOT / "final" / "grpo"
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="Agentic GRPO pilot adapter")
                     print(result.metrics)
