@@ -19,12 +19,62 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOKS = ROOT / "notebooks"
 
 
+# Four notebooks check this repository out, and they kept drifting apart: one
+# would learn to honour a pinned revision while the others still cloned the
+# remote's default branch. There is one block now, spliced into every cell
+# carrying the token below, so a fix lands in all four at once.
+REPO_CHECKOUT_TOKEN = "# <repo-checkout>"
+
+REPO_CHECKOUT = r"""
+REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
+REPO_DIR = Path("/content/qwen3.8-27B-code")
+
+# One checkout path, cold runtime or warm. Cloning only when the directory
+# was absent meant a rerun kept whatever was cloned first, and a clone takes
+# the remote's default branch whatever REPO_REVISION says, so the two paths
+# could disagree about which code this cell is running. Point origin at
+# REPO_URL every time as well, since a directory left by an earlier REPO_URL
+# would otherwise keep the old remote and quietly fetch from it. Then fetch
+# and reset: a fetch takes a branch or a commit, where --branch takes only a
+# branch.
+if not (REPO_DIR / ".git").is_dir():
+    shutil.rmtree(REPO_DIR, ignore_errors=True)
+    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
+# A cold runtime has no origin to remove; that is the expected case, so
+# its message stays out of the cell output.
+subprocess.run(
+    ["git", "-C", str(REPO_DIR), "remote", "remove", "origin"], check=False, capture_output=True
+)
+subprocess.run(["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True)
+subprocess.run(
+    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
+)
+subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+""".strip()
+
+
+def splice_checkout(source: str) -> str:
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != REPO_CHECKOUT_TOKEN:
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        block = [
+            f"{indent}{body}" if body else ""
+            for body in REPO_CHECKOUT.splitlines()
+        ]
+        lines[index : index + 1] = block
+        return "\n".join(lines)
+    return source
+
+
 def markdown(source: str):
     return nbf.v4.new_markdown_cell(dedent(source).strip())
 
 
 def code(source: str):
-    return nbf.v4.new_code_cell(dedent(source).strip())
+    return nbf.v4.new_code_cell(dedent(splice_checkout(source)).strip())
 
 
 def notebook(title: str, cells: list):
@@ -1258,23 +1308,8 @@ def build_02_data():
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 SOURCE_DATASET_IDS = []  # Native-schema datasets only.
                 # The bootstrap corpus lives in this repository; the notebook
-                # clones it, so nothing has to be uploaded or pointed at.
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_BRANCH = "main"
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-                # Cloning only when the directory was absent meant a rerun in a
-                # runtime that already held a checkout kept whatever was cloned
-                # first: the bootstrap corpus and, more to the point, the
-                # converter this cell is about to import. Fetch and reset, so a
-                # rerun is this notebook's code and not last night's.
-                if (REPO_DIR / ".git").is_dir():
-                    subprocess.run(
-                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
-                    )
-                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
-                else:
-                    shutil.rmtree(REPO_DIR, ignore_errors=True)
-                    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                # checks it out, so nothing has to be uploaded or pointed at.
+                # <repo-checkout>
                 REPO_COMMIT = subprocess.run(
                     ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, check=True
                 ).stdout.strip()
@@ -2418,21 +2453,8 @@ def build_04_dpo():
                 PREFERENCE_DATASET_ID = f"{HF_USERNAME}/qwen38-code-preferences"
                 PREFERENCE_DATASET_REVISION = "main"
                 # The execution-derived bootstrap pairs live in this repository;
-                # the notebook clones it, so nothing has to be uploaded.
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_BRANCH = "main"
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-                # Cloning only when the directory was absent meant a rerun in a
-                # runtime that already held a checkout kept whatever was cloned
-                # first, pairs included. Fetch and reset instead.
-                if (REPO_DIR / ".git").is_dir():
-                    subprocess.run(
-                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
-                    )
-                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
-                else:
-                    shutil.rmtree(REPO_DIR, ignore_errors=True)
-                    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                # the notebook checks it out, so nothing has to be uploaded.
+                # <repo-checkout>
                 print(subprocess.run(
                     ["git", "-C", str(REPO_DIR), "rev-parse", "--short", "HEAD"],
                     text=True, capture_output=True, check=True,
@@ -3634,30 +3656,10 @@ def build_07_collect_and_evaluate():
             markdown("## Bring in the shared harness, collector and gate"),
             code(
                 r"""
+                import shutil
                 import subprocess
 
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-
-                import shutil
-
-                # Cloning only when the directory was absent meant a rerun in a
-                # runtime that already held a checkout kept whatever was cloned
-                # first, package included, so the harness fingerprint would
-                # describe code this run is not using. Fetch and reset instead;
-                # a fetch takes a branch or a commit, where --branch takes only
-                # a branch.
-                if not (REPO_DIR / ".git").is_dir():
-                    shutil.rmtree(REPO_DIR, ignore_errors=True)
-                    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
-                    subprocess.run(
-                        ["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True
-                    )
-                subprocess.run(
-                    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
-                )
-                subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+                # <repo-checkout>
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
                 # A rerun would otherwise import the copy an earlier run of this
@@ -4391,31 +4393,11 @@ def build_08_distil():
             markdown("## Bring in the shared harness, collector and teacher adapter"),
             code(
                 r"""
+                import shutil
                 import subprocess
                 import sys
 
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-
-                import shutil
-
-                # Cloning only when the directory was absent meant a rerun in a
-                # runtime that already held a checkout kept whatever was cloned
-                # first, package included, so the harness fingerprint would
-                # describe code this run is not using. Fetch and reset instead;
-                # a fetch takes a branch or a commit, where --branch takes only
-                # a branch.
-                if not (REPO_DIR / ".git").is_dir():
-                    shutil.rmtree(REPO_DIR, ignore_errors=True)
-                    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
-                    subprocess.run(
-                        ["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True
-                    )
-                subprocess.run(
-                    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
-                )
-                subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+                # <repo-checkout>
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
                 # A rerun would otherwise import the copy an earlier run of this

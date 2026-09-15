@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1246,32 +1247,55 @@ def test_fixture_rows_are_refused_at_publish_and_at_training():
     assert demo_cell.count('"id": "fixture/') >= 2
 
 
+def test_every_notebook_checks_the_repository_out_the_same_way():
+    """Four notebooks check this repository out, and the bugs found in one were
+    always still in the other three. Assert it is literally one block."""
+    generator = load_generator()
+    builders = (
+        ("02", generator.build_02_data), ("04", generator.build_04_dpo),
+        ("07", generator.build_07_collect_and_evaluate), ("08", generator.build_08_distil),
+    )
+    blocks = {}
+    for name, build in builders:
+        cell = code_cell_containing(build(), 'REPO_DIR = Path("/content/qwen3.8-27B-code")')
+        start = cell.index('REPO_URL = "https://github.com/')
+        end = cell.index('subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)')
+        blocks[name] = cell[start:end]
+    assert len(set(blocks.values())) == 1, sorted(blocks)
+
+    block = blocks["02"]
+    # A cold runtime honours REPO_REVISION too: a clone would take the remote's
+    # default branch, so the two paths would train from different data.
+    assert '["git", "clone"' not in block
+    assert '["git", "init", "-q", str(REPO_DIR)], check=True' in block
+    assert '["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True' in block
+    # origin is set on every run, not only when the directory is new: a
+    # checkout left by an earlier REPO_URL would otherwise be fetched from.
+    top_level = [ast.unparse(node) for node in ast.parse(block).body]
+    remote_calls = [statement for statement in top_level if "'remote'" in statement]
+    assert len(remote_calls) == 2, top_level
+    assert "'remote', 'remove', 'origin'" in remote_calls[0] and "check=False" in remote_calls[0]
+    assert "'remote', 'add', 'origin', REPO_URL" in remote_calls[1] and "check=True" in remote_calls[1]
+
+
 def test_notebooks_run_the_real_pipeline_as_shipped():
     """Open, Run all: no demo default, no publish flag to flip, no placeholder
     to fill in. Notebook 07 decides from the Hub what a session needs."""
     generator = load_generator()
     data_config = code_cell_containing(generator.build_02_data(), "SOURCE_LOCAL_JSONL")
     assert "DEMO_MODE = False" in data_config
-    assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
-    # A checkout left by an earlier run is refreshed, not reused, and the
-    # package it holds is dropped from sys.modules before the import.
-    assert '["git", "fetch", "--depth", "1", "origin", REPO_BRANCH]' in data_config
-    assert '["git", "reset", "--hard", "FETCH_HEAD"]' in data_config
-    assert "if not REPO_DIR.exists():" not in data_config
-    # Every notebook that clones this repository refreshes it, not just 02:
-    # a stale checkout in notebook 07 fingerprints code the run is not using.
+    # The package a stale checkout holds is dropped from sys.modules before the
+    # import, or the refreshed checkout on disk is not the code that runs.
+    assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
     for name, build in (
         ("04", generator.build_04_dpo), ("07", generator.build_07_collect_and_evaluate),
         ("08", generator.build_08_distil),
     ):
         joined = "\n".join(cell.source for cell in build().cells)
-        assert "if not REPO_DIR.exists():" not in joined, name
-        assert '["git", "reset", "--hard", "FETCH_HEAD"]' in joined, name
         if "qwen3_8_27b_code" in joined:
             assert 'name.split(".")[0] == "qwen3_8_27b_code"' in joined, name
-    assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
     assert data_config.index("del sys.modules[module_name]") < data_config.index(
         "from qwen3_8_27b_code.public_sources import"
     )
