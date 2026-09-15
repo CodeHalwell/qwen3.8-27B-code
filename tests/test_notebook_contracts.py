@@ -1260,6 +1260,17 @@ def test_notebooks_run_the_real_pipeline_as_shipped():
     assert '["git", "fetch", "--depth", "1", "origin", REPO_BRANCH]' in data_config
     assert '["git", "reset", "--hard", "FETCH_HEAD"]' in data_config
     assert "if not REPO_DIR.exists():" not in data_config
+    # Every notebook that clones this repository refreshes it, not just 02:
+    # a stale checkout in notebook 07 fingerprints code the run is not using.
+    for name, build in (
+        ("04", generator.build_04_dpo), ("07", generator.build_07_collect_and_evaluate),
+        ("08", generator.build_08_distil),
+    ):
+        joined = "\n".join(cell.source for cell in build().cells)
+        assert "if not REPO_DIR.exists():" not in joined, name
+        assert '["git", "reset", "--hard", "FETCH_HEAD"]' in joined, name
+        if "qwen3_8_27b_code" in joined:
+            assert 'name.split(".")[0] == "qwen3_8_27b_code"' in joined, name
     assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
     assert data_config.index("del sys.modules[module_name]") < data_config.index(
         "from qwen3_8_27b_code.public_sources import"

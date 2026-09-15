@@ -2398,6 +2398,7 @@ def build_04_dpo():
             code(
                 r"""
                 import hashlib
+                import shutil
                 import subprocess
 
                 from unsloth import FastModel
@@ -2419,9 +2420,23 @@ def build_04_dpo():
                 # The execution-derived bootstrap pairs live in this repository;
                 # the notebook clones it, so nothing has to be uploaded.
                 REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+                REPO_BRANCH = "main"
                 REPO_DIR = Path("/content/qwen3.8-27B-code")
-                if not REPO_DIR.exists():
+                # Cloning only when the directory was absent meant a rerun in a
+                # runtime that already held a checkout kept whatever was cloned
+                # first, pairs included. Fetch and reset instead.
+                if (REPO_DIR / ".git").is_dir():
+                    subprocess.run(
+                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
+                    )
+                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+                else:
+                    shutil.rmtree(REPO_DIR, ignore_errors=True)
                     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                print(subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "rev-parse", "--short", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip())
                 PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")
                 # Reasoning-length pairs from notebook 07 or collect_trajectories.py.
                 # They teach brevity only (both sides succeeded), so they stay a
@@ -3625,13 +3640,32 @@ def build_07_collect_and_evaluate():
                 REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
                 REPO_DIR = Path("/content/qwen3.8-27B-code")
 
-                if not REPO_DIR.exists():
+                import shutil
+
+                # Cloning only when the directory was absent meant a rerun in a
+                # runtime that already held a checkout kept whatever was cloned
+                # first, package included, so the harness fingerprint would
+                # describe code this run is not using. Fetch and reset instead;
+                # a fetch takes a branch or a commit, where --branch takes only
+                # a branch.
+                if not (REPO_DIR / ".git").is_dir():
+                    shutil.rmtree(REPO_DIR, ignore_errors=True)
+                    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
                     subprocess.run(
-                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
-                        check=True,
+                        ["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True
                     )
+                subprocess.run(
+                    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
+                )
+                subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
 
                 from qwen3_8_27b_code.collection import collect, write_corpus
                 from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
@@ -4364,13 +4398,32 @@ def build_08_distil():
                 REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
                 REPO_DIR = Path("/content/qwen3.8-27B-code")
 
-                if not REPO_DIR.exists():
+                import shutil
+
+                # Cloning only when the directory was absent meant a rerun in a
+                # runtime that already held a checkout kept whatever was cloned
+                # first, package included, so the harness fingerprint would
+                # describe code this run is not using. Fetch and reset instead;
+                # a fetch takes a branch or a commit, where --branch takes only
+                # a branch.
+                if not (REPO_DIR / ".git").is_dir():
+                    shutil.rmtree(REPO_DIR, ignore_errors=True)
+                    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
                     subprocess.run(
-                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
-                        check=True,
+                        ["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True
                     )
+                subprocess.run(
+                    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
+                )
+                subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
 
                 from qwen3_8_27b_code.collection import collect, read_attempts, write_attempts, write_corpus
                 from qwen3_8_27b_code.distillation import build_outcome_pairs, write_outcome_pairs
