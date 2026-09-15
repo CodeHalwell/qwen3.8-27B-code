@@ -7,9 +7,11 @@ Three sources, two lanes (docs/data-strategy.md):
   loss, observation format included. Only resolved trajectories are
   kept, and each stops before the harness's final submit command, which
   nothing answers. They are long (a median of tens of thousands of
-  tokens), so one over the token budget is cut to a head window, a
-  faithful prefix; no tail window is cut, since its test results would
-  vouch for edits the window leaves out. Tool outputs are trimmed.
+  tokens), so one over the token budget is cut into windows that together
+  cover every turn once: the opening, then later runs of turns, each
+  carrying an elision note naming the turns and commands that came before
+  it so nothing vouches for edits it does not show. Tool outputs are
+  trimmed.
 * ``nvidia/OpenCodeInstruct`` — instruction and answer pairs with unit
   tests; only rows whose tests all passed are kept, as non-agentic rows.
 * ``nvidia/OpenCodeReasoning`` — competitive-programming answers with the
@@ -32,7 +34,7 @@ from .harness import TRUNCATION_MARKER as TRUNCATION_MARKER  # re-exported for c
 from .harness import format_command_observation, trim_output
 from .schema import TOOL_SCHEMA_JSON, TOOL_SCHEMA_VERSION, TOOLS
 
-CONVERTER_VERSION = "public-sources-v3"
+CONVERTER_VERSION = "public-sources-v4"
 TokenCounter = Callable[[str], int]
 
 # Roughly one token per 3.6 characters of mixed code and prose; used only
@@ -204,18 +206,74 @@ def _turn_groups(messages: list[dict]) -> tuple[list[dict], list[list[dict]]]:
     return prefix, groups
 
 
+# An elided run of turns is announced in place of the turns themselves,
+# with the commands they ran, so a later turn's claim about the repository
+# is backed by something in its own context. The note is a user turn, which
+# assistant-only masking excludes from the loss: it is context, never a
+# target.
+ELIDED_COMMAND_CHARS = 160
+# The note competes with the turns it is introducing, and it grows as the
+# episode does. Capped at this share of the budget it cannot crowd them out;
+# the oldest commands are dropped first, since the newest describe the state
+# the next turn is about to act on.
+ELIDED_NOTE_BUDGET_SHARE = 0.15
+
+
+def _elision_note(elided: list[list[dict]], commands: list[str], dropped: int) -> dict:
+    listing = [f"  {command}" for command in commands]
+    if dropped:
+        listing.insert(0, f"  ... {dropped} earlier commands omitted ...")
+    body = "\n".join(listing) or "  (no commands)"
+    return {
+        "role": "user",
+        "content": (
+            f"[Earlier turns of this session are omitted. {len(elided)} assistant "
+            f"turns ran before this point and the repository already reflects "
+            f"them. The commands they ran, in order:\n{body}\n]"
+        ),
+    }
+
+
+def _elision_message(
+    elided: list[list[dict]], max_tokens: int, count: TokenCounter = approximate_tokens
+) -> dict:
+    """Announce a run of omitted turns and the commands they ran, within
+    ``max_tokens``. Oldest commands go first when it does not fit."""
+    commands = []
+    for group in elided:
+        for call in group[0].get("tool_calls") or []:
+            function = call.get("function") or {}
+            argument = (function.get("arguments") or {}).get("command")
+            if isinstance(argument, str):
+                commands.append(f"{function.get('name')}: {trim_output(argument, ELIDED_COMMAND_CHARS)}")
+    kept = list(commands)
+    while True:
+        note = _elision_note(elided, kept, len(commands) - len(kept))
+        if not kept or _message_tokens(note, count) <= max_tokens:
+            return note
+        kept = kept[1:]
+
+
 def window_trajectory(
     messages: list[dict], budget_tokens: int, count: TokenCounter = approximate_tokens
 ) -> list[tuple[str, list[dict]]]:
-    """Cut a trajectory down to one window that fits ``budget_tokens``.
+    """Cut a trajectory into windows that each fit ``budget_tokens``.
 
-    A trajectory that fits is one ``whole`` window. A longer one yields a
-    ``head`` window: the prefix and the first turns that fit, which is a
-    faithful prefix of what happened. No tail window is cut: the last
-    turns depend on edits made in the turns left out, so a passing test
-    there would vouch for a patch the transcript never shows. Turns are
-    never split from the tool responses that answer them. Nothing is
-    returned when even one turn does not fit beside the prefix.
+    A trajectory that fits is one ``whole`` window. A longer one is cut into
+    a ``head`` window and then ``segment`` windows which together cover every
+    turn exactly once, so the middle and the end of an episode are trained on
+    rather than only its opening. Head windows alone taught the model the
+    exploratory turns, where an agent reasons least, and a gate run measured
+    what that cost: reasoning fell by two thirds and success with it.
+
+    A segment carries an elision note in place of the turns before it, naming
+    how many ran and which commands they ran. That is what keeps a window
+    that starts mid-episode honest: a later turn reporting a passing test has
+    the patch that made it pass somewhere in its own context, rather than
+    vouching for edits the transcript never shows.
+
+    Turns are never split from the tool responses that answer them. Nothing
+    is returned when even one turn does not fit beside the prefix.
     """
     prefix, groups = _turn_groups(messages)
     if not groups:
@@ -224,18 +282,33 @@ def window_trajectory(
     group_tokens = [sum(_message_tokens(m, count) for m in group) for group in groups]
     if prefix_tokens + sum(group_tokens) <= budget_tokens:
         return [("whole", prefix + [m for group in groups for m in group])]
-    available = budget_tokens - prefix_tokens
 
-    head: list[list[dict]] = []
-    used = 0
-    for group, size in zip(groups, group_tokens):
-        if used + size > available:
+    windows: list[tuple[str, list[dict]]] = []
+    start = 0
+    while start < len(groups):
+        available = budget_tokens - prefix_tokens
+        elision = None
+        if start:
+            elision = _elision_message(
+                groups[:start], int(budget_tokens * ELIDED_NOTE_BUDGET_SHARE), count
+            )
+            available -= _message_tokens(elision, count)
+        taken, used = 0, 0
+        for size in group_tokens[start:]:
+            if used + size > available:
+                break
+            used += size
+            taken += 1
+        # The opening turn not fitting beside the prefix drops the
+        # trajectory, as before. Later, it means the elision note has grown
+        # past what the budget leaves; the turns covered so far still stand.
+        if taken == 0:
             break
-        head.append(group)
-        used += size
-    if not head:
-        return []
-    return [("head", prefix + [m for group in head for m in group])]
+        head = prefix if elision is None else prefix + [elision]
+        body = [message for group in groups[start:start + taken] for message in group]
+        windows.append(("head" if start == 0 else "segment", head + body))
+        start += taken
+    return windows
 
 
 def convert_open_swe_row(row: dict, budget_tokens: int, count: TokenCounter = approximate_tokens) -> list[dict]:
@@ -248,14 +321,17 @@ def convert_open_swe_row(row: dict, budget_tokens: int, count: TokenCounter = ap
     repo = str(row.get("repo") or "unknown/unknown")
     effort = SOURCE_LOADERS[SOURCE_OPEN_SWE]["reasoning_effort"]
     rows = []
-    for kind, window in window_trajectory(messages, budget_tokens, count):
+    trajectory = row.get("trajectory_id") or row.get("instance_id")
+    for position, (kind, window) in enumerate(window_trajectory(messages, budget_tokens, count)):
+        # One trajectory now yields several rows, so the position goes in the
+        # id: "head" is always position 0 and the segments follow it.
+        suffix = kind if kind in ("whole", "head") else f"{kind}-{position}"
         base = _base_row(
-            f"open-swe-traces/{row.get('trajectory_id') or row.get('instance_id')}/{kind}",
-            SOURCE_OPEN_SWE, repo, "agentic", effort,
+            f"open-swe-traces/{trajectory}/{suffix}", SOURCE_OPEN_SWE, repo, "agentic", effort,
         )
         base["messages"] = window
-        # The flag records the episode's outcome; ``window`` says whether
-        # the row is that whole episode or a prefix of it.
+        # The flag records the episode's outcome; ``window`` says whether the
+        # row is that whole episode, its opening, or a later run of its turns.
         base["verification"] = {"all_required_tests_pass": True, "runner": "swe-rebench hidden tests", "window": kind}
         rows.append(base)
     return rows

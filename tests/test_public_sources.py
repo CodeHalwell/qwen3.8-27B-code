@@ -101,11 +101,9 @@ def test_long_trajectories_are_cut_to_a_faithful_head_window():
     whole = ps.window_trajectory(messages, budget_tokens=100_000, count=count)
     assert [kind for kind, _ in whole] == ["whole"]
     windows = ps.window_trajectory(messages, budget_tokens=420, count=count)
-    # One head window and never a tail: the last turns depend on edits the
-    # omitted middle made, so a tail would show tests passing for a patch
-    # the transcript never contains.
-    assert [kind for kind, _ in windows] == ["head"]
-    ((_, head),) = windows
+    # The opening window is still a faithful prefix of what happened.
+    assert [kind for kind, _ in windows][0] == "head"
+    (_, head) = windows[0]
     assert head[:2] == messages[:2] and head[2] is messages[2]
     assert head == messages[: len(head)]
     assert len(head) < len(messages)
@@ -119,8 +117,10 @@ def test_long_trajectories_are_cut_to_a_faithful_head_window():
             pending -= 1
     assert pending == 0
     rows = ps.convert_open_swe_row(row, budget_tokens=420, count=count)
-    assert [r["verification"]["window"] for r in rows] == ["head"]
+    assert [r["verification"]["window"] for r in rows][0] == "head"
     assert all(ps.converted_tokens(r, count) <= 420 for r in rows)
+    # One trajectory, several rows: the ids must not collide.
+    assert len({r["id"] for r in rows}) == len(rows)
     assert ps.window_trajectory(messages, budget_tokens=10, count=count) == []
 
 
@@ -275,3 +275,100 @@ def test_converted_rows_pass_notebook_02_validation():
         assert validate_row(row) == []
     for row in ps.convert_open_code_reasoning_row({"id": "2", "source": "s", "input": "q", "output": "<think>t</think>a"}):
         assert validate_row(row) == []
+
+
+def _long_trajectory(turns: int) -> list[dict]:
+    """A trajectory shaped like the Open-SWE ones: long tool output, and
+    reasoning that deepens once exploring gives way to diagnosing."""
+    messages = [
+        {"role": "developer", "content": "You are a coding agent."},
+        {"role": "user", "content": "Fix the failing test. " + "context " * 40},
+    ]
+    for index in range(turns):
+        deep = index >= 3
+        messages.append({
+            "role": "assistant",
+            "content": f"Step {index}.",
+            "reasoning_content": f"Reasoning {index}. " * (60 if deep else 4),
+            "tool_calls": [{"type": "function", "function": {
+                "name": "shell", "arguments": {"command": f"pytest tests/test_{index}.py"}}}],
+        })
+        messages.append({"role": "tool", "name": "shell", "content": f"output {index} " + "y" * 1_500})
+    return messages
+
+
+def test_a_long_trajectory_is_segmented_so_every_turn_is_trained_on():
+    """Head windows alone taught the model only the exploratory opening of an
+    episode, where an agent reasons least; a gate run measured reasoning
+    falling by two thirds and success with it. The windows now cover the whole
+    episode, each turn supervised exactly once."""
+    budget = 6_000
+    messages = _long_trajectory(28)
+    windows = ps.window_trajectory(messages, budget_tokens=budget)
+    assert [kind for kind, _ in windows] == ["head"] + ["segment"] * (len(windows) - 1)
+    assert len(windows) > 1, "a 28-turn trajectory must not collapse to one window"
+
+    # Every assistant turn is trained on, and no turn is trained on twice:
+    # overlap would reweight the opening, which is the shape being fixed.
+    supervised = [m["content"] for _, window in windows for m in window if m["role"] == "assistant"]
+    assert supervised == [f"Step {index}." for index in range(28)]
+
+    for kind, window in windows:
+        assert sum(ps._message_tokens(m, ps.approximate_tokens) for m in window) <= budget, kind
+        # Turns keep their observations: no window ends mid-pair.
+        pending = 0
+        for message in window:
+            if message["role"] == "assistant":
+                assert pending == 0
+                pending = len(message.get("tool_calls") or [])
+            elif message["role"] == "tool":
+                pending -= 1
+        assert pending == 0, kind
+
+    notes = [
+        [m for m in window if m["role"] == "user" and m["content"].startswith("[Earlier turns")]
+        for _, window in windows
+    ]
+    assert notes[0] == [], "the opening window elides nothing"
+    for note in notes[1:]:
+        assert len(note) == 1
+        # A user turn, so assistant-only masking keeps it out of the loss: it
+        # is context for the turns that follow, never a target.
+        assert note[0]["role"] == "user"
+        # What makes a window starting mid-episode honest: the commands that
+        # built the repository state its turns are about to act on.
+        assert "pytest tests/test_0.py" in note[0]["content"]
+
+
+def test_the_elision_note_cannot_crowd_out_the_turns_it_introduces():
+    """The note grows with the episode. Unbounded, it ate the budget and
+    segmenting silently produced nothing past the opening window."""
+    budget = 6_000
+    ceiling = int(budget * ps.ELIDED_NOTE_BUDGET_SHARE)
+    # Real agent commands include heredocs that write whole files, so the
+    # listing has to be trimmed rather than merely counted.
+    messages = _long_trajectory(60)
+    for index, message in enumerate(messages):
+        if message["role"] == "assistant":
+            message["tool_calls"][0]["function"]["arguments"]["command"] = (
+                f"cat > module_{index}.py <<'EOF'\n" + f"line {index}\n" * 200 + "EOF"
+            )
+    windows = ps.window_trajectory(messages, budget_tokens=budget)
+    assert len(windows) > 5
+    for _, window in windows[1:]:
+        (note,) = [m for m in window if m["role"] == "user" and m["content"].startswith("[Earlier turns")]
+        assert ps._message_tokens(note, ps.approximate_tokens) <= ceiling
+        # Every window still carries turns to train on, which is the point of
+        # bounding the note at all.
+        assert sum(1 for m in window if m["role"] == "assistant") >= 1
+    # Each listed command is trimmed rather than dropped whole, and the ones
+    # dropped are counted out loud instead of going silently.
+    (note,) = [
+        m for m in windows[-1][1]
+        if m["role"] == "user" and m["content"].startswith("[Earlier turns")
+    ]
+    assert harness.TRUNCATION_MARKER in note["content"]
+    assert "earlier commands omitted" in note["content"]
+    # The commands kept are the most recent: they describe the state the next
+    # turn is about to act on.
+    assert "module_0.py" not in note["content"]

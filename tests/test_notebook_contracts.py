@@ -763,6 +763,50 @@ def test_baseline_treats_truncated_and_overlong_turns_as_terminations():
     assert "raw, prompt_count, completion_count = generate_turn" not in episode_cell
 
 
+def test_notebook_02_accepts_a_segmented_trajectory_row():
+    """A segment carries an elision note as a second user turn, so the
+    validator must not require the roles to alternate. Rows that fail here
+    fail at the top of a six-hour run, after the corpus is already built."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from qwen3_8_27b_code import public_sources as ps
+
+    generator = load_generator()
+    namespace = {"json": json, "raw_dataset": []}
+    exec(generator.TOOLS_CELL, namespace)
+    exec(code_cell_containing(generator.build_02_data(), "def validate_row"), namespace)
+    validate_row = namespace["validate_row"]
+
+    # The source roles, as Open-SWE spells them: system, and the bash tool.
+    messages = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Fix the failing test. " + "context " * 40},
+    ]
+    for index in range(24):
+        messages.append({
+            "role": "assistant",
+            "content": f"Step {index}.",
+            "reasoning_content": f"Reasoning {index}. " * 30,
+            "tool_calls": [{"type": "function", "id": "c", "function": {
+                "name": "bash",
+                "arguments": json.dumps({"command": f"pytest tests/test_{index}.py"}),
+            }}],
+        })
+        messages.append({"role": "tool", "content": f"output {index} " + "y" * 1_500})
+
+    rows = ps.convert_open_swe_row(
+        {"resolved": 1, "messages": messages, "repo": "acme/widget", "trajectory_id": "t1"},
+        budget_tokens=6_000,
+    )
+    kinds = [row["verification"]["window"] for row in rows]
+    assert kinds[0] == "head" and "segment" in kinds, kinds
+    for row in rows:
+        row = dict(row, tool_schema_version=namespace["TOOL_SCHEMA_VERSION"],
+                   tool_schema_json=namespace["TOOL_SCHEMA_JSON"], tools=namespace["TOOLS"])
+        assert validate_row(row) == [], (row["id"], validate_row(row))
+
+
 def test_notebook_02_accepts_the_documented_non_agentic_lane():
     generator = load_generator()
     namespace = {"json": json, "raw_dataset": []}
