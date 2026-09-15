@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
@@ -953,7 +954,9 @@ def test_training_notebooks_publish_privately_and_save_on_a_real_cadence():
     assert "learning_rate=LEARNING_RATE," in dpo_args
     assert "beta=DPO_BETA," in dpo_args
     dpo_train = code_cell_containing(generator.build_04_dpo(), "preference_mixture.json")
-    assert '"dpo" / "run_manifest.json"' in dpo_train
+    # Beside the trainer's output directory, not inside it; see
+    # test_training_artefacts_are_saved_outside_the_trainer_output_directory.
+    assert '(FINAL_DIR / "run_manifest.json").write_text' in dpo_train
     # The manifest names the rows actually read, not the configured Hub id.
     assert 'run_manifest["preference_sources"] = PREFERENCE_SOURCES' in dpo_train
     dpo_load = code_cell_containing(generator.build_04_dpo(), "demo_preferences = Dataset.from_list")
@@ -1246,21 +1249,96 @@ def test_fixture_rows_are_refused_at_publish_and_at_training():
     assert demo_cell.count('"id": "fixture/') >= 2
 
 
+def test_training_artefacts_are_saved_outside_the_trainer_output_directory():
+    """Everything left in the trainer's output directory is swept into
+    trainer.push_to_hub(): a local copy of the adapter saved there is published
+    a second time under its own subdirectory, and a completion marker written
+    there rides the same commit as the weights it is meant to follow."""
+    generator = load_generator()
+    stages = (
+        ("03", generator.build_03_sft, "SFT_RUN_DIR"),
+        ("04", generator.build_04_dpo, 'RUN_ROOT / "dpo"'),
+        ("05", generator.build_05_grpo, "grpo_root"),
+    )
+    for name, build, run_dir in stages:
+        cells = [cell.source for cell in build().cells if cell.cell_type == "code"]
+        assert any(f"output_dir=str({run_dir})" in cell for cell in cells), name
+        saves = [
+            line.strip() for cell in cells for line in cell.splitlines()
+            if "save_model(" in line or "run_manifest.json\").write_text" in line
+            or "path_or_fileobj=" in line and "run_manifest" in line
+        ]
+        assert saves, name
+        for line in saves:
+            assert run_dir not in line, (name, line)
+            assert "final_adapter" not in line, (name, line)
+
+
+def test_dpo_records_the_shape_of_the_adapter_it_trains():
+    """Notebook 04 trains a fresh adapter over the merged SFT weights, so its
+    rank is its own. As a bare literal beside the model it never reached the
+    manifest, and two adapters of different shapes looked alike in their own
+    provenance records."""
+    generator = load_generator()
+    cells = [cell.source for cell in generator.build_04_dpo().cells if cell.cell_type == "code"]
+    config = next(cell for cell in cells if "DPO_BETA = " in cell)
+    assert "LORA_RANK = 16" in config
+    assert "LORA_ALPHA = 2 * LORA_RANK" in config
+    assert '"lora_rank": LORA_RANK' in config and '"lora_alpha": LORA_ALPHA' in config
+    load = next(cell for cell in cells if "FastModel.get_peft_model(" in cell)
+    assert "r=LORA_RANK," in load and "lora_alpha=LORA_ALPHA," in load
+    assert "r=16," not in load and "lora_alpha=32," not in load
+
+
+def test_every_notebook_checks_the_repository_out_the_same_way():
+    """Four notebooks check this repository out, and the bugs found in one were
+    always still in the other three. Assert it is literally one block."""
+    generator = load_generator()
+    builders = (
+        ("02", generator.build_02_data), ("04", generator.build_04_dpo),
+        ("07", generator.build_07_collect_and_evaluate), ("08", generator.build_08_distil),
+    )
+    blocks = {}
+    for name, build in builders:
+        cell = code_cell_containing(build(), 'REPO_DIR = Path("/content/qwen3.8-27B-code")')
+        start = cell.index('REPO_URL = "https://github.com/')
+        end = cell.index('subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)')
+        blocks[name] = cell[start:end]
+    assert len(set(blocks.values())) == 1, sorted(blocks)
+
+    block = blocks["02"]
+    # A cold runtime honours REPO_REVISION too: a clone would take the remote's
+    # default branch, so the two paths would train from different data.
+    assert '["git", "clone"' not in block
+    assert '["git", "init", "-q", str(REPO_DIR)], check=True' in block
+    assert '["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True' in block
+    # origin is set on every run, not only when the directory is new: a
+    # checkout left by an earlier REPO_URL would otherwise be fetched from.
+    top_level = [ast.unparse(node) for node in ast.parse(block).body]
+    remote_calls = [statement for statement in top_level if "'remote'" in statement]
+    assert len(remote_calls) == 2, top_level
+    assert "'remote', 'remove', 'origin'" in remote_calls[0] and "check=False" in remote_calls[0]
+    assert "'remote', 'add', 'origin', REPO_URL" in remote_calls[1] and "check=True" in remote_calls[1]
+
+
 def test_notebooks_run_the_real_pipeline_as_shipped():
     """Open, Run all: no demo default, no publish flag to flip, no placeholder
     to fill in. Notebook 07 decides from the Hub what a session needs."""
     generator = load_generator()
     data_config = code_cell_containing(generator.build_02_data(), "SOURCE_LOCAL_JSONL")
     assert "DEMO_MODE = False" in data_config
-    assert 'subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)' in data_config
     assert 'SOURCE_LOCAL_JSONL = str(REPO_DIR / "data" / "native_sft" / "trajectories.jsonl")' in data_config
     assert "PUSH_DATASET = True" in code_cell_containing(generator.build_02_data(), "PUSH_DATASET = ")
-    # A checkout left by an earlier run is refreshed, not reused, and the
-    # package it holds is dropped from sys.modules before the import.
-    assert '["git", "fetch", "--depth", "1", "origin", REPO_BRANCH]' in data_config
-    assert '["git", "reset", "--hard", "FETCH_HEAD"]' in data_config
-    assert "if not REPO_DIR.exists():" not in data_config
+    # The package a stale checkout holds is dropped from sys.modules before the
+    # import, or the refreshed checkout on disk is not the code that runs.
     assert 'name.split(".")[0] == "qwen3_8_27b_code"' in data_config
+    for name, build in (
+        ("04", generator.build_04_dpo), ("07", generator.build_07_collect_and_evaluate),
+        ("08", generator.build_08_distil),
+    ):
+        joined = "\n".join(cell.source for cell in build().cells)
+        if "qwen3_8_27b_code" in joined:
+            assert 'name.split(".")[0] == "qwen3_8_27b_code"' in joined, name
     assert data_config.index("del sys.modules[module_name]") < data_config.index(
         "from qwen3_8_27b_code.public_sources import"
     )

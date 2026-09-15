@@ -19,12 +19,62 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOKS = ROOT / "notebooks"
 
 
+# Four notebooks check this repository out, and they kept drifting apart: one
+# would learn to honour a pinned revision while the others still cloned the
+# remote's default branch. There is one block now, spliced into every cell
+# carrying the token below, so a fix lands in all four at once.
+REPO_CHECKOUT_TOKEN = "# <repo-checkout>"
+
+REPO_CHECKOUT = r"""
+REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
+REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
+REPO_DIR = Path("/content/qwen3.8-27B-code")
+
+# One checkout path, cold runtime or warm. Cloning only when the directory
+# was absent meant a rerun kept whatever was cloned first, and a clone takes
+# the remote's default branch whatever REPO_REVISION says, so the two paths
+# could disagree about which code this cell is running. Point origin at
+# REPO_URL every time as well, since a directory left by an earlier REPO_URL
+# would otherwise keep the old remote and quietly fetch from it. Then fetch
+# and reset: a fetch takes a branch or a commit, where --branch takes only a
+# branch.
+if not (REPO_DIR / ".git").is_dir():
+    shutil.rmtree(REPO_DIR, ignore_errors=True)
+    subprocess.run(["git", "init", "-q", str(REPO_DIR)], check=True)
+# A cold runtime has no origin to remove; that is the expected case, so
+# its message stays out of the cell output.
+subprocess.run(
+    ["git", "-C", str(REPO_DIR), "remote", "remove", "origin"], check=False, capture_output=True
+)
+subprocess.run(["git", "-C", str(REPO_DIR), "remote", "add", "origin", REPO_URL], check=True)
+subprocess.run(
+    ["git", "fetch", "--depth", "1", "origin", REPO_REVISION], cwd=REPO_DIR, check=True
+)
+subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
+""".strip()
+
+
+def splice_checkout(source: str) -> str:
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != REPO_CHECKOUT_TOKEN:
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        block = [
+            f"{indent}{body}" if body else ""
+            for body in REPO_CHECKOUT.splitlines()
+        ]
+        lines[index : index + 1] = block
+        return "\n".join(lines)
+    return source
+
+
 def markdown(source: str):
     return nbf.v4.new_markdown_cell(dedent(source).strip())
 
 
 def code(source: str):
-    return nbf.v4.new_code_cell(dedent(source).strip())
+    return nbf.v4.new_code_cell(dedent(splice_checkout(source)).strip())
 
 
 def notebook(title: str, cells: list):
@@ -1258,23 +1308,8 @@ def build_02_data():
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 SOURCE_DATASET_IDS = []  # Native-schema datasets only.
                 # The bootstrap corpus lives in this repository; the notebook
-                # clones it, so nothing has to be uploaded or pointed at.
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_BRANCH = "main"
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-                # Cloning only when the directory was absent meant a rerun in a
-                # runtime that already held a checkout kept whatever was cloned
-                # first: the bootstrap corpus and, more to the point, the
-                # converter this cell is about to import. Fetch and reset, so a
-                # rerun is this notebook's code and not last night's.
-                if (REPO_DIR / ".git").is_dir():
-                    subprocess.run(
-                        ["git", "fetch", "--depth", "1", "origin", REPO_BRANCH], cwd=REPO_DIR, check=True
-                    )
-                    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=REPO_DIR, check=True)
-                else:
-                    shutil.rmtree(REPO_DIR, ignore_errors=True)
-                    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                # checks it out, so nothing has to be uploaded or pointed at.
+                # <repo-checkout>
                 REPO_COMMIT = subprocess.run(
                     ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True, text=True, check=True
                 ).stdout.strip()
@@ -2308,9 +2343,16 @@ def build_03_sft():
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
                     run_manifest["peak_reserved_gib"] = round(peak_reserved_gib, 3)
                     run_manifest["training_memory_delta_gib"] = round(peak_reserved_gib - start_reserved_gib, 3)
-                    trainer.save_model(str(SFT_RUN_DIR / "final_adapter"))
-                    tokenizer.save_pretrained(str(SFT_RUN_DIR / "final_adapter"))
-                    (SFT_RUN_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    # Everything inside the trainer's output directory is swept into
+                    # trainer.push_to_hub(), so a local copy saved there is published a
+                    # second time under its own subdirectory, and the completion marker
+                    # rides the same commit as the weights it is meant to follow. Keep
+                    # both beside the run directory rather than inside it.
+                    FINAL_DIR = RUN_ROOT / "final" / "sft" / SFT_RUN_KEY
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
+                    tokenizer.save_pretrained(str(FINAL_DIR / "adapter"))
+                    (FINAL_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
                     if PUSH_ADAPTER:
                         from huggingface_hub import HfApi
 
@@ -2319,7 +2361,7 @@ def build_03_sft():
                         # training, so its existence proves nothing; notebook 07
                         # gates an adapter only once this file is on the Hub.
                         HfApi(token=hf_token).upload_file(
-                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -2344,7 +2386,7 @@ def build_03_sft():
                             )
                         model.push_to_hub_merged(MERGED_MODEL_ID, tokenizer, save_method="merged_16bit", token=hf_token)
                         hub.upload_file(
-                            path_or_fileobj=str(SFT_RUN_DIR / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=MERGED_MODEL_ID,
                             commit_message="run manifest: merge completed",
@@ -2398,6 +2440,7 @@ def build_04_dpo():
             code(
                 r"""
                 import hashlib
+                import shutil
                 import subprocess
 
                 from unsloth import FastModel
@@ -2417,11 +2460,12 @@ def build_04_dpo():
                 PREFERENCE_DATASET_ID = f"{HF_USERNAME}/qwen38-code-preferences"
                 PREFERENCE_DATASET_REVISION = "main"
                 # The execution-derived bootstrap pairs live in this repository;
-                # the notebook clones it, so nothing has to be uploaded.
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-                if not REPO_DIR.exists():
-                    subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
+                # the notebook checks it out, so nothing has to be uploaded.
+                # <repo-checkout>
+                print(subprocess.run(
+                    ["git", "-C", str(REPO_DIR), "rev-parse", "--short", "HEAD"],
+                    text=True, capture_output=True, check=True,
+                ).stdout.strip())
                 PREFERENCE_LOCAL_JSONL = str(REPO_DIR / "data" / "preferences" / "pairs.jsonl")
                 # Reasoning-length pairs from notebook 07 or collect_trajectories.py.
                 # They teach brevity only (both sides succeeded), so they stay a
@@ -2451,6 +2495,13 @@ def build_04_dpo():
                 # Sweep it alongside beta rather than treating it as settled.
                 LEARNING_RATE = 5e-6
                 DPO_BETA = 0.1
+
+                # A fresh adapter over the merged SFT weights, so this rank is
+                # independent of notebook 03's. It was a bare literal beside the
+                # model, which kept it out of the manifest: two adapters of different
+                # shapes then looked alike in their own provenance records.
+                LORA_RANK = 16
+                LORA_ALPHA = 2 * LORA_RANK
 
                 # The commit the merged checkpoint resolves to, pinned here so
                 # the marker check, the load and the manifest all name the same
@@ -2498,6 +2549,8 @@ def build_04_dpo():
                     "max_steps": MAX_STEPS,
                     "learning_rate": LEARNING_RATE,
                     "beta": DPO_BETA,
+                    "lora_rank": LORA_RANK,
+                    "lora_alpha": LORA_ALPHA,
                     "loss_type": "sigmoid",
                     "gradient_accumulation_steps": 8,
                     "optimizer": "adamw_8bit",
@@ -2564,9 +2617,9 @@ def build_04_dpo():
                 model = FastModel.get_peft_model(
                     model,
                     finetune_vision_layers=False,
-                    r=16,
+                    r=LORA_RANK,
                     target_modules=sorted(discovered_suffixes),
-                    lora_alpha=32,
+                    lora_alpha=LORA_ALPHA,
                     lora_dropout=0,
                     bias="none",
                     use_gradient_checkpointing="unsloth",
@@ -2860,14 +2913,19 @@ def build_04_dpo():
                     run_manifest["preference_sources"] = PREFERENCE_SOURCES
                     run_manifest["preference_mixture"] = PREFERENCE_MIXTURE
                     run_manifest["train_runtime_seconds"] = result.metrics.get("train_runtime")
-                    (RUN_ROOT / "dpo" / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
-                    trainer.save_model(str(RUN_ROOT / "dpo" / "final_adapter"))
+                    # As in notebook 03: files left inside the trainer's output directory
+                    # are swept into its push, duplicating the adapter and letting the
+                    # completion marker ride the weights' own commit.
+                    FINAL_DIR = RUN_ROOT / "final" / "dpo"
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    (FINAL_DIR / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2))
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="DPO adapter from verifier-backed preferences")
                         # Completion marker, after the final push: notebook 07 gates
                         # this adapter only once it is there.
                         hub.upload_file(
-                            path_or_fileobj=str(RUN_ROOT / "dpo" / "run_manifest.json"),
+                            path_or_fileobj=str(FINAL_DIR / "run_manifest.json"),
                             path_in_repo="run_manifest.json",
                             repo_id=OUTPUT_ADAPTER_ID,
                             commit_message="run manifest: training completed",
@@ -3287,7 +3345,10 @@ def build_05_grpo():
                     if trainer is None:
                         raise RuntimeError(AGENTIC_RL_BLOCKER)
                     result = trainer.train()
-                    trainer.save_model(str(RUN_ROOT / "grpo" / "final_adapter"))
+                    # Saved beside the run directory, not inside it: see notebook 03.
+                    FINAL_DIR = RUN_ROOT / "final" / "grpo"
+                    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+                    trainer.save_model(str(FINAL_DIR / "adapter"))
                     if PUSH_ADAPTER:
                         trainer.push_to_hub(commit_message="Agentic GRPO pilot adapter")
                     print(result.metrics)
@@ -3619,19 +3680,18 @@ def build_07_collect_and_evaluate():
             markdown("## Bring in the shared harness, collector and gate"),
             code(
                 r"""
+                import shutil
                 import subprocess
 
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-
-                if not REPO_DIR.exists():
-                    subprocess.run(
-                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
-                        check=True,
-                    )
+                # <repo-checkout>
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
 
                 from qwen3_8_27b_code.collection import collect, write_corpus
                 from qwen3_8_27b_code.episodes import EpisodeBudget, TurnResult
@@ -4357,20 +4417,19 @@ def build_08_distil():
             markdown("## Bring in the shared harness, collector and teacher adapter"),
             code(
                 r"""
+                import shutil
                 import subprocess
                 import sys
 
-                REPO_URL = "https://github.com/CodeHalwell/qwen3.8-27B-code"
-                REPO_REVISION = "main"  # Pin an immutable commit before a run that produces artifacts.
-                REPO_DIR = Path("/content/qwen3.8-27B-code")
-
-                if not REPO_DIR.exists():
-                    subprocess.run(
-                        ["git", "clone", "--depth", "1", "--branch", REPO_REVISION, REPO_URL, str(REPO_DIR)],
-                        check=True,
-                    )
+                # <repo-checkout>
                 if str(REPO_DIR / "src") not in sys.path:
                     sys.path.insert(0, str(REPO_DIR / "src"))
+                # A rerun would otherwise import the copy an earlier run of this
+                # cell left in sys.modules, refreshed checkout or not.
+                for module_name in [
+                    name for name in sys.modules if name.split(".")[0] == "qwen3_8_27b_code"
+                ]:
+                    del sys.modules[module_name]
 
                 from qwen3_8_27b_code.collection import collect, read_attempts, write_attempts, write_corpus
                 from qwen3_8_27b_code.distillation import build_outcome_pairs, write_outcome_pairs
