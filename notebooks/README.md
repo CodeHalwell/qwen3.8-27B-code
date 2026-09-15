@@ -187,7 +187,7 @@ band, whatever the aggregate does.
   [Model and hardware](../docs/model-and-hardware.md#second-lane-kaggle-t4-x2).
   This switch has not yet been run on the G4; if `FastModel` refuses the
   checkpoint under the pinned stack, notebook 00 is where it shows.
-- LoRA starts at rank 16 over the discovered language linear modules — the
+- LoRA runs at rank 32 over the discovered language linear modules — the
   full-attention projections, the Gated DeltaNet `in_proj_*`/`out_proj` that
   three of every four layers use, and the MLP projections — with Unsloth
   gradient checkpointing, BF16 compute and an 8-bit optimizer. Discovery fails

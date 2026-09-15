@@ -203,7 +203,7 @@ Starting configuration:
 | Base model | `unsloth/Qwen3.8-27B` | Pin Hub revision |
 | Loader | Preflight result; `FastModel` in Unsloth's own Qwen3.8 notebook | Returns a processor, so tokenise text by keyword and reach the inner tokenizer for bare strings |
 | Precision | BF16 LoRA | The DeltaNet recurrent state is float32 by configuration; never force float16 anywhere in the stack (NaN gradients). Fall back to 4-bit QLoRA after measured OOM only, noting that the 4-bit build keeps `lm_head` and the DeltaNet `in_proj_qkv/a/b` in 16-bit |
-| LoRA rank / alpha | 16 / 32 | Escalate to 32 / 64 as the specialisation lever once the 16 / 32 baseline passes its gate; change one axis per run |
+| LoRA rank / alpha | 32 / 64 | 16 / 32 was the bootstrap rank and it underfit the 5,729-row corpus, its training loss ending above its validation loss; 64 / 128 does not fit the card, see [model and hardware](model-and-hardware.md); change one axis per run |
 | LoRA dropout | 0 | Unsloth-optimised default |
 | Target | Language all-linear after module discovery | Includes the Gated DeltaNet `in_proj_qkv/z/a/b` and `out_proj`; exclude vision, MTP and `lm_head` |
 | Sequence length | 8,192 | 4,096 smoke; 16,384 only once the chunked loss is confirmed active, because full logits at 16K are about 38 GiB on their own ([logit memory](model-and-hardware.md#logit-memory)) |

@@ -60,7 +60,17 @@ The 27.8B parameter count and the 496 language linear modules LoRA attaches
 to (64 x 3 MLP projections, 16 x 4 attention projections and 48 x 5 DeltaNet
 projections) come from Unsloth's own Qwen3.8-27B notebook
 (`references/qwen3_8_27b_kaggle_t4x2.py`). Rank 8 there is 58.4M trainable
-parameters, so the plan's rank 16 is about 117M, 0.42% of the model.
+parameters, so rank 16 is about 117M, 0.42% of the model, and each doubling
+adds as much again: rank 32 is 233M, 0.85%.
+
+Rank 16 trained the bootstrap corpus and then underfit the 5,729-row one,
+ending with its training loss above its validation loss, so notebook 03 now
+ships rank 32. The rank is bounded by this card rather than by the argument
+for capacity: that run peaked at 88.5 GiB of the roughly 89.4 GiB below, and
+each doubling costs about 0.65 GiB of weight, gradient and 8-bit optimiser
+state, so 32 fits in what is left and 64 does not. Going further means a
+shorter sequence or the 4-bit fallback, and the trajectory windows are
+already short, so the sequence length is the wrong term to cut.
 
 Unsloth's pre-quantised `unsloth/Qwen3.8-27B-unsloth-bnb-4bit` build, which
 `load_in_4bit=True` resolves to, keeps `lm_head`, the vision tower and the

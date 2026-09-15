@@ -1768,6 +1768,22 @@ def build_03_sft():
 
                 MODEL_ID = "unsloth/Qwen3.8-27B"
                 MODEL_REVISION = "main"  # resolved to a commit below and recorded in the manifest
+                # Rank 16 left 116M trainable parameters against 27B frozen, and
+                # the 5,729-row run ended with its training loss above its
+                # validation loss: the adapter could not hold what the corpus
+                # had. Alpha tracks the rank so the update scaling (alpha / r)
+                # stays where it was and only capacity changes.
+                #
+                # 32 rather than 64 because the card decides it. That run peaked
+                # at 88.5 GiB of the roughly 89.4 GiB the G4 reports
+                # (docs/model-and-hardware.md), and each doubling of the rank
+                # costs about 0.65 GiB of weight, gradient and 8-bit optimiser
+                # state: 32 fits in that 0.9 GiB, 64 does not. Going further
+                # means buying room first, and the row windows are already the
+                # shorter end of what these trajectories need, so the sequence
+                # length is the wrong place to buy it from.
+                LORA_RANK = 32
+                LORA_ALPHA = 2 * LORA_RANK
                 DATASET_ID = f"{HF_USERNAME}/qwen38-code-native-sft-v0"
                 DATASET_REVISION = "main"  # the dataset notebook 02 pushed; pin a commit to repeat a run exactly
                 OUTPUT_ADAPTER_ID = f"{HF_USERNAME}/qwen38-27b-code-sft-lora"
@@ -1841,6 +1857,8 @@ def build_03_sft():
                     "num_train_epochs": NUM_TRAIN_EPOCHS,
                     "max_steps": MAX_STEPS,
                     "learning_rate": LEARNING_RATE,
+                    "lora_rank": LORA_RANK,
+                    "lora_alpha": LORA_ALPHA,
                     "gradient_accumulation_steps": 8,
                     "optimizer": "adamw_8bit",
                     "eval_every_steps": EVAL_EVERY_STEPS,
@@ -1928,9 +1946,9 @@ def build_03_sft():
                 model = FastModel.get_peft_model(
                     model,
                     finetune_vision_layers=False,  # text-only specialisation; the reviewed list below decides the rest
-                    r=16,
+                    r=LORA_RANK,
                     target_modules=target_modules,
-                    lora_alpha=32,
+                    lora_alpha=LORA_ALPHA,
                     lora_dropout=0,
                     bias="none",
                     use_gradient_checkpointing="unsloth",
@@ -2122,6 +2140,8 @@ def build_03_sft():
                     "num_train_epochs": NUM_TRAIN_EPOCHS,
                     "max_steps": MAX_STEPS,
                     "learning_rate": LEARNING_RATE,
+                    "lora_rank": LORA_RANK,
+                    "lora_alpha": LORA_ALPHA,
                     "gradient_accumulation_steps": 8,
                     "seed": 3407,
                 }, sort_keys=True).encode()).hexdigest()[:12]

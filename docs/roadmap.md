@@ -277,7 +277,12 @@ revisions and environments — not the machinery around them.
 
 Use a few hundred highly verified trajectories, rank-16 BF16 LoRA and
 assistant-only loss. Prove save/merge/reload and check whether tool-call
-validity improves without a static-coding regression.
+validity improves without a static-coding regression. Rank 16 is what this
+experiment used. Notebook 03 now ships rank 32 for the main run, see
+[model and hardware](model-and-hardware.md), and its demo mode is a two-step
+plumbing check that keeps the shipped adapter shape rather than reproducing
+this experiment: a smoke that exercised a different shape from the real run
+would not be checking the real run's plumbing.
 
 ### Experiment 3: 8K capability SFT
 
